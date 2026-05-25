@@ -15,8 +15,25 @@ serde_json = "1.0"
 tokio = { version = "1.49", features = ["full"] }
 alloy = { version = "1.4", features = ["full", "rpc-types-trace"] }
 indicatif = "0.18"
-reqwest = { version = "0.13", features = ["json", "gzip"] }
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+axum = "0.8.9"
+tower-http = { version = "0.6.10", features = ["fs", "cors", "trace"] }
+duckdb = { version = "1.10", features = ["bundled"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }
+hex = "0.4.3"
+rayon = "1.12.0"
 
 [profile.release]
 lto = true
 codegen-units = 1
+
+# Keep dev-mode compile-times short for our own code, but compile every
+# dependency (duckdb, parquet, alloy, …) at -O3. Without this, debug-mode
+# `blink decode` runs ~50× slower than release because the parquet/CBOR/opcode
+# hot loops don't get inlined.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
