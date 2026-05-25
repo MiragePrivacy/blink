@@ -1,3 +1,9 @@
+//! Batched JSON-RPC client for `trace_block`.
+//!
+//! Groups multiple block traces into a single HTTP request, with semaphore-
+//! controlled concurrency, exponential backoff, and rate-limit detection.
+//! Used by both the bulk extractor and the dashboard's tail loop.
+
 use std::{sync::Arc, time::Duration};
 
 use alloy::rpc::types::trace::parity::LocalizedTransactionTrace;

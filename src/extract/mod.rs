@@ -1,9 +1,9 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    sync::Arc,
-    time::Duration,
-};
+mod batch;
+mod parquet_io;
+pub(crate) mod tail;
+mod traces;
+
+use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
 
 use alloy::{
     providers::{Provider, ProviderBuilder},
@@ -14,15 +14,14 @@ use chrono::Utc;
 use futures::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use self::{batch::BatchClient, traces::extract_contracts};
 use crate::{
-    batch::BatchClient,
     cli::ContractsArgs,
-    extract::extract_contracts,
-    parquet_io,
     types::{ChunkReport, RunReport},
     util::{
-        build_chunks, chunk_path, color_green, color_red, color_white, format_duration,
-        resolve_end_block, resolve_rpc_url, write_report,
+        build_chunks, chunk_path, color_accent, color_dim, color_red, format_count,
+        format_duration, print_header, print_kv, print_kv_accent, resolve_end_block,
+        resolve_rpc_url, write_report,
     },
 };
 
@@ -63,84 +62,34 @@ pub async fn run_contracts(mut args: ContractsArgs) -> Result<()> {
     let total_blocks = end_block - args.start_block + 1;
     let start_time = Utc::now();
 
-    println!("{}", color_white("blink parameters"));
-    println!("{}", color_white("───────────────"));
-    println!("{}", color_white("- data:"));
-    println!(
-        "{}",
-        color_white(&format!(
-            "    - blocks: n={} min={} max={}",
-            total_blocks, args.start_block, end_block
-        ))
+    print_header("blink contracts");
+    print_kv_accent(
+        "blocks",
+        &format!(
+            "{} ({} → {})",
+            format_count(total_blocks),
+            format_count(args.start_block),
+            format_count(end_block)
+        ),
     );
-    println!("{}", color_white("- source:"));
-    println!("{}", color_white(&format!("    - rpc url: {}", rpc_url)));
-    println!(
-        "{}",
-        color_white(&format!(
-            "    - max concurrent requests: {}",
-            args.max_concurrent_requests
-        ))
+    print_kv("rpc", &rpc_url);
+    print_kv(
+        "concurrency",
+        &format!(
+            "{} requests · {} chunks",
+            args.max_concurrent_requests, args.max_concurrent_chunks
+        ),
     );
-    println!(
-        "{}",
-        color_white(&format!(
-            "    - max concurrent chunks: {}",
-            args.max_concurrent_chunks
-        ))
-    );
-    println!("{}", color_white("- output:"));
-    println!(
-        "{}",
-        color_white(&format!("    - chunk size: {}", args.chunk_size))
-    );
-    println!(
-        "{}",
-        color_white(&format!(
-            "    - chunks to collect: {} / {}",
+    print_kv(
+        "output",
+        &format!(
+            "{} · parquet · {} chunks of {}",
+            args.output_dir.display(),
             chunk_ranges.len(),
-            chunk_ranges.len()
-        ))
-    );
-    println!("{}", color_white("    - output format: parquet"));
-    println!(
-        "{}",
-        color_white(&format!("    - output dir: {}", args.output_dir.display()))
-    );
-    println!(
-        "{}",
-        color_white(&format!(
-            "    - report file: {}/.blink/reports/<timestamp>.json",
-            args.output_dir.display()
-        ))
+            format_count(args.chunk_size)
+        ),
     );
     println!();
-    println!("{}", color_white("schema for contracts"));
-    println!("{}", color_white("────────────────────"));
-    println!("{}", color_white("- block_number: uint32"));
-    println!("{}", color_white("- block_hash: binary"));
-    println!("{}", color_white("- create_index: uint32"));
-    println!("{}", color_white("- transaction_hash: binary"));
-    println!("{}", color_white("- contract_address: binary"));
-    println!("{}", color_white("- deployer: binary"));
-    println!("{}", color_white("- factory: binary"));
-    println!("{}", color_white("- init_code: binary"));
-    println!("{}", color_white("- code: binary"));
-    println!("{}", color_white("- init_code_hash: binary"));
-    println!("{}", color_white("- n_init_code_bytes: uint32"));
-    println!("{}", color_white("- n_code_bytes: uint32"));
-    println!("{}", color_white("- code_hash: binary"));
-    println!("{}", color_white("- chain_id: uint64"));
-    println!();
-    println!(
-        "{}",
-        color_white("sorting contracts by: block_number, create_index")
-    );
-    println!();
-    println!("{}", color_white("other available columns: [none]"));
-    println!();
-    println!("{}", color_white("collecting data"));
-    println!("{}", color_white("───────────────"));
 
     let batch_client = Arc::new(BatchClient::new(
         rpc_url.clone(),
@@ -151,10 +100,10 @@ pub async fn run_contracts(mut args: ContractsArgs) -> Result<()> {
     progress.set_style(
         ProgressStyle::default_bar()
             .template(
-                "{spinner:.white} [{elapsed_precise}] [{bar:50.white/white}] {pos}/{len} blocks ({percent}%) | ETA: {eta} | {msg}",
+                "  \x1b[38;2;189;255;0m▸\x1b[0m [{elapsed_precise}] \x1b[38;2;189;255;0m{bar:40}\x1b[38;2;64;64;64m{bar:0}\x1b[0m {pos}/{len} blocks · {percent}% · eta {eta} · {msg}",
             )
             .unwrap()
-            .progress_chars("█▓░"),
+            .progress_chars("█░ "),
     );
     progress.enable_steady_tick(Duration::from_millis(200));
 
@@ -162,7 +111,7 @@ pub async fn run_contracts(mut args: ContractsArgs) -> Result<()> {
     let chunks_total = chunk_ranges.len();
     let mut error: Option<String> = None;
 
-    let mut chunk_stream = stream::iter(chunk_ranges.into_iter())
+    let mut chunk_stream = stream::iter(chunk_ranges)
         .map(|chunk| {
             let batch_client = batch_client.clone();
             let args = args.clone();
@@ -187,12 +136,12 @@ pub async fn run_contracts(mut args: ContractsArgs) -> Result<()> {
             Ok(report) => {
                 completed += 1;
                 let status = if report.skipped {
-                    color_white("skipped")
+                    color_dim("skipped")
                 } else {
-                    color_green(&format!("{} contracts", report.rows))
+                    color_accent(&format!("{} contracts", format_count(report.rows as u64)))
                 };
                 progress.set_message(format!(
-                    "chunk {}/{} ({}-{}) {}",
+                    "chunk {}/{} ({}–{}) {}",
                     completed, chunks_total, report.start_block, report.end_block, status
                 ));
                 reports.push(report);
@@ -206,31 +155,30 @@ pub async fn run_contracts(mut args: ContractsArgs) -> Result<()> {
     }
 
     if error.is_none() {
-        progress.finish_with_message(color_green("done"));
+        progress.finish_with_message(color_accent("done"));
     }
 
     let end_time = Utc::now();
     let duration = end_time - start_time;
     let total_rows: usize = reports.iter().map(|r| r.rows).sum();
 
-    println!(
-        "\n{}",
-        color_white(&format!("completed in {}", format_duration(duration)))
-    );
-    println!(
-        "{}",
-        color_white(&format!("total contracts: {}", total_rows))
-    );
-    println!(
-        "{}",
-        color_white(&format!(
-            "speed: {:.1} blocks/sec",
+    println!();
+    print_kv_accent("elapsed", &format_duration(duration));
+    print_kv_accent("contracts", &format_count(total_rows as u64));
+    print_kv_accent(
+        "speed",
+        &format!(
+            "{:.1} blocks/sec",
             total_blocks as f64 / duration.num_seconds().max(1) as f64
-        ))
+        ),
     );
 
     reports.sort_by_key(|r| r.index);
-    let status = if error.is_some() { "failed" } else { "completed" };
+    let status = if error.is_some() {
+        "failed"
+    } else {
+        "completed"
+    };
     let report = RunReport {
         started_at: start_time,
         finished_at: end_time,
@@ -249,10 +197,7 @@ pub async fn run_contracts(mut args: ContractsArgs) -> Result<()> {
     };
     let report_path = report_dir.join(format!("{}.json", start_time.format("%Y-%m-%d_%H-%M-%S")));
     write_report(&report_path, &report)?;
-    println!(
-        "{}",
-        color_white(&format!("report: {}", report_path.display()))
-    );
+    print_kv("report", &report_path.display().to_string());
 
     if let Some(err) = error {
         return Err(anyhow!(err));
