@@ -46,10 +46,7 @@ pub fn resolve_rpc_url(rpc: Option<String>) -> Result<String> {
     Ok(url)
 }
 
-pub async fn resolve_end_block<P: Provider>(
-    provider: &P,
-    end_block: &str,
-) -> Result<u64> {
+pub async fn resolve_end_block<P: Provider>(provider: &P, end_block: &str) -> Result<u64> {
     if end_block.eq_ignore_ascii_case("latest") {
         provider
             .get_block_number()
@@ -81,14 +78,108 @@ pub fn format_duration(d: Duration) -> String {
     }
 }
 
-pub fn color_white(text: &str) -> String {
-    format!("\x1b[97m{}\x1b[0m", text)
+/// Format an integer with US-style thousands separators.
+pub fn format_count(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
 }
 
-pub fn color_green(text: &str) -> String {
-    format!("\x1b[32m{}\x1b[0m", text)
+/// Tiny glob: supports '*' and literal chars. Intended for simple file names
+/// like `*.parquet`, not full path globbing.
+pub fn match_simple_glob(pattern: &str, name: &str) -> bool {
+    fn helper(pat: &[u8], s: &[u8]) -> bool {
+        if pat.is_empty() {
+            return s.is_empty();
+        }
+        if pat[0] == b'*' {
+            for i in 0..=s.len() {
+                if helper(&pat[1..], &s[i..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if !s.is_empty() && pat[0] == s[0] {
+            return helper(&pat[1..], &s[1..]);
+        }
+        false
+    }
+    helper(pattern.as_bytes(), name.as_bytes())
+}
+
+/// Truncate by character count so error messages never slice through a UTF-8 codepoint.
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        match chars.next() {
+            Some(ch) => out.push(ch),
+            None => return s.to_string(),
+        }
+    }
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
 }
 
 pub fn color_red(text: &str) -> String {
-    format!("\x1b[31m{}\x1b[0m", text)
+    format!("\x1b[38;2;255;77;77m{}\x1b[0m", text)
+}
+
+pub fn color_text(text: &str) -> String {
+    format!("\x1b[38;2;237;237;237m{}\x1b[0m", text)
+}
+
+pub fn color_accent(text: &str) -> String {
+    format!("\x1b[38;2;189;255;0m{}\x1b[0m", text)
+}
+
+pub fn color_dim(text: &str) -> String {
+    format!("\x1b[38;2;112;112;112m{}\x1b[0m", text)
+}
+
+pub fn color_faint(text: &str) -> String {
+    format!("\x1b[38;2;64;64;64m{}\x1b[0m", text)
+}
+
+/// Section header block: `░ TITLE` in lime + a hairline rule below.
+pub fn format_header(title: &str) -> String {
+    format!(
+        "{}\n{} {}\n{}",
+        color_faint(""),
+        color_accent("░"),
+        color_accent(&title.to_uppercase()),
+        color_faint(&"─".repeat(60))
+    )
+}
+
+pub fn print_header(title: &str) {
+    println!("{}", format_header(title));
+}
+
+/// Key/value line: `  key:  value` with dim label and bright value.
+pub fn print_kv(key: &str, value: &str) {
+    println!(
+        "  {}  {}",
+        color_dim(&format!("{:<14}", format!("{}:", key))),
+        color_text(value)
+    );
+}
+
+/// Same as [`print_kv`] but the value is rendered in the lime accent color.
+pub fn print_kv_accent(key: &str, value: &str) {
+    println!(
+        "  {}  {}",
+        color_dim(&format!("{:<14}", format!("{}:", key))),
+        color_accent(value)
+    );
 }
