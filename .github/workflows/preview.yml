@@ -1,0 +1,30 @@
+name: Deploy PR previews
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - closed
+
+concurrency: preview-${{ github.ref }}
+
+permissions:
+  contents: write
+  pull-requests: write
+  pages: write
+
+jobs:
+  deploy-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy preview
+        id: preview
+        uses: rossjrw/pr-preview-action@v1
+        with:
+          source-dir: ./static
+          pages-base-url: blink.mirageprivacy.com

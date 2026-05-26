@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: build
+        run: cargo build --all --all-features --release
+
+      - name: nextest run
+        run: cargo nextest run --release --all --no-fail-fast
