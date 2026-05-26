@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>blink · ethereum contract intel</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Real-time Ethereum smart contract deployment intelligence — verification status, bytecode size, compiler distribution." />
+  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='3' y='3' width='10' height='10' fill='%23bdff00'/></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <link rel="stylesheet" href="./styles.css?v=7" />
+  <script src="./dashboard.js?v=9" defer></script>
+</head>
+<body>
+  <nav class="topbar">
+    <div class="brand">
+      <div class="mark"></div>
+      <span class="wordmark">BLINK</span>
+      <span class="meta-tag">ethereum · mainnet</span>
+    </div>
+    <div class="status-block">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">connecting</span>
+      <span class="top-refresh" id="footer-refresh">—</span>
+    </div>
+  </nav>
+
+  <main>
+    <section class="kpi-row">
+      <div class="kpi">
+        <div class="kpi-label">Total contracts</div>
+        <div class="kpi-value" id="m-total">—</div>
+        <div class="kpi-sub" id="m-block-range">—</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Verified</div>
+        <div class="kpi-value" id="m-verified">—</div>
+        <div class="kpi-sub"><span id="m-verified-pct">—</span></div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Unverified</div>
+        <div class="kpi-value" id="m-unverified">—</div>
+        <div class="kpi-sub">checked, not on Etherscan</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Coverage</div>
+        <div class="kpi-value" id="m-coverage">—</div>
+        <div class="kpi-sub">metadata sync progress</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Last block</div>
+        <div class="kpi-value" id="m-last-block">—</div>
+        <div class="kpi-sub" id="m-last-block-time">—</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Compiler metadata</div>
+        <div class="kpi-value" id="m-lang-top">—</div>
+        <div class="kpi-sub" id="m-lang-sub">decode coverage —</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div class="panel-title">
+          <span class="title-tag">CHART</span>
+          <h2>Deployments over time</h2>
+        </div>
+        <div class="seg" data-target="deploys">
+          <button data-bucket="hour">1H</button>
+          <button data-bucket="day" class="active">1D</button>
+          <button data-bucket="week">1W</button>
+          <button data-bucket="month">1M</button>
+        </div>
+      </div>
+      <div class="chart-wrap tall"><canvas id="chart-deploys"></canvas></div>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title">
+            <span class="title-tag">CHART</span>
+            <h2>Verification ratio</h2>
+          </div>
+          <div class="seg" data-target="verified">
+            <button data-bucket="day">1D</button>
+            <button data-bucket="week" class="active">1W</button>
+            <button data-bucket="month">1M</button>
+          </div>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-verified"></canvas></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title">
+            <span class="title-tag">CHART</span>
+            <h2>Bytecode size distribution</h2>
+          </div>
+          <span class="meta-tag">EVM cap 24 KB</span>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-sizes"></canvas></div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title">
+            <span class="title-tag">CHART</span>
+            <h2>Top compiler versions</h2>
+          </div>
+          <span class="meta-tag" id="compilers-source">decoded</span>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-compilers"></canvas></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title">
+            <span class="title-tag">CHART</span>
+            <h2>Bytecode signals</h2>
+          </div>
+          <span class="meta-tag" id="standards-coverage">— decoded</span>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-standards"></canvas></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div class="panel-title">
+          <span class="title-tag">TABLE</span>
+          <h2>Most recent deployments</h2>
+        </div>
+        <div class="pager">
+          <span class="pager-range" id="recent-range">—</span>
+          <button class="pager-btn" id="recent-prev" aria-label="previous page" disabled>‹</button>
+          <button class="pager-btn" id="recent-next" aria-label="next page">›</button>
+        </div>
+      </div>
+      <div class="table-wrap recent">
+        <table id="recent-table">
+          <thead>
+            <tr>
+              <th>Block</th>
+              <th>Address</th>
+              <th>Name</th>
+              <th>Compiler</th>
+              <th class="num">Size</th>
+              <th>Verification status</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel query-panel">
+      <div class="panel-head">
+        <div class="panel-title">
+          <span class="title-tag">QUERY</span>
+          <h2>SQL explorer</h2>
+        </div>
+        <div class="query-actions">
+          <span class="query-status" id="query-status">ready</span>
+          <button class="run-btn" id="query-run" type="button">Run</button>
+        </div>
+      </div>
+      <div class="query-body">
+        <textarea id="query-editor" class="query-editor" spellcheck="false">SELECT
+  block_number,
+  address,
+  compiler_version,
+  language,
+  n_code_bytes,
+  is_verified
+FROM contract_metadata
+ORDER BY block_number DESC, create_index DESC
+LIMIT 50</textarea>
+        <div class="table-wrap query">
+          <table id="query-table">
+            <thead></thead>
+            <tbody>
+              <tr><td class="query-empty">no query results</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+</body>
+</html>
