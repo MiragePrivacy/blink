@@ -27,4 +27,4 @@ jobs:
         uses: rossjrw/pr-preview-action@v1
         with:
           source-dir: ./static
-          pages-base-url: www.mirageprivacy.github.io/blink
+          pages-base-url: blink.mirageprivacy.com
