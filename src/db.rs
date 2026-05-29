@@ -471,6 +471,24 @@ fn normalize_read_only_sql(sql: &str) -> Result<String> {
     Ok(without_trailing_semicolon.to_string())
 }
 
+fn wrap_dashboard_query(sql: &str, limit: u32, chain_id: Option<u64>) -> String {
+    match chain_id {
+        Some(chain_id) => format!(
+            r#"
+            WITH contract_metadata AS (
+                SELECT *
+                FROM contract_metadata_all
+                WHERE chain_id = {chain_id}
+            )
+            SELECT *
+            FROM ({sql}) AS _blink_dashboard_query
+            LIMIT {limit}
+            "#
+        ),
+        None => format!("SELECT * FROM ({sql}) AS _blink_dashboard_query LIMIT {limit}"),
+    }
+}
+
 fn value_ref_to_json(value: ValueRef<'_>) -> Value {
     match value {
         ValueRef::Null => Value::Null,
@@ -828,7 +846,7 @@ fn create_standard_query_views(conn: &Connection, has_zellic: bool) -> Result<()
     };
     let contract_metadata_sql = format!(
         r#"
-        CREATE OR REPLACE TEMP VIEW contract_metadata AS
+        CREATE OR REPLACE TEMP VIEW contract_metadata_all AS
         SELECT
             c.chain_id,
             c.block_number,
@@ -866,6 +884,9 @@ fn create_standard_query_views(conn: &Connection, has_zellic: bool) -> Result<()
         LEFT JOIN enrichment_current e
           ON c.contract_address = e.contract_address
          AND c.chain_id = e.chain_id;
+
+        CREATE OR REPLACE TEMP VIEW contract_metadata AS
+        SELECT * FROM contract_metadata_all;
         "#
     );
     conn.execute_batch(&contract_metadata_sql)
@@ -1178,16 +1199,18 @@ fn rebuild_contracts_view_for_conn(
 }
 
 impl Db {
-    pub async fn query_sql(&self, sql: String, limit: u32) -> Result<SqlQueryResult> {
+    pub async fn query_sql(
+        &self,
+        sql: String,
+        limit: u32,
+        chain_id: Option<u64>,
+    ) -> Result<SqlQueryResult> {
         let inner = self.inner.clone();
         let normalized = normalize_read_only_sql(&sql)?;
         let limit = limit.clamp(1, 1_000);
         tokio::task::spawn_blocking(move || -> Result<SqlQueryResult> {
             let started = Instant::now();
-            let wrapped = format!(
-                "SELECT * FROM ({}) AS _blink_dashboard_query LIMIT {}",
-                normalized, limit
-            );
+            let wrapped = wrap_dashboard_query(&normalized, limit, chain_id);
             let conn = inner.blocking_lock();
             let mut stmt = conn.prepare(&wrapped).context("prepare dashboard query")?;
             let mut rows = stmt.query([]).context("execute dashboard query")?;
@@ -1960,7 +1983,8 @@ impl Db {
         let mut contracts = tokio::task::spawn_blocking(move || -> Result<Vec<RecentContract>> {
             let conn = inner.blocking_lock();
             let page_limit = limit as i64 + 1;
-            let has_zellic = table_exists(&conn, "zellic_contracts")?
+            let has_zellic = chain_id == ETHEREUM_CHAIN_ID
+                && table_exists(&conn, "zellic_contracts")?
                 && table_exists(&conn, "zellic_bytecodes")?;
             let has_hash_metadata = table_exists(&conn, "bytecode_metadata_by_hash")?;
             let parquet_files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
@@ -2627,5 +2651,40 @@ mod tests {
             recent.contracts[0].address,
             format!("0x{}", hex::encode(make_bytes(0x15, 20)))
         );
+    }
+
+    #[tokio::test]
+    async fn recent_does_not_fall_back_to_ethereum_for_other_chains() {
+        let dir = TestDir::new("no_cross_chain_recent_fallback");
+        insert_zellic_snapshot(&dir.path);
+
+        let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+
+        let recent = db.recent_contracts(100, 5, None).await.unwrap();
+        assert!(recent.contracts.is_empty());
+        assert!(!recent.has_more);
+    }
+
+    #[tokio::test]
+    async fn dashboard_sql_scopes_contract_metadata_by_chain() {
+        let dir = TestDir::new("query_chain_scope");
+        insert_zellic_snapshot(&dir.path);
+        write_backfill_parquet(&dir.path);
+
+        let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+
+        let result = db
+            .query_sql(
+                "SELECT chain_id, block_number FROM contract_metadata ORDER BY block_number"
+                    .to_string(),
+                10,
+                Some(100),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.rows[0][0], serde_json::json!(100));
+        assert_eq!(result.rows[0][1], serde_json::json!(300));
     }
 }

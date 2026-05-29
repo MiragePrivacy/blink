@@ -662,6 +662,8 @@ struct SqlQueryRequest {
     sql: String,
     /// Maximum rows to return.
     limit: Option<u32>,
+    /// Chain id used to scope the `contract_metadata` dashboard view.
+    chain_id: Option<u64>,
 }
 
 #[utoipa::path(
@@ -681,7 +683,11 @@ async fn query_handler(
 ) -> Result<Json<crate::db::SqlQueryResult>, AppError> {
     state
         .db
-        .query_sql(req.sql, req.limit.unwrap_or(100))
+        .query_sql(
+            req.sql,
+            req.limit.unwrap_or(100),
+            Some(selected_chain_id(req.chain_id)),
+        )
         .await
         .map(Json)
         .map_err(AppError::bad_request)
