@@ -102,6 +102,10 @@ impl<T: Clone> CacheCell<T> {
         *self.value.lock().await = Some((Instant::now(), value.clone()));
         Ok(value)
     }
+
+    async fn clear(&self) {
+        *self.value.lock().await = None;
+    }
 }
 
 struct CacheMap<K, V> {
@@ -140,6 +144,22 @@ where
             .await
             .insert(key, (Instant::now(), value.clone()));
         Ok(value)
+    }
+
+    async fn clear(&self) {
+        self.values.lock().await.clear();
+    }
+}
+
+impl ApiCache {
+    async fn clear_contract_data(&self) {
+        self.stats.clear().await;
+        self.deploys.clear().await;
+        self.verified.clear().await;
+        self.bytecode_sizes.clear().await;
+        self.compilers.clear().await;
+        self.languages.clear().await;
+        self.standards.clear().await;
     }
 }
 
@@ -233,10 +253,11 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         tail_enabled,
         args.tail_interval_secs.max(15),
     ));
+    let cache = Arc::new(ApiCache::default());
     let state = AppState {
         db: db.clone(),
         runtime: runtime.clone(),
-        cache: Arc::new(ApiCache::default()),
+        cache: cache.clone(),
     };
 
     if let Some(rpc) = args.tail_rpc.clone().filter(|_| !args.read_only) {
@@ -250,8 +271,9 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
             data_dir: args.data_dir.clone(),
         };
         let runtime_bg = runtime.clone();
+        let cache_bg = cache.clone();
         tokio::spawn(async move {
-            background_tail_loop(db_bg, config, runtime_bg).await;
+            background_tail_loop(db_bg, config, runtime_bg, cache_bg).await;
         });
     }
 
@@ -639,7 +661,12 @@ struct LanguagesResponse {
     languages: Vec<crate::db::LanguageCount>,
 }
 
-async fn background_tail_loop(db: Db, config: TailLoopConfig, runtime: Arc<RuntimeState>) {
+async fn background_tail_loop(
+    db: Db,
+    config: TailLoopConfig,
+    runtime: Arc<RuntimeState>,
+    cache: Arc<ApiCache>,
+) {
     tracing::info!(
         "background tail loop starting (rpc={}, interval={:?}, confirmations={})",
         config.rpc,
@@ -662,6 +689,7 @@ async fn background_tail_loop(db: Db, config: TailLoopConfig, runtime: Arc<Runti
                 runtime
                     .mark_tail_ok(Some(report.end_block), report.rows as u64)
                     .await;
+                cache.clear_contract_data().await;
                 tracing::info!(
                     "tail extracted blocks {}-{} ({} contracts)",
                     report.start_block,
