@@ -25,6 +25,8 @@ use tokio::sync::Mutex;
 
 use crate::util::match_simple_glob;
 
+const RECENT_PARQUET_FILE_LIMIT: usize = 64;
+
 #[derive(Clone)]
 pub struct Db {
     inner: Arc<Mutex<Connection>>,
@@ -162,6 +164,164 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
         )
         .unwrap_or(0);
     Ok(count > 0)
+}
+
+#[derive(Debug)]
+struct ContractParquetFile {
+    path: PathBuf,
+    start_block: Option<u64>,
+    end_block: Option<u64>,
+}
+
+fn list_contract_parquet_files(data_dir: &Path, contracts_glob: &str) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(data_dir)
+        .with_context(|| format!("read data dir {}", data_dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|s| s.to_str()) == Some("parquet")
+                && match_simple_glob(
+                    contracts_glob,
+                    p.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                )
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|n| n != "enrichment.parquet")
+                    .unwrap_or(true)
+        })
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+fn contract_file_with_range(path: PathBuf) -> ContractParquetFile {
+    let nums = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(decimal_runs)
+        .unwrap_or_default();
+    let len = nums.len();
+    let (start_block, end_block) = if len >= 2 {
+        (Some(nums[len - 2]), Some(nums[len - 1]))
+    } else {
+        (None, None)
+    };
+    ContractParquetFile {
+        path,
+        start_block,
+        end_block,
+    }
+}
+
+fn decimal_runs(input: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut current: Option<u64> = None;
+    for byte in input.bytes() {
+        if byte.is_ascii_digit() {
+            let digit = u64::from(byte - b'0');
+            current = Some(
+                current
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(digit),
+            );
+        } else if let Some(value) = current.take() {
+            out.push(value);
+        }
+    }
+    if let Some(value) = current {
+        out.push(value);
+    }
+    out
+}
+
+fn max_contract_file_block(files: &[PathBuf]) -> Option<u64> {
+    files
+        .iter()
+        .filter_map(|path| contract_file_with_range(path.clone()).end_block)
+        .max()
+}
+
+fn recent_contract_parquet_files(files: &[PathBuf], cursor: Option<RecentCursor>) -> Vec<PathBuf> {
+    let cursor_block = cursor.map(|cursor| cursor.block_number);
+    let mut ranged = files
+        .iter()
+        .cloned()
+        .map(contract_file_with_range)
+        .collect::<Vec<_>>();
+    ranged.sort_by(|a, b| {
+        b.end_block
+            .unwrap_or(0)
+            .cmp(&a.end_block.unwrap_or(0))
+            .then_with(|| b.start_block.unwrap_or(0).cmp(&a.start_block.unwrap_or(0)))
+            .then_with(|| b.path.cmp(&a.path))
+    });
+
+    ranged
+        .into_iter()
+        .filter(|file| {
+            cursor_block
+                .map(|block| file.start_block.unwrap_or(0) <= block)
+                .unwrap_or(true)
+        })
+        .take(RECENT_PARQUET_FILE_LIMIT)
+        .map(|file| file.path)
+        .collect()
+}
+
+fn parquet_read_list(files: &[PathBuf]) -> String {
+    files
+        .iter()
+        .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn create_recent_parquet_contracts_view(conn: &Connection, files: &[PathBuf]) -> Result<()> {
+    let body = if files.is_empty() {
+        r#"
+            SELECT
+                CAST(NULL AS UINTEGER) AS block_number,
+                CAST(NULL AS BLOB) AS block_hash,
+                CAST(NULL AS UINTEGER) AS create_index,
+                CAST(NULL AS BLOB) AS transaction_hash,
+                CAST(NULL AS BLOB) AS contract_address,
+                CAST(NULL AS BLOB) AS deployer,
+                CAST(NULL AS BLOB) AS factory,
+                CAST(NULL AS BLOB) AS init_code,
+                CAST(NULL AS BLOB) AS code,
+                CAST(NULL AS BLOB) AS init_code_hash,
+                CAST(NULL AS UINTEGER) AS n_init_code_bytes,
+                CAST(NULL AS UINTEGER) AS n_code_bytes,
+                CAST(NULL AS BLOB) AS code_hash,
+                CAST(NULL AS UBIGINT) AS chain_id
+            WHERE FALSE
+        "#
+        .to_string()
+    } else {
+        format!(
+            r#"
+                SELECT
+                    block_number, block_hash, create_index, transaction_hash,
+                    contract_address, deployer, factory, init_code, code,
+                    init_code_hash, n_init_code_bytes, n_code_bytes,
+                    code_hash, chain_id
+                FROM read_parquet([{}], union_by_name = true)
+            "#,
+            parquet_read_list(files)
+        )
+    };
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE TEMP VIEW recent_parquet_contracts AS\n{};",
+        body
+    ))
+    .with_context(|| {
+        format!(
+            "create recent parquet contracts view ({} of newest files)",
+            files.len()
+        )
+    })?;
+    Ok(())
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -859,23 +1019,7 @@ fn rebuild_contracts_view_for_conn(
     data_dir: &Path,
     contracts_glob: &str,
 ) -> Result<()> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(data_dir)
-        .with_context(|| format!("read data dir {}", data_dir.display()))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().and_then(|s| s.to_str()) == Some("parquet")
-                && match_simple_glob(
-                    contracts_glob,
-                    p.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
-                )
-                && p.file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|n| n != "enrichment.parquet")
-                    .unwrap_or(true)
-        })
-        .collect();
-    files.sort();
+    let files = list_contract_parquet_files(data_dir, contracts_glob)?;
 
     // Use TEMP VIEWs so read-only mode (where the main database is locked
     // for writes) can still set this up — temp views live in a session-
@@ -1684,6 +1828,8 @@ impl Db {
         cursor: Option<RecentCursor>,
     ) -> Result<RecentPage> {
         let inner = self.inner.clone();
+        let data_dir = self.data_dir.clone();
+        let contracts_glob = self.contracts_glob.clone();
         let limit = limit.clamp(1, 200);
         let mut contracts = tokio::task::spawn_blocking(move || -> Result<Vec<RecentContract>> {
             let conn = inner.blocking_lock();
@@ -1691,26 +1837,29 @@ impl Db {
             let has_zellic = table_exists(&conn, "zellic_contracts")?
                 && table_exists(&conn, "zellic_bytecodes")?;
             let has_hash_metadata = table_exists(&conn, "bytecode_metadata_by_hash")?;
-            let max_contracts_block: Option<u32> = conn
-                .query_row("SELECT MAX(block_number) FROM contracts", [], |row| {
-                    row.get(0)
-                })
-                .unwrap_or(None);
-            let max_zellic_block: Option<u32> = if has_zellic {
-                conn.query_row(
-                    "SELECT MAX(block_number) FROM zellic_contracts",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(None)
+            let parquet_files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
+            let max_contracts_block = max_contract_file_block(&parquet_files);
+            let max_zellic_block: Option<u64> = if has_zellic {
+                let block: Option<u32> = conn
+                    .query_row(
+                        "SELECT MAX(block_number) FROM zellic_contracts",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(None);
+                block.map(u64::from)
             } else {
                 None
             };
             let has_external_contracts = max_contracts_block > max_zellic_block;
             let use_external_recent = has_external_contracts
                 && cursor
-                    .map(|cursor| cursor.block_number > max_zellic_block.unwrap_or(0) as u64)
+                    .map(|cursor| cursor.block_number > max_zellic_block.unwrap_or(0))
                     .unwrap_or(true);
+            if use_external_recent {
+                let recent_files = recent_contract_parquet_files(&parquet_files, cursor);
+                create_recent_parquet_contracts_view(&conn, &recent_files)?;
+            }
             let registry_loaded = verification_registry_loaded(&conn)?;
 
             // For Zellic imports, compiler metadata is keyed by bytecode hash.
@@ -1727,7 +1876,7 @@ impl Db {
                         c.deployer,
                         c.n_code_bytes,
                         c.code_hash
-                    FROM parquet_contracts c
+                    FROM recent_parquet_contracts c
                     WHERE c.block_number IS NOT NULL
                       AND (
                           c.block_number < ?
@@ -1760,7 +1909,7 @@ impl Db {
                         c.deployer,
                         c.n_code_bytes,
                         c.code_hash
-                    FROM parquet_contracts c
+                    FROM recent_parquet_contracts c
                     WHERE c.block_number IS NOT NULL
                     ORDER BY c.block_number DESC, c.create_index DESC
                     LIMIT ?
@@ -1788,7 +1937,7 @@ impl Db {
                         c.create_index,
                         c.deployer,
                         c.n_code_bytes
-                    FROM parquet_contracts c
+                    FROM recent_parquet_contracts c
                     WHERE c.block_number IS NOT NULL
                       AND (
                           c.block_number < ?
@@ -1819,7 +1968,7 @@ impl Db {
                         c.create_index,
                         c.deployer,
                         c.n_code_bytes
-                    FROM parquet_contracts c
+                    FROM recent_parquet_contracts c
                     WHERE c.block_number IS NOT NULL
                     ORDER BY c.block_number DESC, c.create_index DESC
                     LIMIT ?
@@ -2067,14 +2216,35 @@ impl Db {
 
     pub async fn highest_block(&self) -> Result<Option<u64>> {
         let inner = self.inner.clone();
+        let data_dir = self.data_dir.clone();
+        let contracts_glob = self.contracts_glob.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<u64>> {
+            let parquet_max =
+                max_contract_file_block(&list_contract_parquet_files(&data_dir, &contracts_glob)?);
             let conn = inner.blocking_lock();
+            let zellic_max = if table_exists(&conn, "zellic_contracts")? {
+                let block: Option<u32> = conn
+                    .query_row(
+                        "SELECT MAX(block_number) FROM zellic_contracts",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(None);
+                block.map(u64::from)
+            } else {
+                None
+            };
+            let known_max = [parquet_max, zellic_max].into_iter().flatten().max();
+            if known_max.is_some() {
+                return Ok(known_max);
+            }
+
             let block: Option<u32> = conn
                 .query_row("SELECT MAX(block_number) FROM contracts", [], |row| {
                     row.get(0)
                 })
                 .unwrap_or(None);
-            Ok(block.map(|b| b as u64))
+            Ok(block.map(u64::from))
         })
         .await
         .map_err(|e| anyhow!("join error: {}", e))?
@@ -2091,7 +2261,7 @@ mod tests {
 
     use duckdb::Connection;
 
-    use super::Db;
+    use super::{max_contract_file_block, recent_contract_parquet_files, Db, RecentCursor};
 
     struct TestDir {
         path: PathBuf,
@@ -2181,6 +2351,35 @@ mod tests {
             "#
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn recent_parquet_selection_uses_filename_block_ranges() {
+        let files = vec![
+            PathBuf::from("/tmp/contracts__0021850001__0021950000.parquet"),
+            PathBuf::from("/tmp/tail__0025330032__0025330040.parquet"),
+            PathBuf::from("/tmp/tail__0025330041__0025330048.parquet"),
+        ];
+
+        assert_eq!(max_contract_file_block(&files), Some(25_330_048));
+
+        let latest = recent_contract_parquet_files(&files, None);
+        assert_eq!(
+            latest[0].file_name().and_then(|name| name.to_str()),
+            Some("tail__0025330041__0025330048.parquet")
+        );
+
+        let cursor_page = recent_contract_parquet_files(
+            &files,
+            Some(RecentCursor {
+                block_number: 25_330_040,
+                create_index: 0,
+            }),
+        );
+        assert_eq!(
+            cursor_page[0].file_name().and_then(|name| name.to_str()),
+            Some("tail__0025330032__0025330040.parquet")
+        );
     }
 
     #[tokio::test]

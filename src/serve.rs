@@ -68,8 +68,16 @@ struct ApiCache {
     verified: CacheMap<u64, Vec<crate::db::VerifiedRatioBucket>>,
     bytecode_sizes: CacheCell<Vec<crate::db::SizeBin>>,
     compilers: CacheMap<u32, (Vec<crate::db::CompilerCount>, u64)>,
+    recent: CacheMap<RecentCacheKey, crate::db::RecentPage>,
     languages: CacheCell<Vec<crate::db::LanguageCount>>,
     standards: CacheCell<crate::db::StandardsBreakdown>,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct RecentCacheKey {
+    limit: u32,
+    before_block: Option<u64>,
+    before_create_index: Option<u64>,
 }
 
 struct CacheCell<T> {
@@ -146,6 +154,21 @@ where
         Ok(value)
     }
 
+    async fn get(&self, key: K) -> Option<V> {
+        self.values
+            .lock()
+            .await
+            .get(&key)
+            .map(|(_, value)| value.clone())
+    }
+
+    async fn insert(&self, key: K, value: V) {
+        self.values
+            .lock()
+            .await
+            .insert(key, (Instant::now(), value));
+    }
+
     async fn clear(&self) {
         self.values.lock().await.clear();
     }
@@ -158,6 +181,7 @@ impl ApiCache {
         self.verified.clear().await;
         self.bytecode_sizes.clear().await;
         self.compilers.clear().await;
+        self.recent.clear().await;
         self.languages.clear().await;
         self.standards.clear().await;
     }
@@ -540,6 +564,11 @@ async fn recent_handler(
     Query(q): Query<PageQuery>,
 ) -> Result<Json<RecentResponse>, AppError> {
     let limit = q.limit.unwrap_or(20);
+    let cache_key = RecentCacheKey {
+        limit,
+        before_block: q.before_block,
+        before_create_index: q.before_create_index,
+    };
     let cursor = match (q.before_block, q.before_create_index) {
         (Some(block_number), Some(create_index)) => Some(RecentCursor {
             block_number,
@@ -547,7 +576,24 @@ async fn recent_handler(
         }),
         _ => None,
     };
-    let page = state.db.recent_contracts(limit, cursor).await?;
+    let page = match state.db.recent_contracts(limit, cursor).await {
+        Ok(page) => {
+            state.cache.recent.insert(cache_key, page.clone()).await;
+            page
+        }
+        Err(err) => {
+            tracing::warn!("recent contracts query failed: {:#}", err);
+            state
+                .cache
+                .recent
+                .get(cache_key)
+                .await
+                .unwrap_or(crate::db::RecentPage {
+                    contracts: Vec::new(),
+                    has_more: false,
+                })
+        }
+    };
     Ok(Json(RecentResponse {
         contracts: page.contracts,
         limit,
