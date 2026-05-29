@@ -15,6 +15,12 @@ use crate::{db::Db, types::ChunkReport};
 
 const TAIL_BATCH_BLOCK_LIMIT: u64 = 5_000;
 
+pub async fn rpc_chain_id(rpc_url: &str) -> Result<u64> {
+    let provider =
+        ProviderBuilder::new().connect_http(rpc_url.parse().context("invalid tail rpc url")?);
+    provider.get_chain_id().await.context("tail: get chain id")
+}
+
 pub async fn tail_once(
     db: &Db,
     rpc_url: &str,
@@ -35,7 +41,7 @@ pub async fn tail_once(
         .context("tail: get head block")?;
     let target = head.saturating_sub(confirmations);
 
-    let highest_indexed = db.highest_block().await?.unwrap_or(0);
+    let highest_indexed = db.highest_block(chain_id).await?.unwrap_or(0);
     let start_block = if highest_indexed == 0 {
         target
     } else {
@@ -48,8 +54,8 @@ pub async fn tail_once(
 
     let started_at = Utc::now();
     let output_path = data_dir.join(format!(
-        "tail__{:010}__{:010}.parquet",
-        start_block, end_block
+        "tail__chain_{:010}__{:010}__{:010}.parquet",
+        chain_id, start_block, end_block
     ));
     let temp_output_path = output_path.with_extension("parquet.tmp");
     let _ = std::fs::remove_file(&temp_output_path);

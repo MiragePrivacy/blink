@@ -1,6 +1,7 @@
 //! `blink` binary entry point.
 
 mod blocks;
+mod chains;
 mod cli;
 mod db;
 mod decode;

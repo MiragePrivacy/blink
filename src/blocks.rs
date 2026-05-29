@@ -1,12 +1,13 @@
-//! Approximate Ethereum mainnet block-number → wall-clock-time conversion.
+//! Approximate block-number → wall-clock-time conversion for supported chains.
 //!
 //! The contract Parquet schema does not store block timestamps, so the
-//! dashboard derives them from `block_number` via piecewise-linear
-//! interpolation between hardcoded checkpoints (genesis, hardforks, and a
-//! handful of round numbers in between). Post-Merge it switches to the
-//! exact 12-second slot cadence.
+//! dashboard derives them from `block_number`. Ethereum uses piecewise-linear
+//! interpolation before the Merge and exact slots after. Gnosis uses its
+//! steady 5-second cadence from an approximate xDai/Gnosis genesis timestamp.
 
 use chrono::{DateTime, TimeZone, Utc};
+
+use crate::chains::GNOSIS_CHAIN_ID;
 
 /// Hardcoded (block_number, unix_timestamp) checkpoints for Ethereum mainnet.
 /// Used to interpolate timestamps without an extra timestamp lookup table.
@@ -39,18 +40,27 @@ const POST_MERGE_BLOCK: u64 = 15_537_393;
 const POST_MERGE_TIMESTAMP: i64 = 1_663_224_162;
 const SECS_PER_BLOCK_POST_MERGE: i64 = 12;
 
-/// Approximate the Ethereum mainnet block timestamp for a given block number.
-/// Post-Merge: exact (12s/block). Pre-Merge: linear interpolation between checkpoints.
-pub fn block_timestamp(block_number: u64) -> DateTime<Utc> {
-    let secs = if block_number >= POST_MERGE_BLOCK {
-        POST_MERGE_TIMESTAMP + (block_number - POST_MERGE_BLOCK) as i64 * SECS_PER_BLOCK_POST_MERGE
-    } else {
-        interpolate_pre_merge(block_number)
+const GNOSIS_GENESIS_TIMESTAMP: i64 = 1_539_024_180;
+const GNOSIS_SECS_PER_BLOCK: i64 = 5;
+
+/// Approximate the block timestamp for a given chain and block number.
+pub fn block_timestamp(chain_id: u64, block_number: u64) -> DateTime<Utc> {
+    let secs = match chain_id {
+        GNOSIS_CHAIN_ID => GNOSIS_GENESIS_TIMESTAMP + block_number as i64 * GNOSIS_SECS_PER_BLOCK,
+        _ => ethereum_block_timestamp_secs(block_number),
     };
     Utc.timestamp_opt(secs, 0).single().unwrap_or_else(Utc::now)
 }
 
-fn interpolate_pre_merge(block_number: u64) -> i64 {
+fn ethereum_block_timestamp_secs(block_number: u64) -> i64 {
+    if block_number >= POST_MERGE_BLOCK {
+        POST_MERGE_TIMESTAMP + (block_number - POST_MERGE_BLOCK) as i64 * SECS_PER_BLOCK_POST_MERGE
+    } else {
+        interpolate_ethereum_pre_merge(block_number)
+    }
+}
+
+fn interpolate_ethereum_pre_merge(block_number: u64) -> i64 {
     let idx = match CHECKPOINTS.binary_search_by_key(&block_number, |(b, _)| *b) {
         Ok(i) => return CHECKPOINTS[i].1,
         Err(i) => i,
@@ -70,11 +80,16 @@ fn interpolate_pre_merge(block_number: u64) -> i64 {
 }
 
 /// Approximate blocks per day at the given block height (for choosing bucket widths).
-pub fn blocks_per_day(block_number: u64) -> u64 {
-    if block_number >= POST_MERGE_BLOCK {
-        86_400 / SECS_PER_BLOCK_POST_MERGE as u64
-    } else {
-        // Pre-Merge averaged ~13.5s/block.
-        86_400 / 14
+pub fn blocks_per_day(chain_id: u64, block_number: u64) -> u64 {
+    match chain_id {
+        GNOSIS_CHAIN_ID => 86_400 / GNOSIS_SECS_PER_BLOCK as u64,
+        _ => {
+            if block_number >= POST_MERGE_BLOCK {
+                86_400 / SECS_PER_BLOCK_POST_MERGE as u64
+            } else {
+                // Pre-Merge averaged ~13.5s/block.
+                86_400 / 14
+            }
+        }
     }
 }

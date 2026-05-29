@@ -2,8 +2,8 @@
 //!
 //! Hosts the JSON API consumed by the separate dashboard frontend.
 //! Optional background tasks:
-//! - `--tail-rpc URL` polls the chain head and extracts newly produced
-//!   blocks into a separate `tail__*.parquet` file (see [`crate::extract::tail`]).
+//! - repeated `--tail-rpc URL` flags poll one or more chain heads and extract
+//!   newly produced blocks into separate `tail__chain_*` parquet files.
 //!
 //! Endpoints (all return JSON):
 //! - `GET /api/stats` — totals, verified pct, last block, verification coverage.
@@ -41,6 +41,7 @@ use utoipa_scalar::{Scalar, Servable};
 
 use crate::{
     blocks::blocks_per_day,
+    chains::{self, ChainInfo},
     cli::ServeArgs,
     db::{Db, RecentCursor},
 };
@@ -63,57 +64,34 @@ struct ApiDoc;
 
 #[derive(Default)]
 struct ApiCache {
-    stats: CacheCell<crate::db::Stats>,
-    deploys: CacheMap<u64, Vec<crate::db::DeployBucket>>,
-    verified: CacheMap<u64, Vec<crate::db::VerifiedRatioBucket>>,
-    bytecode_sizes: CacheCell<Vec<crate::db::SizeBin>>,
-    compilers: CacheMap<u32, (Vec<crate::db::CompilerCount>, u64)>,
+    stats: CacheMap<u64, crate::db::Stats>,
+    deploys: CacheMap<BucketCacheKey, Vec<crate::db::DeployBucket>>,
+    verified: CacheMap<BucketCacheKey, Vec<crate::db::VerifiedRatioBucket>>,
+    bytecode_sizes: CacheMap<u64, Vec<crate::db::SizeBin>>,
+    compilers: CacheMap<LimitCacheKey, (Vec<crate::db::CompilerCount>, u64)>,
     recent: CacheMap<RecentCacheKey, crate::db::RecentPage>,
-    languages: CacheCell<Vec<crate::db::LanguageCount>>,
-    standards: CacheCell<crate::db::StandardsBreakdown>,
+    languages: CacheMap<u64, Vec<crate::db::LanguageCount>>,
+    standards: CacheMap<u64, crate::db::StandardsBreakdown>,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct BucketCacheKey {
+    chain_id: u64,
+    bucket: u64,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct LimitCacheKey {
+    chain_id: u64,
+    limit: u32,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct RecentCacheKey {
+    chain_id: u64,
     limit: u32,
     before_block: Option<u64>,
     before_create_index: Option<u64>,
-}
-
-struct CacheCell<T> {
-    value: Mutex<Option<(Instant, T)>>,
-}
-
-impl<T> Default for CacheCell<T> {
-    fn default() -> Self {
-        Self {
-            value: Mutex::new(None),
-        }
-    }
-}
-
-impl<T: Clone> CacheCell<T> {
-    async fn get_or_try_update<F>(&self, ttl: Duration, future: F) -> Result<T>
-    where
-        F: Future<Output = Result<T>>,
-    {
-        {
-            let guard = self.value.lock().await;
-            if let Some((stored_at, value)) = guard.as_ref() {
-                if stored_at.elapsed() <= ttl {
-                    return Ok(value.clone());
-                }
-            }
-        }
-
-        let value = future.await?;
-        *self.value.lock().await = Some((Instant::now(), value.clone()));
-        Ok(value)
-    }
-
-    async fn clear(&self) {
-        *self.value.lock().await = None;
-    }
 }
 
 struct CacheMap<K, V> {
@@ -198,6 +176,7 @@ struct RuntimeState {
 #[derive(Debug, Default, Clone, Serialize, ToSchema)]
 struct RuntimeSnapshot {
     tail_running: bool,
+    tail_running_count: u64,
     tail_last_ok_at: Option<DateTime<Utc>>,
     tail_last_block: Option<u64>,
     tail_last_rows: Option<u64>,
@@ -243,12 +222,15 @@ impl RuntimeState {
     }
 
     async fn mark_tail_start(&self) {
-        self.snapshot.lock().await.tail_running = true;
+        let mut snapshot = self.snapshot.lock().await;
+        snapshot.tail_running_count = snapshot.tail_running_count.saturating_add(1);
+        snapshot.tail_running = true;
     }
 
     async fn mark_tail_ok(&self, end_block: Option<u64>, rows: u64) {
         let mut snapshot = self.snapshot.lock().await;
-        snapshot.tail_running = false;
+        snapshot.tail_running_count = snapshot.tail_running_count.saturating_sub(1);
+        snapshot.tail_running = snapshot.tail_running_count > 0;
         snapshot.tail_last_ok_at = Some(Utc::now());
         if let Some(block) = end_block {
             snapshot.tail_last_block = Some(block);
@@ -260,18 +242,28 @@ impl RuntimeState {
 
     async fn mark_tail_error(&self, message: String) {
         let mut snapshot = self.snapshot.lock().await;
-        snapshot.tail_running = false;
+        snapshot.tail_running_count = snapshot.tail_running_count.saturating_sub(1);
+        snapshot.tail_running = snapshot.tail_running_count > 0;
         snapshot.tail_last_error_at = Some(Utc::now());
         snapshot.tail_last_error = Some(message);
     }
 }
 
 pub async fn run_serve(args: ServeArgs) -> Result<()> {
-    if args.read_only && args.tail_rpc.is_some() {
-        tracing::warn!("--read-only is set; ignoring --tail-rpc (it requires a write lock)");
+    if args.read_only && !args.tail_rpc.is_empty() {
+        tracing::warn!(
+            "--read-only is set; ignoring --tail-rpc values (tailing requires a write lock)"
+        );
     }
     let db = Db::open_with_mode(&args.data_dir, &args.contracts_glob, args.read_only)?;
-    let tail_enabled = args.tail_rpc.is_some() && !args.read_only;
+    let tail_rpcs = args
+        .tail_rpc
+        .iter()
+        .map(|rpc| rpc.trim())
+        .filter(|rpc| !rpc.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let tail_enabled = !tail_rpcs.is_empty() && !args.read_only;
     let runtime = Arc::new(RuntimeState::new(
         args.read_only,
         tail_enabled,
@@ -284,25 +276,28 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         cache: cache.clone(),
     };
 
-    if let Some(rpc) = args.tail_rpc.clone().filter(|_| !args.read_only) {
-        let db_bg = db.clone();
-        let config = TailLoopConfig {
-            rpc,
-            interval: Duration::from_secs(args.tail_interval_secs.max(15)),
-            confirmations: args.tail_confirmations,
-            batch_size: args.tail_batch_size,
-            max_concurrent: args.tail_max_concurrent_requests,
-            data_dir: args.data_dir.clone(),
-        };
-        let runtime_bg = runtime.clone();
-        let cache_bg = cache.clone();
-        tokio::spawn(async move {
-            background_tail_loop(db_bg, config, runtime_bg, cache_bg).await;
-        });
+    if !args.read_only {
+        for rpc in tail_rpcs {
+            let db_bg = db.clone();
+            let config = TailLoopConfig {
+                rpc,
+                interval: Duration::from_secs(args.tail_interval_secs.max(15)),
+                confirmations: args.tail_confirmations,
+                batch_size: args.tail_batch_size,
+                max_concurrent: args.tail_max_concurrent_requests,
+                data_dir: args.data_dir.clone(),
+            };
+            let runtime_bg = runtime.clone();
+            let cache_bg = cache.clone();
+            tokio::spawn(async move {
+                background_tail_loop(db_bg, config, runtime_bg, cache_bg).await;
+            });
+        }
     }
 
     let (api_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(stats_handler))
+        .routes(routes!(chains_handler))
         .routes(routes!(runtime_handler))
         .routes(routes!(deploys_handler))
         .routes(routes!(verified_handler))
@@ -374,20 +369,55 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
     }
 }
 
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct ChainQuery {
+    /// Chain ID to query. Defaults to Ethereum mainnet (1).
+    chain_id: Option<u64>,
+}
+
+fn selected_chain_id(chain_id: Option<u64>) -> u64 {
+    chain_id.unwrap_or_else(chains::default_chain_id)
+}
+
+#[derive(Serialize, ToSchema)]
+struct ChainsResponse {
+    chains: Vec<ChainInfo>,
+    default_chain_id: u64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/chains",
+    tag = API_TAG,
+    responses((status = OK, body = ChainsResponse))
+)]
+async fn chains_handler() -> Json<ChainsResponse> {
+    Json(ChainsResponse {
+        chains: chains::supported_chains().to_vec(),
+        default_chain_id: chains::default_chain_id(),
+    })
+}
+
 #[utoipa::path(
     get,
     path = "/api/stats",
     tag = API_TAG,
+    params(ChainQuery),
     responses(
         (status = OK, body = crate::db::Stats),
         (status = INTERNAL_SERVER_ERROR, body = ApiError)
     )
 )]
-async fn stats_handler(State(state): State<AppState>) -> Result<Json<crate::db::Stats>, AppError> {
+async fn stats_handler(
+    State(state): State<AppState>,
+    Query(q): Query<ChainQuery>,
+) -> Result<Json<crate::db::Stats>, AppError> {
+    let chain_id = selected_chain_id(q.chain_id);
     let stats = state
         .cache
         .stats
-        .get_or_try_update(API_CACHE_TTL, state.db.stats())
+        .get_or_try_update(chain_id, API_CACHE_TTL, state.db.stats(chain_id))
         .await?;
     Ok(Json(stats))
 }
@@ -405,20 +435,22 @@ async fn runtime_handler(State(state): State<AppState>) -> Json<RuntimeResponse>
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 struct BucketQuery {
+    /// Chain ID to query. Defaults to Ethereum mainnet (1).
+    chain_id: Option<u64>,
     /// `day` (default), `week`, or a raw block count
     #[serde(default)]
     bucket: Option<String>,
 }
 
-fn parse_bucket(q: &BucketQuery, anchor_block: u64) -> u64 {
+fn parse_bucket(q: &BucketQuery, chain_id: u64, anchor_block: u64) -> u64 {
     match q.bucket.as_deref() {
-        None | Some("day") => blocks_per_day(anchor_block),
-        Some("hour") => blocks_per_day(anchor_block) / 24,
-        Some("week") => blocks_per_day(anchor_block) * 7,
-        Some("month") => blocks_per_day(anchor_block) * 30,
+        None | Some("day") => blocks_per_day(chain_id, anchor_block),
+        Some("hour") => blocks_per_day(chain_id, anchor_block) / 24,
+        Some("week") => blocks_per_day(chain_id, anchor_block) * 7,
+        Some("month") => blocks_per_day(chain_id, anchor_block) * 30,
         Some(other) => other
             .parse::<u64>()
-            .unwrap_or_else(|_| blocks_per_day(anchor_block)),
+            .unwrap_or_else(|_| blocks_per_day(chain_id, anchor_block)),
     }
 }
 
@@ -436,12 +468,18 @@ async fn deploys_handler(
     State(state): State<AppState>,
     Query(q): Query<BucketQuery>,
 ) -> Result<Json<DeploysResponse>, AppError> {
-    let highest = state.db.highest_block().await?.unwrap_or(0);
-    let bucket = parse_bucket(&q, highest);
+    let chain_id = selected_chain_id(q.chain_id);
+    let highest = state.db.highest_block(chain_id).await?.unwrap_or(0);
+    let bucket = parse_bucket(&q, chain_id, highest);
+    let cache_key = BucketCacheKey { chain_id, bucket };
     let buckets = state
         .cache
         .deploys
-        .get_or_try_update(bucket, API_CACHE_TTL, state.db.deploys_over_time(bucket))
+        .get_or_try_update(
+            cache_key,
+            API_CACHE_TTL,
+            state.db.deploys_over_time(chain_id, bucket),
+        )
         .await?;
     Ok(Json(DeploysResponse {
         bucket_blocks: bucket,
@@ -463,15 +501,17 @@ async fn verified_handler(
     State(state): State<AppState>,
     Query(q): Query<BucketQuery>,
 ) -> Result<Json<VerifiedResponse>, AppError> {
-    let highest = state.db.highest_block().await?.unwrap_or(0);
-    let bucket = parse_bucket(&q, highest);
+    let chain_id = selected_chain_id(q.chain_id);
+    let highest = state.db.highest_block(chain_id).await?.unwrap_or(0);
+    let bucket = parse_bucket(&q, chain_id, highest);
+    let cache_key = BucketCacheKey { chain_id, bucket };
     let buckets = state
         .cache
         .verified
         .get_or_try_update(
-            bucket,
+            cache_key,
             API_CACHE_TTL,
-            state.db.verified_ratio_over_time(bucket),
+            state.db.verified_ratio_over_time(chain_id, bucket),
         )
         .await?;
     Ok(Json(VerifiedResponse {
@@ -484,6 +524,7 @@ async fn verified_handler(
     get,
     path = "/api/bytecode-sizes",
     tag = API_TAG,
+    params(ChainQuery),
     responses(
         (status = OK, body = SizeResponse),
         (status = INTERNAL_SERVER_ERROR, body = ApiError)
@@ -491,11 +532,17 @@ async fn verified_handler(
 )]
 async fn bytecode_sizes_handler(
     State(state): State<AppState>,
+    Query(q): Query<ChainQuery>,
 ) -> Result<Json<SizeResponse>, AppError> {
+    let chain_id = selected_chain_id(q.chain_id);
     let bins_out = state
         .cache
         .bytecode_sizes
-        .get_or_try_update(API_CACHE_TTL, state.db.bytecode_size_distribution())
+        .get_or_try_update(
+            chain_id,
+            API_CACHE_TTL,
+            state.db.bytecode_size_distribution(chain_id),
+        )
         .await?;
     Ok(Json(SizeResponse { bins: bins_out }))
 }
@@ -503,6 +550,8 @@ async fn bytecode_sizes_handler(
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 struct LimitQuery {
+    /// Chain ID to query. Defaults to Ethereum mainnet (1).
+    chain_id: Option<u64>,
     /// Maximum number of compiler versions to return.
     limit: Option<u32>,
 }
@@ -510,6 +559,8 @@ struct LimitQuery {
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 struct PageQuery {
+    /// Chain ID to query. Defaults to Ethereum mainnet (1).
+    chain_id: Option<u64>,
     /// Maximum number of contracts to return.
     limit: Option<u32>,
     /// Cursor block number from the previous page.
@@ -532,14 +583,16 @@ async fn compilers_handler(
     State(state): State<AppState>,
     Query(q): Query<LimitQuery>,
 ) -> Result<Json<CompilersResponse>, AppError> {
+    let chain_id = selected_chain_id(q.chain_id);
     let limit = q.limit.unwrap_or(15);
+    let cache_key = LimitCacheKey { chain_id, limit };
     let (compilers, total_known) = state
         .cache
         .compilers
-        .get_or_try_update(limit, API_CACHE_TTL, async {
+        .get_or_try_update(cache_key, API_CACHE_TTL, async {
             Ok((
-                state.db.top_compilers(limit).await?,
-                state.db.compiler_version_total().await?,
+                state.db.top_compilers(chain_id, limit).await?,
+                state.db.compiler_version_total(chain_id).await?,
             ))
         })
         .await?;
@@ -563,8 +616,10 @@ async fn recent_handler(
     State(state): State<AppState>,
     Query(q): Query<PageQuery>,
 ) -> Result<Json<RecentResponse>, AppError> {
+    let chain_id = selected_chain_id(q.chain_id);
     let limit = q.limit.unwrap_or(20);
     let cache_key = RecentCacheKey {
+        chain_id,
         limit,
         before_block: q.before_block,
         before_create_index: q.before_create_index,
@@ -576,7 +631,7 @@ async fn recent_handler(
         }),
         _ => None,
     };
-    let page = match state.db.recent_contracts(limit, cursor).await {
+    let page = match state.db.recent_contracts(chain_id, limit, cursor).await {
         Ok(page) => {
             state.cache.recent.insert(cache_key, page.clone()).await;
             page
@@ -636,6 +691,7 @@ async fn query_handler(
     get,
     path = "/api/languages",
     tag = API_TAG,
+    params(ChainQuery),
     responses(
         (status = OK, body = LanguagesResponse),
         (status = INTERNAL_SERVER_ERROR, body = ApiError)
@@ -643,11 +699,17 @@ async fn query_handler(
 )]
 async fn languages_handler(
     State(state): State<AppState>,
+    Query(q): Query<ChainQuery>,
 ) -> Result<Json<LanguagesResponse>, AppError> {
+    let chain_id = selected_chain_id(q.chain_id);
     let languages = state
         .cache
         .languages
-        .get_or_try_update(API_CACHE_TTL, state.db.language_distribution())
+        .get_or_try_update(
+            chain_id,
+            API_CACHE_TTL,
+            state.db.language_distribution(chain_id),
+        )
         .await?;
     Ok(Json(LanguagesResponse { languages }))
 }
@@ -656,6 +718,7 @@ async fn languages_handler(
     get,
     path = "/api/standards",
     tag = API_TAG,
+    params(ChainQuery),
     responses(
         (status = OK, body = crate::db::StandardsBreakdown),
         (status = INTERNAL_SERVER_ERROR, body = ApiError)
@@ -663,11 +726,17 @@ async fn languages_handler(
 )]
 async fn standards_handler(
     State(state): State<AppState>,
+    Query(q): Query<ChainQuery>,
 ) -> Result<Json<crate::db::StandardsBreakdown>, AppError> {
+    let chain_id = selected_chain_id(q.chain_id);
     let standards = state
         .cache
         .standards
-        .get_or_try_update(API_CACHE_TTL, state.db.standards_breakdown())
+        .get_or_try_update(
+            chain_id,
+            API_CACHE_TTL,
+            state.db.standards_breakdown(chain_id),
+        )
         .await?;
     Ok(Json(standards))
 }
@@ -713,9 +782,23 @@ async fn background_tail_loop(
     runtime: Arc<RuntimeState>,
     cache: Arc<ApiCache>,
 ) {
+    let chain_id = match crate::extract::tail::rpc_chain_id(&config.rpc).await {
+        Ok(chain_id) => Some(chain_id),
+        Err(err) => {
+            tracing::warn!(
+                "could not determine tail chain id at startup (rpc={}): {:#}",
+                config.rpc,
+                err
+            );
+            None
+        }
+    };
     tracing::info!(
-        "background tail loop starting (rpc={}, interval={:?}, confirmations={})",
+        "background tail loop starting (rpc={}, chain_id={}, interval={:?}, confirmations={})",
         config.rpc,
+        chain_id
+            .map(|chain_id| chain_id.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
         config.interval,
         config.confirmations
     );

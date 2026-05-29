@@ -19,7 +19,7 @@ use crate::{
     cli::ContractsArgs,
     types::{ChunkReport, RunReport},
     util::{
-        build_chunks, chunk_path, color_accent, color_dim, color_red, format_count,
+        build_chunks, chain_chunk_path, color_accent, color_dim, color_red, format_count,
         format_duration, print_header, print_kv, print_kv_accent, resolve_end_block,
         resolve_rpc_url, write_report,
     },
@@ -215,7 +215,7 @@ async fn process_chunk(
     chunks_total: usize,
 ) -> Result<ChunkReport> {
     let started_at = Utc::now();
-    let output_path = chunk_path(&args.output_dir, chunk.start, chunk.end);
+    let output_path = chain_chunk_path(&args.output_dir, chain_id, chunk.start, chunk.end);
 
     if output_path.exists() && !args.overwrite {
         let size_bytes = match fs::metadata(&output_path) {

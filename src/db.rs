@@ -23,7 +23,7 @@ use duckdb::{params, types::ValueRef, AccessMode, Config, Connection, Row};
 use serde_json::{Number, Value};
 use tokio::sync::Mutex;
 
-use crate::util::match_simple_glob;
+use crate::{chains::ETHEREUM_CHAIN_ID, util::match_simple_glob};
 
 const RECENT_PARQUET_FILE_LIMIT: usize = 64;
 
@@ -155,6 +155,14 @@ fn read_recent_row(row: &Row<'_>) -> duckdb::Result<RecentRowData> {
     ))
 }
 
+fn read_u64_pair(row: &Row<'_>) -> duckdb::Result<(u64, u64)> {
+    Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
+}
+
+fn read_string_u64_pair(row: &Row<'_>) -> duckdb::Result<(String, u64)> {
+    Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+}
+
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     let count: i64 = conn
         .query_row(
@@ -169,6 +177,7 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
 #[derive(Debug)]
 struct ContractParquetFile {
     path: PathBuf,
+    chain_id: Option<u64>,
     start_block: Option<u64>,
     end_block: Option<u64>,
 }
@@ -195,11 +204,16 @@ fn list_contract_parquet_files(data_dir: &Path, contracts_glob: &str) -> Result<
 }
 
 fn contract_file_with_range(path: PathBuf) -> ContractParquetFile {
-    let nums = path
+    let name = path
         .file_name()
         .and_then(|s| s.to_str())
-        .map(decimal_runs)
         .unwrap_or_default();
+    let nums = decimal_runs(name);
+    let chain_id = if name.starts_with("contracts__chain_") || name.starts_with("tail__chain_") {
+        nums.first().copied()
+    } else {
+        None
+    };
     let len = nums.len();
     let (start_block, end_block) = if len >= 2 {
         (Some(nums[len - 2]), Some(nums[len - 1]))
@@ -208,6 +222,7 @@ fn contract_file_with_range(path: PathBuf) -> ContractParquetFile {
     };
     ContractParquetFile {
         path,
+        chain_id,
         start_block,
         end_block,
     }
@@ -235,19 +250,33 @@ fn decimal_runs(input: &str) -> Vec<u64> {
     out
 }
 
-fn max_contract_file_block(files: &[PathBuf]) -> Option<u64> {
+fn max_contract_file_block_for_chain(files: &[PathBuf], chain_id: u64) -> Option<u64> {
     files
         .iter()
-        .filter_map(|path| contract_file_with_range(path.clone()).end_block)
+        .cloned()
+        .map(contract_file_with_range)
+        .filter(|file| {
+            file.chain_id == Some(chain_id)
+                || (file.chain_id.is_none() && chain_id == ETHEREUM_CHAIN_ID)
+        })
+        .filter_map(|file| file.end_block)
         .max()
 }
 
-fn recent_contract_parquet_files(files: &[PathBuf], cursor: Option<RecentCursor>) -> Vec<PathBuf> {
+fn recent_contract_parquet_files(
+    files: &[PathBuf],
+    chain_id: u64,
+    cursor: Option<RecentCursor>,
+) -> Vec<PathBuf> {
     let cursor_block = cursor.map(|cursor| cursor.block_number);
     let mut ranged = files
         .iter()
         .cloned()
         .map(contract_file_with_range)
+        .filter(|file| {
+            file.chain_id == Some(chain_id)
+                || (file.chain_id.is_none() && chain_id == ETHEREUM_CHAIN_ID)
+        })
         .collect::<Vec<_>>();
     ranged.sort_by(|a, b| {
         b.end_block
@@ -277,7 +306,11 @@ fn parquet_read_list(files: &[PathBuf]) -> String {
         .join(", ")
 }
 
-fn create_recent_parquet_contracts_view(conn: &Connection, files: &[PathBuf]) -> Result<()> {
+fn create_recent_parquet_contracts_view(
+    conn: &Connection,
+    files: &[PathBuf],
+    chain_id: u64,
+) -> Result<()> {
     let body = if files.is_empty() {
         r#"
             SELECT
@@ -307,8 +340,10 @@ fn create_recent_parquet_contracts_view(conn: &Connection, files: &[PathBuf]) ->
                     init_code_hash, n_init_code_bytes, n_code_bytes,
                     code_hash, chain_id
                 FROM read_parquet([{}], union_by_name = true)
+                WHERE chain_id = {}
             "#,
-            parquet_read_list(files)
+            parquet_read_list(files),
+            chain_id
         )
     };
     conn.execute_batch(&format!(
@@ -581,6 +616,11 @@ fn create_metadata_current_view(conn: &Connection) -> Result<()> {
 
 fn create_enrichment_current_view(conn: &Connection) -> Result<()> {
     let sql = if table_exists(conn, "enrichment")? {
+        let chain_id = if column_exists(conn, "enrichment", "chain_id")? {
+            "chain_id"
+        } else {
+            "1::UBIGINT AS chain_id"
+        };
         let verification_source = if column_exists(conn, "enrichment", "verification_source")? {
             "verification_source"
         } else {
@@ -606,6 +646,7 @@ fn create_enrichment_current_view(conn: &Connection) -> Result<()> {
         CREATE OR REPLACE TEMP VIEW enrichment_current AS
         SELECT
             contract_address,
+            {chain_id},
             is_verified,
             contract_name,
             checked_at,
@@ -621,6 +662,7 @@ fn create_enrichment_current_view(conn: &Connection) -> Result<()> {
         CREATE OR REPLACE TEMP VIEW enrichment_current AS
         SELECT
             CAST(NULL AS BLOB) AS contract_address,
+            CAST(NULL AS UBIGINT) AS chain_id,
             CAST(NULL AS BOOLEAN) AS is_verified,
             CAST(NULL AS VARCHAR) AS contract_name,
             CAST(NULL AS TIMESTAMP) AS checked_at,
@@ -636,14 +678,14 @@ fn create_enrichment_current_view(conn: &Connection) -> Result<()> {
         .context("create enrichment compatibility view")
 }
 
-fn verification_registry_loaded(conn: &Connection) -> Result<bool> {
+fn verification_registry_loaded(conn: &Connection, chain_id: u64) -> Result<bool> {
     if !table_exists(conn, "verification_registry_imports")? {
         return Ok(false);
     }
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM verification_registry_imports WHERE source = 'verifier_alliance'",
-            [],
+            "SELECT COUNT(*) FROM verification_registry_imports WHERE source = 'verifier_alliance' AND chain_id = ?",
+            params![chain_id],
             |row| row.get(0),
         )
         .unwrap_or(0);
@@ -779,7 +821,7 @@ fn create_standard_query_views(conn: &Connection, has_zellic: bool) -> Result<()
             LEFT JOIN bytecode_metadata_current m ON c.contract_address = m.contract_address
         "#
     };
-    let is_verified_expr = if verification_registry_loaded(conn)? {
+    let is_verified_expr = if table_exists(conn, "verification_registry_imports")? {
         "COALESCE(e.is_verified, false) AS is_verified"
     } else {
         "e.is_verified"
@@ -821,7 +863,9 @@ fn create_standard_query_views(conn: &Connection, has_zellic: bool) -> Result<()
             e.checked_at AS verification_checked_at
         FROM contracts c
         {metadata_join}
-        LEFT JOIN enrichment_current e ON c.contract_address = e.contract_address;
+        LEFT JOIN enrichment_current e
+          ON c.contract_address = e.contract_address
+         AND c.chain_id = e.chain_id;
         "#
     );
     conn.execute_batch(&contract_metadata_sql)
@@ -930,6 +974,7 @@ impl Db {
             r#"
             CREATE TABLE IF NOT EXISTS enrichment (
                 contract_address BLOB,
+                chain_id UBIGINT DEFAULT 1,
                 is_verified BOOLEAN NOT NULL,
                 contract_name VARCHAR,
                 checked_at TIMESTAMP NOT NULL
@@ -937,10 +982,13 @@ impl Db {
             -- Track where each verification came from (verifier_alliance).
             -- Added in a later migration; the IF NOT EXISTS guard keeps older
             -- databases working without an explicit migration step.
+            ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS chain_id UBIGINT DEFAULT 1;
             ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS verification_source VARCHAR;
             ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS match_type VARCHAR;
             ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS block_number UINTEGER;
             ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS create_index UINTEGER;
+            UPDATE enrichment SET chain_id = 1 WHERE chain_id IS NULL;
+            CREATE INDEX IF NOT EXISTS enrichment_chain_addr_idx ON enrichment(chain_id, contract_address);
             CREATE INDEX IF NOT EXISTS enrichment_verified_idx ON enrichment(is_verified);
             CREATE INDEX IF NOT EXISTS enrichment_source_idx    ON enrichment(verification_source);
 
@@ -1169,12 +1217,12 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn stats(&self) -> Result<Stats> {
+    pub async fn stats(&self, chain_id: u64) -> Result<Stats> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || -> Result<Stats> {
             let conn = inner.blocking_lock();
             let (zellic_total, zellic_first, zellic_last): (i64, Option<u32>, Option<u32>) =
-                if table_exists(&conn, "zellic_block_counts")? {
+                if chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_block_counts")? {
                     conn.query_row(
                         r#"
                         SELECT
@@ -1187,7 +1235,8 @@ impl Db {
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .unwrap_or((0, None, None))
-                } else if table_exists(&conn, "zellic_contracts")? {
+                } else if chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_contracts")?
+                {
                     conn.query_row(
                         "SELECT COUNT(*), MIN(block_number), MAX(block_number) FROM zellic_contracts",
                         [],
@@ -1199,8 +1248,8 @@ impl Db {
                 };
             let (parquet_total, parquet_first, parquet_last): (i64, Option<u32>, Option<u32>) =
                 conn.query_row(
-                    "SELECT COUNT(*), MIN(block_number), MAX(block_number) FROM parquet_contracts",
-                    [],
+                    "SELECT COUNT(*), MIN(block_number), MAX(block_number) FROM parquet_contracts WHERE chain_id = ?",
+                    params![chain_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .unwrap_or((0, None, None));
@@ -1217,17 +1266,20 @@ impl Db {
                 .max()
                 .unwrap_or(0) as u64;
 
-            let registry_loaded = verification_registry_loaded(&conn)?;
+            let registry_loaded = verification_registry_loaded(&conn, chain_id)?;
             let (enriched, verified): (i64, i64) = if registry_loaded {
-                let verified_zellic: i64 = if table_exists(&conn, "zellic_contracts")? {
+                let verified_zellic: i64 =
+                    if chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_contracts")? {
                     conn.query_row(
                         r#"
                     SELECT COUNT(*)
                     FROM zellic_contracts c
-                    JOIN enrichment e ON c.contract_address = e.contract_address
+                    JOIN enrichment_current e
+                      ON c.contract_address = e.contract_address
+                     AND e.chain_id = ?
                     WHERE e.is_verified
                     "#,
-                        [],
+                        params![chain_id],
                         |row| row.get(0),
                     )
                     .unwrap_or(0)
@@ -1239,10 +1291,13 @@ impl Db {
                         r#"
                         SELECT COUNT(*)
                         FROM parquet_contracts c
-                        JOIN enrichment e ON c.contract_address = e.contract_address
+                        JOIN enrichment_current e
+                          ON c.contract_address = e.contract_address
+                         AND c.chain_id = e.chain_id
                         WHERE e.is_verified
+                          AND c.chain_id = ?
                         "#,
-                        [],
+                        params![chain_id],
                         |row| row.get(0),
                     )
                     .unwrap_or(0);
@@ -1250,8 +1305,8 @@ impl Db {
                 (total as i64, verified)
             } else {
                 conn.query_row(
-                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE is_verified) FROM enrichment",
-                    [],
+                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE is_verified) FROM enrichment_current WHERE chain_id = ?",
+                    params![chain_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap_or((0, 0))
@@ -1286,12 +1341,18 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn deploys_over_time(&self, bucket_blocks: u64) -> Result<Vec<DeployBucket>> {
+    pub async fn deploys_over_time(
+        &self,
+        chain_id: u64,
+        bucket_blocks: u64,
+    ) -> Result<Vec<DeployBucket>> {
         let inner = self.inner.clone();
         let bucket_blocks = bucket_blocks.max(1);
         tokio::task::spawn_blocking(move || -> Result<Vec<DeployBucket>> {
             let conn = inner.blocking_lock();
-            let sql = if table_exists(&conn, "zellic_block_counts")? {
+            let sql = if chain_id == ETHEREUM_CHAIN_ID
+                && table_exists(&conn, "zellic_block_counts")?
+            {
                 r#"
                 SELECT
                     (block_number / ?)::UBIGINT AS bucket_id,
@@ -1301,7 +1362,7 @@ impl Db {
                 GROUP BY bucket_id
                 ORDER BY bucket_id
                 "#
-            } else if table_exists(&conn, "zellic_contracts")? {
+            } else if chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_contracts")? {
                 r#"
                 SELECT
                     (block_number / ?)::UBIGINT AS bucket_id,
@@ -1318,16 +1379,20 @@ impl Db {
                     COUNT(*)::UBIGINT AS cnt
                 FROM contracts
                 WHERE block_number IS NOT NULL
+                  AND chain_id = ?
                 GROUP BY bucket_id
                 ORDER BY bucket_id
                 "#
             };
             let mut stmt = conn.prepare(sql)?;
-            let rows = stmt.query_map(params![bucket_blocks], |row| {
-                let bucket_id: u64 = row.get(0)?;
-                let count: u64 = row.get(1)?;
-                Ok((bucket_id, count))
-            })?;
+            let rows = if chain_id == ETHEREUM_CHAIN_ID
+                && (table_exists(&conn, "zellic_block_counts")?
+                    || table_exists(&conn, "zellic_contracts")?)
+            {
+                stmt.query_map(params![bucket_blocks], read_u64_pair)?
+            } else {
+                stmt.query_map(params![bucket_blocks, chain_id], read_u64_pair)?
+            };
             let mut out = Vec::new();
             for r in rows {
                 let (bucket_id, count) = r?;
@@ -1337,7 +1402,7 @@ impl Db {
                 out.push(DeployBucket {
                     block_start,
                     block_end,
-                    timestamp: crate::blocks::block_timestamp(mid),
+                    timestamp: crate::blocks::block_timestamp(chain_id, mid),
                     count,
                 });
             }
@@ -1349,6 +1414,7 @@ impl Db {
 
     pub async fn verified_ratio_over_time(
         &self,
+        chain_id: u64,
         bucket_blocks: u64,
     ) -> Result<Vec<VerifiedRatioBucket>> {
         let inner = self.inner.clone();
@@ -1356,8 +1422,8 @@ impl Db {
         tokio::task::spawn_blocking(move || -> Result<Vec<VerifiedRatioBucket>> {
             let conn = inner.blocking_lock();
             let mut out = Vec::new();
-            let registry_loaded = verification_registry_loaded(&conn)?;
-            if table_exists(&conn, "zellic_contracts")? {
+            let registry_loaded = verification_registry_loaded(&conn, chain_id)?;
+            if chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_contracts")? {
                 if !table_exists(&conn, "zellic_block_counts")? {
                     return Ok(out);
                 }
@@ -1377,7 +1443,9 @@ impl Db {
                             (z.block_number / ?)::UBIGINT AS bucket_id,
                             COUNT(*)::UBIGINT AS verified
                         FROM zellic_contracts z
-                        JOIN enrichment_current e ON z.contract_address = e.contract_address
+                        JOIN enrichment_current e
+                          ON z.contract_address = e.contract_address
+                         AND e.chain_id = ?
                         WHERE z.block_number IS NOT NULL
                           AND e.is_verified
                         GROUP BY bucket_id
@@ -1408,6 +1476,7 @@ impl Db {
                             COUNT(*) FILTER (WHERE is_verified IS FALSE)::UBIGINT AS unverified
                         FROM enrichment_current
                         WHERE block_number IS NOT NULL
+                          AND chain_id = ?
                         GROUP BY bucket_id
                     )
                     SELECT
@@ -1426,7 +1495,7 @@ impl Db {
                     "#
                 };
                 let mut stmt = conn.prepare(sql)?;
-                let rows = stmt.query_map(params![bucket_blocks, bucket_blocks], |row| {
+                let rows = stmt.query_map(params![bucket_blocks, bucket_blocks, chain_id], |row| {
                     Ok((
                         row.get::<_, u64>(0)?,
                         row.get::<_, u64>(1)?,
@@ -1442,7 +1511,7 @@ impl Db {
                     out.push(VerifiedRatioBucket {
                         block_start,
                         block_end,
-                        timestamp: crate::blocks::block_timestamp(mid),
+                        timestamp: crate::blocks::block_timestamp(chain_id, mid),
                         verified,
                         unverified,
                         unknown,
@@ -1459,8 +1528,11 @@ impl Db {
                     COUNT(*) FILTER (WHERE e.is_verified IS NULL OR e.is_verified IS FALSE)::UBIGINT AS unverified,
                     0::UBIGINT AS unknown
                 FROM contracts c
-                LEFT JOIN enrichment e ON c.contract_address = e.contract_address
+                LEFT JOIN enrichment_current e
+                  ON c.contract_address = e.contract_address
+                 AND c.chain_id = e.chain_id
                 WHERE c.block_number IS NOT NULL
+                  AND c.chain_id = ?
                 GROUP BY bucket_id
                 ORDER BY bucket_id
                 "#
@@ -1472,14 +1544,17 @@ impl Db {
                     COUNT(*) FILTER (WHERE e.is_verified IS FALSE)::UBIGINT AS unverified,
                     COUNT(*) FILTER (WHERE e.is_verified IS NULL)::UBIGINT AS unknown
                 FROM contracts c
-                LEFT JOIN enrichment e ON c.contract_address = e.contract_address
+                LEFT JOIN enrichment_current e
+                  ON c.contract_address = e.contract_address
+                 AND c.chain_id = e.chain_id
                 WHERE c.block_number IS NOT NULL
+                  AND c.chain_id = ?
                 GROUP BY bucket_id
                 ORDER BY bucket_id
                 "#
             };
             let mut stmt = conn.prepare(sql)?;
-            let rows = stmt.query_map(params![bucket_blocks], |row| {
+            let rows = stmt.query_map(params![bucket_blocks, chain_id], |row| {
                 Ok((
                     row.get::<_, u64>(0)?,
                     row.get::<_, u64>(1)?,
@@ -1495,7 +1570,7 @@ impl Db {
                 out.push(VerifiedRatioBucket {
                     block_start,
                     block_end,
-                    timestamp: crate::blocks::block_timestamp(mid),
+                    timestamp: crate::blocks::block_timestamp(chain_id, mid),
                     verified,
                     unverified,
                     unknown,
@@ -1507,7 +1582,7 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn bytecode_size_distribution(&self) -> Result<Vec<SizeBin>> {
+    pub async fn bytecode_size_distribution(&self, chain_id: u64) -> Result<Vec<SizeBin>> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<SizeBin>> {
             let conn = inner.blocking_lock();
@@ -1529,9 +1604,10 @@ impl Db {
                 (16_385, 24_576, "16-24 KB"),
             ];
             let mut counts = vec![0u64; bucket_defs.len()];
-            let sql = if table_exists(&conn, "zellic_bytecodes")?
-                && table_exists(&conn, "zellic_bytecode_counts")?
-            {
+            let use_zellic = chain_id == ETHEREUM_CHAIN_ID
+                && table_exists(&conn, "zellic_bytecodes")?
+                && table_exists(&conn, "zellic_bytecode_counts")?;
+            let sql = if use_zellic {
                 r#"
                 SELECT
                     CASE
@@ -1577,17 +1653,21 @@ impl Db {
                     END AS bin_id,
                     COUNT(*)::UBIGINT AS cnt
                 FROM contracts c
-                LEFT JOIN bytecode_metadata_current m ON c.contract_address = m.contract_address
+                LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
                 WHERE c.n_code_bytes IS NOT NULL
                   AND c.n_code_bytes <= 24576
+                  AND c.chain_id = ?
                 GROUP BY bin_id
                 ORDER BY bin_id
                 "#
                 .to_string()
             };
             let mut stmt = conn.prepare(&sql)?;
-            let rows =
-                stmt.query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)))?;
+            let rows = if use_zellic {
+                stmt.query_map([], read_u64_pair)?
+            } else {
+                stmt.query_map(params![chain_id], read_u64_pair)?
+            };
             for r in rows {
                 let (bin_id, count) = r?;
                 if let Some(slot) = counts.get_mut(bin_id as usize) {
@@ -1609,7 +1689,7 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn top_compilers(&self, limit: u32) -> Result<Vec<CompilerCount>> {
+    pub async fn top_compilers(&self, chain_id: u64, limit: u32) -> Result<Vec<CompilerCount>> {
         let inner = self.inner.clone();
         let limit = limit.clamp(1, 50);
         tokio::task::spawn_blocking(move || -> Result<Vec<CompilerCount>> {
@@ -1617,9 +1697,10 @@ impl Db {
             // Compiler distribution is bytecode-derived. Verification sources
             // can confirm source publication, but local decode remains the
             // source of truth for compiler metadata in this dashboard.
-            let sql = if table_exists(&conn, "zellic_bytecode_counts")?
-                && table_exists(&conn, "bytecode_metadata_by_hash")?
-            {
+            let use_zellic = chain_id == ETHEREUM_CHAIN_ID
+                && table_exists(&conn, "zellic_bytecode_counts")?
+                && table_exists(&conn, "bytecode_metadata_by_hash")?;
+            let sql = if use_zellic {
                 r#"
                 SELECT m.compiler_version, SUM(c.contract_count)::UBIGINT AS cnt
                 FROM bytecode_metadata_by_hash m
@@ -1631,18 +1712,28 @@ impl Db {
                 "#
             } else {
                 r#"
-                SELECT compiler_version, COUNT(*)::UBIGINT AS cnt
-                FROM bytecode_metadata_current
-                WHERE compiler_version IS NOT NULL
-                GROUP BY compiler_version
+                WITH counts AS (
+                    SELECT code_hash, COUNT(*)::UBIGINT AS contract_count
+                    FROM contracts
+                    WHERE chain_id = ?
+                      AND code_hash IS NOT NULL
+                    GROUP BY code_hash
+                )
+                SELECT m.compiler_version, SUM(c.contract_count)::UBIGINT AS cnt
+                FROM counts c
+                JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
+                WHERE m.compiler_version IS NOT NULL
+                GROUP BY m.compiler_version
                 ORDER BY cnt DESC
                 LIMIT ?
                 "#
             };
             let mut stmt = conn.prepare(sql)?;
-            let rows = stmt.query_map(params![limit as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-            })?;
+            let rows = if use_zellic {
+                stmt.query_map(params![limit as i64], read_string_u64_pair)?
+            } else {
+                stmt.query_map(params![chain_id, limit as i64], read_string_u64_pair)?
+            };
             let mut out = Vec::new();
             for r in rows {
                 let (compiler_version, count) = r?;
@@ -1657,11 +1748,12 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn compiler_version_total(&self) -> Result<u64> {
+    pub async fn compiler_version_total(&self, chain_id: u64) -> Result<u64> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || -> Result<u64> {
             let conn = inner.blocking_lock();
-            if table_exists(&conn, "zellic_bytecode_counts")?
+            if chain_id == ETHEREUM_CHAIN_ID
+                && table_exists(&conn, "zellic_bytecode_counts")?
                 && table_exists(&conn, "bytecode_metadata_by_hash")?
             {
                 let count: i64 = conn
@@ -1680,8 +1772,20 @@ impl Db {
             }
             let count: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM bytecode_metadata_current WHERE compiler_version IS NOT NULL",
-                    [],
+                    r#"
+                    WITH counts AS (
+                        SELECT code_hash, COUNT(*)::UBIGINT AS contract_count
+                        FROM contracts
+                        WHERE chain_id = ?
+                          AND code_hash IS NOT NULL
+                        GROUP BY code_hash
+                    )
+                    SELECT COALESCE(SUM(c.contract_count), 0)::BIGINT
+                    FROM counts c
+                    JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
+                    WHERE m.compiler_version IS NOT NULL
+                    "#,
+                    params![chain_id],
                     |row| row.get(0),
                 )
                 .unwrap_or(0);
@@ -1691,13 +1795,14 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn language_distribution(&self) -> Result<Vec<LanguageCount>> {
+    pub async fn language_distribution(&self, chain_id: u64) -> Result<Vec<LanguageCount>> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<LanguageCount>> {
             let conn = inner.blocking_lock();
-            let sql = if table_exists(&conn, "zellic_bytecode_counts")?
-                && table_exists(&conn, "bytecode_metadata_by_hash")?
-            {
+            let use_zellic = chain_id == ETHEREUM_CHAIN_ID
+                && table_exists(&conn, "zellic_bytecode_counts")?
+                && table_exists(&conn, "bytecode_metadata_by_hash")?;
+            let sql = if use_zellic {
                 r#"
                 SELECT COALESCE(m.language, 'unknown') AS lang,
                        SUM(c.contract_count)::UBIGINT AS cnt
@@ -1708,16 +1813,27 @@ impl Db {
                 "#
             } else {
                 r#"
-                SELECT COALESCE(language, 'unknown') AS lang, COUNT(*)::UBIGINT AS cnt
-                FROM bytecode_metadata_current
+                WITH counts AS (
+                    SELECT code_hash, COUNT(*)::UBIGINT AS contract_count
+                    FROM contracts
+                    WHERE chain_id = ?
+                      AND code_hash IS NOT NULL
+                    GROUP BY code_hash
+                )
+                SELECT COALESCE(m.language, 'unknown') AS lang,
+                       SUM(c.contract_count)::UBIGINT AS cnt
+                FROM counts c
+                LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
                 GROUP BY lang
                 ORDER BY cnt DESC
                 "#
             };
             let mut stmt = conn.prepare(sql)?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-            })?;
+            let rows = if use_zellic {
+                stmt.query_map([], read_string_u64_pair)?
+            } else {
+                stmt.query_map(params![chain_id], read_string_u64_pair)?
+            };
             let mut out = Vec::new();
             for r in rows {
                 let (language, count) = r?;
@@ -1729,11 +1845,12 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn standards_breakdown(&self) -> Result<StandardsBreakdown> {
+    pub async fn standards_breakdown(&self, chain_id: u64) -> Result<StandardsBreakdown> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || -> Result<StandardsBreakdown> {
             let conn = inner.blocking_lock();
-            if table_exists(&conn, "zellic_bytecode_counts")?
+            if chain_id == ETHEREUM_CHAIN_ID
+                && table_exists(&conn, "zellic_bytecode_counts")?
                 && table_exists(&conn, "bytecode_metadata_by_hash")?
             {
                 return conn
@@ -1780,18 +1897,26 @@ impl Db {
             }
             conn.query_row(
                 r#"
+                WITH counts AS (
+                    SELECT code_hash, COUNT(*)::UBIGINT AS contract_count
+                    FROM contracts
+                    WHERE chain_id = ?
+                      AND code_hash IS NOT NULL
+                    GROUP BY code_hash
+                )
                 SELECT
-                    COUNT(*) FILTER (WHERE is_erc20)::UBIGINT,
-                    COUNT(*) FILTER (WHERE is_erc721)::UBIGINT,
-                    COUNT(*) FILTER (WHERE is_erc1155)::UBIGINT,
-                    COUNT(*) FILTER (WHERE is_proxy_eip1967)::UBIGINT,
-                    COUNT(*) FILTER (WHERE is_proxy_minimal)::UBIGINT,
-                    COUNT(*) FILTER (WHERE uses_push0)::UBIGINT,
-                    COUNT(*) FILTER (WHERE has_source_hash)::UBIGINT,
-                    COUNT(*)::UBIGINT
-                FROM bytecode_metadata_current
+                    COALESCE(SUM(CASE WHEN m.is_erc20 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.is_erc721 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.is_erc1155 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.is_proxy_eip1967 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.is_proxy_minimal THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.uses_push0 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.has_source_hash THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.code_hash IS NOT NULL THEN c.contract_count ELSE 0 END), 0)::UBIGINT
+                FROM counts c
+                LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
                 "#,
-                [],
+                params![chain_id],
                 |row| {
                     Ok(StandardsBreakdown {
                         erc20: row.get(0)?,
@@ -1824,6 +1949,7 @@ impl Db {
 
     pub async fn recent_contracts(
         &self,
+        chain_id: u64,
         limit: u32,
         cursor: Option<RecentCursor>,
     ) -> Result<RecentPage> {
@@ -1838,8 +1964,8 @@ impl Db {
                 && table_exists(&conn, "zellic_bytecodes")?;
             let has_hash_metadata = table_exists(&conn, "bytecode_metadata_by_hash")?;
             let parquet_files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
-            let max_contracts_block = max_contract_file_block(&parquet_files);
-            let max_zellic_block: Option<u64> = if has_zellic {
+            let max_contracts_block = max_contract_file_block_for_chain(&parquet_files, chain_id);
+            let max_zellic_block: Option<u64> = if chain_id == ETHEREUM_CHAIN_ID && has_zellic {
                 let block: Option<u32> = conn
                     .query_row(
                         "SELECT MAX(block_number) FROM zellic_contracts",
@@ -1857,10 +1983,30 @@ impl Db {
                     .map(|cursor| cursor.block_number > max_zellic_block.unwrap_or(0))
                     .unwrap_or(true);
             if use_external_recent {
-                let recent_files = recent_contract_parquet_files(&parquet_files, cursor);
-                create_recent_parquet_contracts_view(&conn, &recent_files)?;
+                let recent_files = recent_contract_parquet_files(&parquet_files, chain_id, cursor);
+                create_recent_parquet_contracts_view(&conn, &recent_files, chain_id)?;
             }
-            let registry_loaded = verification_registry_loaded(&conn)?;
+            conn.execute_batch(&format!(
+                r#"
+                CREATE OR REPLACE TEMP VIEW recent_enrichment AS
+                SELECT *
+                FROM enrichment_current
+                WHERE chain_id = {};
+                "#,
+                chain_id
+            ))
+            .context("create recent enrichment view")?;
+            conn.execute_batch(&format!(
+                r#"
+                CREATE OR REPLACE TEMP VIEW recent_contracts_all AS
+                SELECT *
+                FROM contracts
+                WHERE chain_id = {};
+                "#,
+                chain_id
+            ))
+            .context("create recent contracts view")?;
+            let registry_loaded = verification_registry_loaded(&conn, chain_id)?;
 
             // For Zellic imports, compiler metadata is keyed by bytecode hash.
             // Select the tiny recent page first, then join hash metadata; going
@@ -1895,7 +2041,7 @@ impl Db {
                     e.contract_name,
                     h.compiler_version
                 FROM page
-                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 LEFT JOIN bytecode_metadata_by_hash h ON page.code_hash = h.code_hash
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
@@ -1924,7 +2070,7 @@ impl Db {
                     e.contract_name,
                     h.compiler_version
                 FROM page
-                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 LEFT JOIN bytecode_metadata_by_hash h ON page.code_hash = h.code_hash
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
@@ -1956,7 +2102,7 @@ impl Db {
                     e.contract_name,
                     CAST(NULL AS VARCHAR) AS compiler_version
                 FROM page
-                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
             } else if use_external_recent {
@@ -1983,7 +2129,7 @@ impl Db {
                     e.contract_name,
                     CAST(NULL AS VARCHAR) AS compiler_version
                 FROM page
-                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
             } else if has_zellic && has_hash_metadata && cursor.is_some() {
@@ -2014,7 +2160,7 @@ impl Db {
                     h.compiler_version
                 FROM page
                 LEFT JOIN zellic_bytecodes b ON page.bytecode_hash = b.code_hash
-                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 LEFT JOIN bytecode_metadata_by_hash h ON page.bytecode_hash = h.code_hash
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
@@ -2042,7 +2188,7 @@ impl Db {
                     h.compiler_version
                 FROM page
                 LEFT JOIN zellic_bytecodes b ON page.bytecode_hash = b.code_hash
-                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 LEFT JOIN bytecode_metadata_by_hash h ON page.bytecode_hash = h.code_hash
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
@@ -2074,7 +2220,7 @@ impl Db {
                     CAST(NULL AS VARCHAR) AS compiler_version
                 FROM page
                 LEFT JOIN zellic_bytecodes b ON page.bytecode_hash = b.code_hash
-                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
             } else if has_zellic {
@@ -2101,7 +2247,7 @@ impl Db {
                     CAST(NULL AS VARCHAR) AS compiler_version
                 FROM page
                 LEFT JOIN zellic_bytecodes b ON page.bytecode_hash = b.code_hash
-                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
             } else if cursor.is_some() {
@@ -2113,7 +2259,7 @@ impl Db {
                         c.create_index,
                         c.deployer,
                         c.n_code_bytes
-                    FROM contracts c
+                    FROM recent_contracts_all c
                     WHERE c.block_number IS NOT NULL
                       AND (
                           c.block_number < ?
@@ -2132,7 +2278,7 @@ impl Db {
                     e.contract_name,
                     b.compiler_version
                 FROM page
-                LEFT JOIN enrichment e        ON page.contract_address = e.contract_address
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 LEFT JOIN bytecode_metadata_current b ON page.contract_address = b.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
@@ -2145,7 +2291,7 @@ impl Db {
                         c.create_index,
                         c.deployer,
                         c.n_code_bytes
-                    FROM contracts c
+                    FROM recent_contracts_all c
                     WHERE c.block_number IS NOT NULL
                     ORDER BY c.block_number DESC, c.create_index DESC
                     LIMIT ?
@@ -2160,7 +2306,7 @@ impl Db {
                     e.contract_name,
                     b.compiler_version
                 FROM page
-                LEFT JOIN enrichment e        ON page.contract_address = e.contract_address
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 LEFT JOIN bytecode_metadata_current b ON page.contract_address = b.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
@@ -2192,7 +2338,7 @@ impl Db {
                     address: format!("0x{}", hex::encode(&addr)),
                     block_number: block_u64,
                     create_index: create_index as u64,
-                    timestamp: crate::blocks::block_timestamp(block_u64),
+                    timestamp: crate::blocks::block_timestamp(chain_id, block_u64),
                     deployer: format!("0x{}", hex::encode(deployer.unwrap_or_default())),
                     n_code_bytes: n_code.unwrap_or(0) as u64,
                     is_verified,
@@ -2214,37 +2360,51 @@ impl Db {
         })
     }
 
-    pub async fn highest_block(&self) -> Result<Option<u64>> {
+    pub async fn highest_block(&self, chain_id: u64) -> Result<Option<u64>> {
         let inner = self.inner.clone();
         let data_dir = self.data_dir.clone();
         let contracts_glob = self.contracts_glob.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<u64>> {
-            let parquet_max =
-                max_contract_file_block(&list_contract_parquet_files(&data_dir, &contracts_glob)?);
+            let parquet_files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
+            let parquet_filename_max = max_contract_file_block_for_chain(&parquet_files, chain_id);
             let conn = inner.blocking_lock();
-            let zellic_max = if table_exists(&conn, "zellic_contracts")? {
-                let block: Option<u32> = conn
-                    .query_row(
-                        "SELECT MAX(block_number) FROM zellic_contracts",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(None);
-                block.map(u64::from)
-            } else {
-                None
-            };
-            let known_max = [parquet_max, zellic_max].into_iter().flatten().max();
-            if known_max.is_some() {
-                return Ok(known_max);
-            }
-
-            let block: Option<u32> = conn
-                .query_row("SELECT MAX(block_number) FROM contracts", [], |row| {
-                    row.get(0)
-                })
+            let zellic_max =
+                if chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_contracts")? {
+                    let block: Option<u32> = conn
+                        .query_row(
+                            "SELECT MAX(block_number) FROM zellic_contracts",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(None);
+                    block.map(u64::from)
+                } else {
+                    None
+                };
+            let parquet_view_max: Option<u32> = conn
+                .query_row(
+                    "SELECT MAX(block_number) FROM parquet_contracts WHERE chain_id = ?",
+                    params![chain_id],
+                    |row| row.get(0),
+                )
                 .unwrap_or(None);
-            Ok(block.map(u64::from))
+
+            let contracts_view_max: Option<u32> = conn
+                .query_row(
+                    "SELECT MAX(block_number) FROM contracts WHERE chain_id = ?",
+                    params![chain_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(None);
+            Ok([
+                parquet_filename_max,
+                parquet_view_max.map(u64::from),
+                contracts_view_max.map(u64::from),
+                zellic_max,
+            ]
+            .into_iter()
+            .flatten()
+            .max())
         })
         .await
         .map_err(|e| anyhow!("join error: {}", e))?
@@ -2261,7 +2421,11 @@ mod tests {
 
     use duckdb::Connection;
 
-    use super::{max_contract_file_block, recent_contract_parquet_files, Db, RecentCursor};
+    use crate::chains::ETHEREUM_CHAIN_ID;
+
+    use super::{
+        max_contract_file_block_for_chain, recent_contract_parquet_files, Db, RecentCursor,
+    };
 
     struct TestDir {
         path: PathBuf,
@@ -2326,8 +2490,11 @@ mod tests {
     }
 
     fn write_backfill_parquet(data_dir: &Path) {
-        let path = data_dir.join("contracts__0000000200__0000000200.parquet");
-        let path_sql = path.display().to_string().replace('\'', "''");
+        let ethereum_path = data_dir.join("contracts__0000000200__0000000200.parquet");
+        let ethereum_path_sql = ethereum_path.display().to_string().replace('\'', "''");
+        let gnosis_path =
+            data_dir.join("contracts__chain_0000000100__0000000300__0000000300.parquet");
+        let gnosis_path_sql = gnosis_path.display().to_string().replace('\'', "''");
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(&format!(
             r#"
@@ -2347,7 +2514,25 @@ mod tests {
                     2::UINTEGER AS n_code_bytes,
                     unhex(repeat('09', 32)) AS code_hash,
                     1::UBIGINT AS chain_id
-            ) TO '{path_sql}' (FORMAT PARQUET);
+            ) TO '{ethereum_path_sql}' (FORMAT PARQUET);
+
+            COPY (
+                SELECT
+                    300::UINTEGER AS block_number,
+                    unhex(repeat('13', 32)) AS block_hash,
+                    0::UINTEGER AS create_index,
+                    unhex(repeat('14', 32)) AS transaction_hash,
+                    unhex(repeat('15', 20)) AS contract_address,
+                    unhex(repeat('16', 20)) AS deployer,
+                    unhex(repeat('17', 20)) AS factory,
+                    unhex('6000') AS init_code,
+                    unhex('6001') AS code,
+                    unhex(repeat('18', 32)) AS init_code_hash,
+                    2::UINTEGER AS n_init_code_bytes,
+                    2::UINTEGER AS n_code_bytes,
+                    unhex(repeat('19', 32)) AS code_hash,
+                    100::UBIGINT AS chain_id
+            ) TO '{gnosis_path_sql}' (FORMAT PARQUET);
             "#
         ))
         .unwrap();
@@ -2357,20 +2542,35 @@ mod tests {
     fn recent_parquet_selection_uses_filename_block_ranges() {
         let files = vec![
             PathBuf::from("/tmp/contracts__0021850001__0021950000.parquet"),
-            PathBuf::from("/tmp/tail__0025330032__0025330040.parquet"),
-            PathBuf::from("/tmp/tail__0025330041__0025330048.parquet"),
+            PathBuf::from("/tmp/tail__chain_0000000001__0025330032__0025330040.parquet"),
+            PathBuf::from("/tmp/tail__chain_0000000001__0025330041__0025330048.parquet"),
+            PathBuf::from("/tmp/tail__chain_0000000100__0040000001__0040000048.parquet"),
         ];
 
-        assert_eq!(max_contract_file_block(&files), Some(25_330_048));
+        assert_eq!(
+            max_contract_file_block_for_chain(&files, ETHEREUM_CHAIN_ID),
+            Some(25_330_048)
+        );
+        assert_eq!(
+            max_contract_file_block_for_chain(&files, 100),
+            Some(40_000_048)
+        );
 
-        let latest = recent_contract_parquet_files(&files, None);
+        let latest = recent_contract_parquet_files(&files, ETHEREUM_CHAIN_ID, None);
         assert_eq!(
             latest[0].file_name().and_then(|name| name.to_str()),
-            Some("tail__0025330041__0025330048.parquet")
+            Some("tail__chain_0000000001__0025330041__0025330048.parquet")
+        );
+
+        let gnosis_latest = recent_contract_parquet_files(&files, 100, None);
+        assert_eq!(
+            gnosis_latest[0].file_name().and_then(|name| name.to_str()),
+            Some("tail__chain_0000000100__0040000001__0040000048.parquet")
         );
 
         let cursor_page = recent_contract_parquet_files(
             &files,
+            ETHEREUM_CHAIN_ID,
             Some(RecentCursor {
                 block_number: 25_330_040,
                 create_index: 0,
@@ -2378,7 +2578,7 @@ mod tests {
         );
         assert_eq!(
             cursor_page[0].file_name().and_then(|name| name.to_str()),
-            Some("tail__0025330032__0025330040.parquet")
+            Some("tail__chain_0000000001__0025330032__0025330040.parquet")
         );
     }
 
@@ -2390,17 +2590,42 @@ mod tests {
 
         let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
 
-        let stats = db.stats().await.unwrap();
+        let stats = db.stats(ETHEREUM_CHAIN_ID).await.unwrap();
         assert_eq!(stats.total_contracts, 2);
         assert_eq!(stats.first_block, 100);
         assert_eq!(stats.last_block, 200);
 
-        let recent = db.recent_contracts(5, None).await.unwrap();
+        let recent = db
+            .recent_contracts(ETHEREUM_CHAIN_ID, 5, None)
+            .await
+            .unwrap();
         assert_eq!(recent.contracts.len(), 1);
         assert_eq!(recent.contracts[0].block_number, 200);
         assert_eq!(
             recent.contracts[0].address,
             format!("0x{}", hex::encode(make_bytes(5, 20)))
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_and_recent_filter_gnosis_chain() {
+        let dir = TestDir::new("gnosis_chain_filter");
+        insert_zellic_snapshot(&dir.path);
+        write_backfill_parquet(&dir.path);
+
+        let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+
+        let stats = db.stats(100).await.unwrap();
+        assert_eq!(stats.total_contracts, 1);
+        assert_eq!(stats.first_block, 300);
+        assert_eq!(stats.last_block, 300);
+
+        let recent = db.recent_contracts(100, 5, None).await.unwrap();
+        assert_eq!(recent.contracts.len(), 1);
+        assert_eq!(recent.contracts[0].block_number, 300);
+        assert_eq!(
+            recent.contracts[0].address,
+            format!("0x{}", hex::encode(make_bytes(0x15, 20)))
         );
     }
 }

@@ -170,12 +170,13 @@ pub struct ServeArgs {
     #[arg(long, default_value = "*.parquet")]
     pub contracts_glob: String,
     /// Open DuckDB in read-only mode so the dashboard can run alongside an
-    /// active `blink decode`. Disables `--tail-rpc` automatically.
+    /// active `blink decode`. Disables any `--tail-rpc` values automatically.
     #[arg(long)]
     pub read_only: bool,
-    /// Run continuous tail extraction against this RPC URL
+    /// Run continuous tail extraction against one or more RPC URLs.
+    /// Repeat for multi-chain serving; Blink infers each chain ID from its RPC.
     #[arg(long)]
-    pub tail_rpc: Option<String>,
+    pub tail_rpc: Vec<String>,
     /// Tail extraction poll interval (seconds)
     #[arg(long, default_value_t = 60)]
     pub tail_interval_secs: u64,
