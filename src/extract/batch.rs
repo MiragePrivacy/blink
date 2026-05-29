@@ -124,14 +124,7 @@ impl BatchClient {
                         let value = resp.result.ok_or_else(|| {
                             anyhow!("missing result for block {}", blocks[resp.id as usize])
                         })?;
-                        let traces: Vec<LocalizedTransactionTrace> = serde_json::from_value(value)
-                            .map_err(|err| {
-                                anyhow!(
-                                    "decode error for block {}: {}",
-                                    blocks[resp.id as usize],
-                                    err
-                                )
-                            })?;
+                        let traces = decode_trace_block_value(blocks[resp.id as usize], value)?;
                         results[resp.id as usize] = Some(traces);
                     }
 
@@ -174,4 +167,62 @@ impl BatchClient {
 
 fn is_rate_limited(err: &JsonRpcError) -> bool {
     err.code == 429 || err.message.to_ascii_lowercase().contains("compute units")
+}
+
+fn decode_trace_block_value(
+    block: u64,
+    value: serde_json::Value,
+) -> Result<Vec<LocalizedTransactionTrace>> {
+    let value = filter_reward_traces(value);
+    serde_json::from_value(value)
+        .map_err(|err| anyhow!("decode error for block {}: {}", block, err))
+}
+
+fn filter_reward_traces(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .filter(|item| !is_reward_trace(item))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn is_reward_trace(item: &serde_json::Value) -> bool {
+    item.get("type").and_then(|value| value.as_str()) == Some("reward")
+        || item
+            .get("action")
+            .and_then(|action| action.get("rewardType"))
+            .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_trace_block_value;
+
+    #[test]
+    fn trace_decode_ignores_gnosis_external_reward_traces() {
+        let value = serde_json::json!([
+            {
+                "action": {
+                    "author": "0x0000000000000000000000000000000000000000",
+                    "rewardType": "external",
+                    "value": "0x0"
+                },
+                "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "blockNumber": 46630628,
+                "result": null,
+                "subtraces": 0,
+                "traceAddress": [],
+                "transactionHash": null,
+                "transactionPosition": null,
+                "type": "reward"
+            }
+        ]);
+
+        let traces = decode_trace_block_value(46630628, value).unwrap();
+        assert!(traces.is_empty());
+    }
 }
