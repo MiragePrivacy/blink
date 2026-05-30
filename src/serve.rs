@@ -27,14 +27,17 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json},
     routing::get,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::Mutex};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_scalar::{Scalar, Servable};
@@ -309,7 +312,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     let app = api_router
         .route("/openapi.json", get(|| async { openapi_json }))
         .merge(Scalar::with_url("/scalar", api))
-        .layer(CorsLayer::permissive())
+        .layer(dashboard_cors_layer())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -325,6 +328,13 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     axum::serve(listener, app)
         .await
         .context("axum server failed")
+}
+
+fn dashboard_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(HeaderValue::from_static("https://blink.mirageprivacy.com"))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any)
 }
 
 #[derive(Serialize, ToSchema)]
