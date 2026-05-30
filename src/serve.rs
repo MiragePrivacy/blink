@@ -438,6 +438,9 @@ struct BucketQuery {
     /// Visible time range: `hour`, `day`, `week`, or `month`.
     #[serde(default)]
     range: Option<String>,
+    /// Optional block number where the visible range should end. Defaults to the latest indexed block.
+    #[serde(default)]
+    end_block: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -460,6 +463,7 @@ fn parse_bucket_value(bucket: Option<&str>, chain_id: u64, anchor_block: u64) ->
 
 fn parse_time_series_window(q: &BucketQuery, chain_id: u64, anchor_block: u64) -> TimeSeriesWindow {
     let blocks_per_day = blocks_per_day(chain_id, anchor_block).max(1);
+    let range_end = q.end_block.unwrap_or(anchor_block).min(anchor_block);
     let range = q.range.as_deref();
     let (window_blocks, default_bucket) = match range {
         Some("hour") => {
@@ -485,8 +489,8 @@ fn parse_time_series_window(q: &BucketQuery, chain_id: u64, anchor_block: u64) -
             .unwrap_or(default_bucket)
             .max(1),
         block_range: Some((
-            anchor_block.saturating_sub(window_blocks.saturating_sub(1)),
-            anchor_block,
+            range_end.saturating_sub(window_blocks.saturating_sub(1)),
+            range_end,
         )),
     }
 }
@@ -527,6 +531,9 @@ async fn deploys_handler(
         .await?;
     Ok(Json(DeploysResponse {
         bucket_blocks: window.bucket_blocks,
+        range_start_block: window.block_range.map(|(start, _)| start),
+        range_end_block: window.block_range.map(|(_, end)| end),
+        latest_block: highest,
         buckets,
     }))
 }
@@ -567,6 +574,9 @@ async fn verified_handler(
         .await?;
     Ok(Json(VerifiedResponse {
         bucket_blocks: window.bucket_blocks,
+        range_start_block: window.block_range.map(|(start, _)| start),
+        range_end_block: window.block_range.map(|(_, end)| end),
+        latest_block: highest,
         buckets,
     }))
 }
@@ -807,12 +817,18 @@ async fn standards_handler(
 #[derive(Serialize, ToSchema)]
 struct DeploysResponse {
     bucket_blocks: u64,
+    range_start_block: Option<u64>,
+    range_end_block: Option<u64>,
+    latest_block: u64,
     buckets: Vec<crate::db::DeployBucket>,
 }
 
 #[derive(Serialize, ToSchema)]
 struct VerifiedResponse {
     bucket_blocks: u64,
+    range_start_block: Option<u64>,
+    range_end_block: Option<u64>,
+    latest_block: u64,
     buckets: Vec<crate::db::VerifiedRatioBucket>,
 }
 
@@ -914,6 +930,7 @@ mod tests {
             chain_id: None,
             bucket: bucket.map(str::to_string),
             range: range.map(str::to_string),
+            end_block: None,
         }
     }
 
@@ -955,5 +972,19 @@ mod tests {
 
         assert_eq!(window.block_range, None);
         assert_eq!(window.bucket_blocks, 7_200);
+    }
+
+    #[test]
+    fn range_end_block_moves_visible_window() {
+        let anchor_block = 20_000_000;
+        let mut q = query(Some("day"), None);
+        q.end_block = Some(19_000_000);
+        let window = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, anchor_block);
+
+        assert_eq!(window.block_range, Some((18_992_801, 19_000_000)));
+
+        q.end_block = Some(21_000_000);
+        let capped = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, anchor_block);
+        assert_eq!(capped.block_range, Some((19_992_801, 20_000_000)));
     }
 }
