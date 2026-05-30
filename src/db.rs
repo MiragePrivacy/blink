@@ -12,6 +12,7 @@
 //! for an analytics dashboard's request rate.
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -25,7 +26,7 @@ use tokio::sync::Mutex;
 
 use crate::{chains::ETHEREUM_CHAIN_ID, util::match_simple_glob};
 
-const RECENT_PARQUET_FILE_LIMIT: usize = 64;
+const RECENT_PARQUET_FILE_LIMIT: usize = 12;
 
 #[derive(Clone)]
 pub struct Db {
@@ -157,6 +158,15 @@ fn read_recent_row(row: &Row<'_>) -> duckdb::Result<RecentRowData> {
 
 fn read_u64_pair(row: &Row<'_>) -> duckdb::Result<(u64, u64)> {
     Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?))
+}
+
+fn read_verified_bucket_row(row: &Row<'_>) -> duckdb::Result<(u64, u64, u64, u64)> {
+    Ok((
+        row.get::<_, u64>(0)?,
+        row.get::<_, u64>(1)?,
+        row.get::<_, u64>(2)?,
+        row.get::<_, u64>(3)?,
+    ))
 }
 
 fn read_string_u64_pair(row: &Row<'_>) -> duckdb::Result<(String, u64)> {
@@ -298,6 +308,40 @@ fn recent_contract_parquet_files(
         .collect()
 }
 
+fn contract_parquet_files_for_block_range(
+    files: &[PathBuf],
+    chain_id: u64,
+    block_range: Option<(u64, u64)>,
+) -> Vec<PathBuf> {
+    let mut ranged = files
+        .iter()
+        .cloned()
+        .map(contract_file_with_range)
+        .filter(|file| {
+            file.chain_id == Some(chain_id)
+                || (file.chain_id.is_none() && chain_id == ETHEREUM_CHAIN_ID)
+        })
+        .filter(|file| {
+            if let Some((start, end)) = block_range {
+                match (file.start_block, file.end_block) {
+                    (Some(file_start), Some(file_end)) => file_end >= start && file_start <= end,
+                    _ => true,
+                }
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+    ranged.sort_by(|a, b| {
+        a.start_block
+            .unwrap_or(0)
+            .cmp(&b.start_block.unwrap_or(0))
+            .then_with(|| a.end_block.unwrap_or(0).cmp(&b.end_block.unwrap_or(0)))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    ranged.into_iter().map(|file| file.path).collect()
+}
+
 fn parquet_read_list(files: &[PathBuf]) -> String {
     files
         .iter()
@@ -306,8 +350,9 @@ fn parquet_read_list(files: &[PathBuf]) -> String {
         .join(", ")
 }
 
-fn create_recent_parquet_contracts_view(
+fn create_contract_parquet_view(
     conn: &Connection,
+    view_name: &str,
     files: &[PathBuf],
     chain_id: u64,
 ) -> Result<()> {
@@ -347,15 +392,87 @@ fn create_recent_parquet_contracts_view(
         )
     };
     conn.execute_batch(&format!(
-        "CREATE OR REPLACE TEMP VIEW recent_parquet_contracts AS\n{};",
-        body
+        "CREATE OR REPLACE TEMP VIEW {view_name} AS\n{body};"
     ))
     .with_context(|| {
         format!(
-            "create recent parquet contracts view ({} of newest files)",
-            files.len()
+            "create {view_name} parquet contracts view ({} files)",
+            files.len(),
         )
     })?;
+    Ok(())
+}
+
+fn create_recent_parquet_contracts_view(
+    conn: &Connection,
+    files: &[PathBuf],
+    chain_id: u64,
+) -> Result<()> {
+    create_contract_parquet_view(conn, "recent_parquet_contracts", files, chain_id)
+}
+
+fn ensure_parquet_block_counts(conn: &Connection, files: &[PathBuf]) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS parquet_block_counts (
+            source_path VARCHAR NOT NULL,
+            chain_id UBIGINT NOT NULL,
+            block_number UINTEGER NOT NULL,
+            contract_count UBIGINT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS parquet_block_counts_chain_block_idx
+            ON parquet_block_counts(chain_id, block_number);
+        CREATE INDEX IF NOT EXISTS parquet_block_counts_source_idx
+            ON parquet_block_counts(source_path);
+        "#,
+    )
+    .context("create parquet block counts table")?;
+
+    let existing = conn
+        .prepare("SELECT DISTINCT source_path FROM parquet_block_counts")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let current = files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<HashSet<_>>();
+    for source_path in existing {
+        if !current.contains(&source_path) {
+            conn.execute(
+                "DELETE FROM parquet_block_counts WHERE source_path = ?",
+                params![source_path],
+            )
+            .context("delete stale parquet block counts")?;
+        }
+    }
+
+    let counted = conn
+        .prepare("SELECT DISTINCT source_path FROM parquet_block_counts")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<HashSet<_>, _>>()?;
+    for file in files {
+        let source_path = file.display().to_string();
+        if counted.contains(&source_path) {
+            continue;
+        }
+        let source_path_sql = source_path.replace('\'', "''");
+        conn.execute_batch(&format!(
+            r#"
+            INSERT INTO parquet_block_counts
+            SELECT
+                '{source_path_sql}' AS source_path,
+                chain_id::UBIGINT AS chain_id,
+                block_number::UINTEGER AS block_number,
+                COUNT(*)::UBIGINT AS contract_count
+            FROM read_parquet('{source_path_sql}', union_by_name = true)
+            WHERE block_number IS NOT NULL
+              AND chain_id IS NOT NULL
+            GROUP BY chain_id, block_number;
+            "#
+        ))
+        .with_context(|| format!("count parquet blocks in {}", file.display()))?;
+    }
+
     Ok(())
 }
 
@@ -1061,6 +1178,8 @@ impl Db {
         .context("create blink schema")?;
         ensure_zellic_summary_tables(&conn)?;
         backfill_enrichment_blocks(&conn)?;
+        let files = list_contract_parquet_files(data_dir, contracts_glob)?;
+        ensure_parquet_block_counts(&conn, &files)?;
         rebuild_contracts_view_for_conn(&conn, data_dir, contracts_glob)?;
 
         Ok(Self {
@@ -1072,6 +1191,8 @@ impl Db {
 
     fn rebuild_contracts_view_blocking(&self) -> Result<()> {
         let conn = self.inner.blocking_lock();
+        let files = list_contract_parquet_files(&self.data_dir, &self.contracts_glob)?;
+        ensure_parquet_block_counts(&conn, &files)?;
         rebuild_contracts_view_for_conn(&conn, &self.data_dir, &self.contracts_glob)
     }
 
@@ -1368,54 +1489,107 @@ impl Db {
         &self,
         chain_id: u64,
         bucket_blocks: u64,
+        block_range: Option<(u64, u64)>,
     ) -> Result<Vec<DeployBucket>> {
         let inner = self.inner.clone();
+        let data_dir = self.data_dir.clone();
+        let contracts_glob = self.contracts_glob.clone();
         let bucket_blocks = bucket_blocks.max(1);
         tokio::task::spawn_blocking(move || -> Result<Vec<DeployBucket>> {
             let conn = inner.blocking_lock();
-            let sql = if chain_id == ETHEREUM_CHAIN_ID
-                && table_exists(&conn, "zellic_block_counts")?
-            {
-                r#"
-                SELECT
-                    (block_number / ?)::UBIGINT AS bucket_id,
-                    SUM(contract_count)::UBIGINT AS cnt
-                FROM zellic_block_counts
-                WHERE block_number IS NOT NULL
-                GROUP BY bucket_id
-                ORDER BY bucket_id
-                "#
-            } else if chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_contracts")? {
-                r#"
-                SELECT
-                    (block_number / ?)::UBIGINT AS bucket_id,
-                    COUNT(*)::UBIGINT AS cnt
-                FROM zellic_contracts
-                WHERE block_number IS NOT NULL
-                GROUP BY bucket_id
-                ORDER BY bucket_id
-                "#
+            let use_zellic_counts =
+                chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_block_counts")?;
+            let use_zellic_contracts =
+                chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_contracts")?;
+            let range_filter = block_range
+                .map(|(start, end)| format!(" AND block_number BETWEEN {start} AND {end}"))
+                .unwrap_or_default();
+            let parquet_select = if table_exists(&conn, "parquet_block_counts")? {
+                format!(
+                    r#"
+                    SELECT
+                        (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                        SUM(contract_count)::UBIGINT AS cnt
+                    FROM parquet_block_counts
+                    WHERE block_number IS NOT NULL
+                      AND chain_id = {chain_id}
+                      {range_filter}
+                    GROUP BY bucket_id
+                    "#
+                )
             } else {
+                let parquet_source = if block_range.is_some() {
+                    let files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
+                    let files =
+                        contract_parquet_files_for_block_range(&files, chain_id, block_range);
+                    create_contract_parquet_view(
+                        &conn,
+                        "dashboard_range_parquet_contracts",
+                        &files,
+                        chain_id,
+                    )?;
+                    "dashboard_range_parquet_contracts"
+                } else {
+                    "parquet_contracts"
+                };
+                format!(
+                    r#"
+                    SELECT
+                        (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                        COUNT(*)::UBIGINT AS cnt
+                    FROM {parquet_source}
+                    WHERE block_number IS NOT NULL
+                      AND chain_id = {chain_id}
+                      {range_filter}
+                    GROUP BY bucket_id
+                "#
+                )
+            };
+            let zellic_select = if use_zellic_counts {
+                Some(format!(
+                    r#"
+                    SELECT
+                        (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                        SUM(contract_count)::UBIGINT AS cnt
+                    FROM zellic_block_counts
+                    WHERE block_number IS NOT NULL
+                      {range_filter}
+                    GROUP BY bucket_id
+                    "#
+                ))
+            } else if use_zellic_contracts {
+                Some(format!(
+                    r#"
+                    SELECT
+                        (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                        COUNT(*)::UBIGINT AS cnt
+                    FROM zellic_contracts
+                    WHERE block_number IS NOT NULL
+                      {range_filter}
+                    GROUP BY bucket_id
+                    "#
+                ))
+            } else {
+                None
+            };
+            let sources = [zellic_select, Some(parquet_select)]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\nUNION ALL\n");
+            let sql = format!(
                 r#"
-                SELECT
-                    (block_number / ?)::UBIGINT AS bucket_id,
-                    COUNT(*)::UBIGINT AS cnt
-                FROM contracts
-                WHERE block_number IS NOT NULL
-                  AND chain_id = ?
+                WITH bucket_counts AS (
+                    {sources}
+                )
+                SELECT bucket_id, SUM(cnt)::UBIGINT AS cnt
+                FROM bucket_counts
                 GROUP BY bucket_id
                 ORDER BY bucket_id
                 "#
-            };
-            let mut stmt = conn.prepare(sql)?;
-            let rows = if chain_id == ETHEREUM_CHAIN_ID
-                && (table_exists(&conn, "zellic_block_counts")?
-                    || table_exists(&conn, "zellic_contracts")?)
-            {
-                stmt.query_map(params![bucket_blocks], read_u64_pair)?
-            } else {
-                stmt.query_map(params![bucket_blocks, chain_id], read_u64_pair)?
-            };
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map([], read_u64_pair)?;
             let mut out = Vec::new();
             for r in rows {
                 let (bucket_id, count) = r?;
@@ -1439,20 +1613,159 @@ impl Db {
         &self,
         chain_id: u64,
         bucket_blocks: u64,
+        block_range: Option<(u64, u64)>,
     ) -> Result<Vec<VerifiedRatioBucket>> {
         let inner = self.inner.clone();
+        let data_dir = self.data_dir.clone();
+        let contracts_glob = self.contracts_glob.clone();
         let bucket_blocks = bucket_blocks.max(1);
         tokio::task::spawn_blocking(move || -> Result<Vec<VerifiedRatioBucket>> {
             let conn = inner.blocking_lock();
             let mut out = Vec::new();
             let registry_loaded = verification_registry_loaded(&conn, chain_id)?;
+            if let Some((start, end)) = block_range {
+                let parquet_total_select = if table_exists(&conn, "parquet_block_counts")? {
+                    format!(
+                        r#"
+                        SELECT
+                            (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                            SUM(contract_count)::UBIGINT AS total
+                        FROM parquet_block_counts
+                        WHERE block_number IS NOT NULL
+                          AND chain_id = {chain_id}
+                          AND block_number BETWEEN {start} AND {end}
+                        GROUP BY bucket_id
+                        "#
+                    )
+                } else {
+                    let files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
+                    let files =
+                        contract_parquet_files_for_block_range(&files, chain_id, block_range);
+                    create_contract_parquet_view(
+                        &conn,
+                        "dashboard_range_parquet_contracts",
+                        &files,
+                        chain_id,
+                    )?;
+                    format!(
+                        r#"
+                        SELECT
+                            (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                            COUNT(*)::UBIGINT AS total
+                        FROM dashboard_range_parquet_contracts
+                        WHERE block_number IS NOT NULL
+                          AND chain_id = {chain_id}
+                          AND block_number BETWEEN {start} AND {end}
+                        GROUP BY bucket_id
+                        "#
+                    )
+                };
+                let zellic_total_select = if chain_id == ETHEREUM_CHAIN_ID
+                    && table_exists(&conn, "zellic_block_counts")?
+                {
+                    Some(format!(
+                        r#"
+                        SELECT
+                            (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                            SUM(contract_count)::UBIGINT AS total
+                        FROM zellic_block_counts
+                        WHERE block_number IS NOT NULL
+                          AND block_number BETWEEN {start} AND {end}
+                        GROUP BY bucket_id
+                        "#
+                    ))
+                } else if chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_contracts")?
+                {
+                    Some(format!(
+                        r#"
+                        SELECT
+                            (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                            COUNT(*)::UBIGINT AS total
+                        FROM zellic_contracts
+                        WHERE block_number IS NOT NULL
+                          AND chain_id = {chain_id}
+                          AND block_number BETWEEN {start} AND {end}
+                        GROUP BY bucket_id
+                        "#
+                    ))
+                } else {
+                    None
+                };
+                let total_sources = [zellic_total_select, Some(parquet_total_select)]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("\nUNION ALL\n");
+                let verified_value = "LEAST(COALESCE(checked.verified, 0), totals.total)";
+                let (unverified_expr, unknown_expr) = if registry_loaded {
+                    (
+                        format!("GREATEST(totals.total - {verified_value}, 0)::UBIGINT"),
+                        "0::UBIGINT".to_string(),
+                    )
+                } else {
+                    (
+                        "COALESCE(checked.unverified, 0)::UBIGINT".to_string(),
+                        format!(
+                            "GREATEST(totals.total - {verified_value} - COALESCE(checked.unverified, 0), 0)::UBIGINT"
+                        ),
+                    )
+                };
+                let sql = format!(
+                    r#"
+                    WITH total_rows AS (
+                        {total_sources}
+                    ),
+                    totals AS (
+                        SELECT bucket_id, SUM(total)::UBIGINT AS total
+                        FROM total_rows
+                        GROUP BY bucket_id
+                    ),
+                    checked AS (
+                        SELECT
+                            (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                            COUNT(*) FILTER (WHERE is_verified)::UBIGINT AS verified,
+                            COUNT(*) FILTER (WHERE is_verified IS FALSE)::UBIGINT AS unverified
+                        FROM enrichment_current
+                        WHERE block_number IS NOT NULL
+                          AND chain_id = {chain_id}
+                          AND block_number BETWEEN {start} AND {end}
+                        GROUP BY bucket_id
+                    )
+                    SELECT
+                        totals.bucket_id,
+                        {verified_value}::UBIGINT AS verified,
+                        {unverified_expr} AS unverified,
+                        {unknown_expr} AS unknown
+                    FROM totals
+                    LEFT JOIN checked ON totals.bucket_id = checked.bucket_id
+                    ORDER BY totals.bucket_id
+                    "#
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map([], read_verified_bucket_row)?;
+                for r in rows {
+                    let (bucket_id, verified, unverified, unknown) = r?;
+                    let block_start = bucket_id * bucket_blocks;
+                    let block_end = block_start + bucket_blocks - 1;
+                    let mid = block_start + bucket_blocks / 2;
+                    out.push(VerifiedRatioBucket {
+                        block_start,
+                        block_end,
+                        timestamp: crate::blocks::block_timestamp(chain_id, mid),
+                        verified,
+                        unverified,
+                        unknown,
+                    });
+                }
+                return Ok(out);
+            }
             if chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_contracts")? {
                 if !table_exists(&conn, "zellic_block_counts")? {
                     return Ok(out);
                 }
 
-                let sql = if registry_loaded {
-                    r#"
+                let sql = match (registry_loaded, block_range.is_some()) {
+                    (true, false) => r#"
                     WITH totals AS (
                         SELECT
                             (block_number / ?)::UBIGINT AS bucket_id,
@@ -1481,9 +1794,40 @@ impl Db {
                     FROM totals
                     LEFT JOIN checked ON totals.bucket_id = checked.bucket_id
                     ORDER BY totals.bucket_id
-                    "#
-                } else {
-                    r#"
+                    "#,
+                    (true, true) => r#"
+                    WITH totals AS (
+                        SELECT
+                            (block_number / ?)::UBIGINT AS bucket_id,
+                            SUM(contract_count)::UBIGINT AS total
+                        FROM zellic_block_counts
+                        WHERE block_number IS NOT NULL
+                          AND block_number BETWEEN ? AND ?
+                        GROUP BY bucket_id
+                    ),
+                    checked AS (
+                        SELECT
+                            (z.block_number / ?)::UBIGINT AS bucket_id,
+                            COUNT(*)::UBIGINT AS verified
+                        FROM zellic_contracts z
+                        JOIN enrichment_current e
+                          ON z.contract_address = e.contract_address
+                         AND e.chain_id = ?
+                        WHERE z.block_number IS NOT NULL
+                          AND z.block_number BETWEEN ? AND ?
+                          AND e.is_verified
+                        GROUP BY bucket_id
+                    )
+                    SELECT
+                        totals.bucket_id,
+                        COALESCE(checked.verified, 0)::UBIGINT AS verified,
+                        GREATEST(totals.total - COALESCE(checked.verified, 0), 0)::UBIGINT AS unverified,
+                        0::UBIGINT AS unknown
+                    FROM totals
+                    LEFT JOIN checked ON totals.bucket_id = checked.bucket_id
+                    ORDER BY totals.bucket_id
+                    "#,
+                    (false, false) => r#"
                     WITH totals AS (
                         SELECT
                             (block_number / ?)::UBIGINT AS bucket_id,
@@ -1515,17 +1859,54 @@ impl Db {
                     FROM totals
                     LEFT JOIN checked ON totals.bucket_id = checked.bucket_id
                     ORDER BY totals.bucket_id
-                    "#
+                    "#,
+                    (false, true) => r#"
+                    WITH totals AS (
+                        SELECT
+                            (block_number / ?)::UBIGINT AS bucket_id,
+                            SUM(contract_count)::UBIGINT AS total
+                        FROM zellic_block_counts
+                        WHERE block_number IS NOT NULL
+                          AND block_number BETWEEN ? AND ?
+                        GROUP BY bucket_id
+                    ),
+                    checked AS (
+                        SELECT
+                            (block_number / ?)::UBIGINT AS bucket_id,
+                            COUNT(*) FILTER (WHERE is_verified)::UBIGINT AS verified,
+                            COUNT(*) FILTER (WHERE is_verified IS FALSE)::UBIGINT AS unverified
+                        FROM enrichment_current
+                        WHERE block_number IS NOT NULL
+                          AND chain_id = ?
+                          AND block_number BETWEEN ? AND ?
+                        GROUP BY bucket_id
+                    )
+                    SELECT
+                        totals.bucket_id,
+                        COALESCE(checked.verified, 0)::UBIGINT AS verified,
+                        COALESCE(checked.unverified, 0)::UBIGINT AS unverified,
+                        GREATEST(
+                            totals.total
+                              - COALESCE(checked.verified, 0)
+                              - COALESCE(checked.unverified, 0),
+                            0
+                        )::UBIGINT AS unknown
+                    FROM totals
+                    LEFT JOIN checked ON totals.bucket_id = checked.bucket_id
+                    ORDER BY totals.bucket_id
+                    "#,
                 };
                 let mut stmt = conn.prepare(sql)?;
-                let rows = stmt.query_map(params![bucket_blocks, bucket_blocks, chain_id], |row| {
-                    Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, u64>(1)?,
-                        row.get::<_, u64>(2)?,
-                        row.get::<_, u64>(3)?,
-                    ))
-                })?;
+                let rows = match block_range {
+                    None => stmt.query_map(
+                        params![bucket_blocks, bucket_blocks, chain_id],
+                        read_verified_bucket_row,
+                    )?,
+                    Some((start, end)) => stmt.query_map(
+                        params![bucket_blocks, start, end, bucket_blocks, chain_id, start, end],
+                        read_verified_bucket_row,
+                    )?,
+                };
                 for r in rows {
                     let (bucket_id, verified, unverified, unknown) = r?;
                     let block_start = bucket_id * bucket_blocks;
@@ -1543,8 +1924,8 @@ impl Db {
                 return Ok(out);
             }
 
-            let sql = if registry_loaded {
-                r#"
+            let sql = match (registry_loaded, block_range.is_some()) {
+                (true, false) => r#"
                 SELECT
                     (c.block_number / ?)::UBIGINT AS bucket_id,
                     COUNT(*) FILTER (WHERE e.is_verified)::UBIGINT AS verified,
@@ -1558,9 +1939,24 @@ impl Db {
                   AND c.chain_id = ?
                 GROUP BY bucket_id
                 ORDER BY bucket_id
-                "#
-            } else {
-                r#"
+                "#,
+                (true, true) => r#"
+                SELECT
+                    (c.block_number / ?)::UBIGINT AS bucket_id,
+                    COUNT(*) FILTER (WHERE e.is_verified)::UBIGINT AS verified,
+                    COUNT(*) FILTER (WHERE e.is_verified IS NULL OR e.is_verified IS FALSE)::UBIGINT AS unverified,
+                    0::UBIGINT AS unknown
+                FROM contracts c
+                LEFT JOIN enrichment_current e
+                  ON c.contract_address = e.contract_address
+                 AND c.chain_id = e.chain_id
+                WHERE c.block_number IS NOT NULL
+                  AND c.chain_id = ?
+                  AND c.block_number BETWEEN ? AND ?
+                GROUP BY bucket_id
+                ORDER BY bucket_id
+                "#,
+                (false, false) => r#"
                 SELECT
                     (c.block_number / ?)::UBIGINT AS bucket_id,
                     COUNT(*) FILTER (WHERE e.is_verified)::UBIGINT AS verified,
@@ -1574,17 +1970,35 @@ impl Db {
                   AND c.chain_id = ?
                 GROUP BY bucket_id
                 ORDER BY bucket_id
-                "#
+                "#,
+                (false, true) => r#"
+                SELECT
+                    (c.block_number / ?)::UBIGINT AS bucket_id,
+                    COUNT(*) FILTER (WHERE e.is_verified)::UBIGINT AS verified,
+                    COUNT(*) FILTER (WHERE e.is_verified IS FALSE)::UBIGINT AS unverified,
+                    COUNT(*) FILTER (WHERE e.is_verified IS NULL)::UBIGINT AS unknown
+                FROM contracts c
+                LEFT JOIN enrichment_current e
+                  ON c.contract_address = e.contract_address
+                 AND c.chain_id = e.chain_id
+                WHERE c.block_number IS NOT NULL
+                  AND c.chain_id = ?
+                  AND c.block_number BETWEEN ? AND ?
+                GROUP BY bucket_id
+                ORDER BY bucket_id
+                "#,
             };
             let mut stmt = conn.prepare(sql)?;
-            let rows = stmt.query_map(params![bucket_blocks, chain_id], |row| {
-                Ok((
-                    row.get::<_, u64>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, u64>(3)?,
-                ))
-            })?;
+            let rows = match block_range {
+                None => stmt.query_map(
+                    params![bucket_blocks, chain_id],
+                    read_verified_bucket_row,
+                )?,
+                Some((start, end)) => stmt.query_map(
+                    params![bucket_blocks, chain_id, start, end],
+                    read_verified_bucket_row,
+                )?,
+            };
             for r in rows {
                 let (bucket_id, verified, unverified, unknown) = r?;
                 let block_start = bucket_id * bucket_blocks;
@@ -1980,64 +2394,67 @@ impl Db {
         let data_dir = self.data_dir.clone();
         let contracts_glob = self.contracts_glob.clone();
         let limit = limit.clamp(1, 200);
-        let mut contracts = tokio::task::spawn_blocking(move || -> Result<Vec<RecentContract>> {
-            let conn = inner.blocking_lock();
-            let page_limit = limit as i64 + 1;
-            let has_zellic = chain_id == ETHEREUM_CHAIN_ID
-                && table_exists(&conn, "zellic_contracts")?
-                && table_exists(&conn, "zellic_bytecodes")?;
-            let has_hash_metadata = table_exists(&conn, "bytecode_metadata_by_hash")?;
-            let parquet_files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
-            let max_contracts_block = max_contract_file_block_for_chain(&parquet_files, chain_id);
-            let max_zellic_block: Option<u64> = if chain_id == ETHEREUM_CHAIN_ID && has_zellic {
-                let block: Option<u32> = conn
-                    .query_row(
-                        "SELECT MAX(block_number) FROM zellic_contracts",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(None);
-                block.map(u64::from)
-            } else {
-                None
-            };
-            let has_external_contracts = max_contracts_block > max_zellic_block;
-            let use_external_recent = has_external_contracts
-                && cursor
-                    .map(|cursor| cursor.block_number > max_zellic_block.unwrap_or(0))
-                    .unwrap_or(true);
-            if use_external_recent {
-                let recent_files = recent_contract_parquet_files(&parquet_files, chain_id, cursor);
-                create_recent_parquet_contracts_view(&conn, &recent_files, chain_id)?;
-            }
-            conn.execute_batch(&format!(
-                r#"
+        let (mut contracts, may_have_more_external) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<RecentContract>, bool)> {
+                let conn = inner.blocking_lock();
+                let page_limit = limit as i64 + 1;
+                let has_zellic = chain_id == ETHEREUM_CHAIN_ID
+                    && table_exists(&conn, "zellic_contracts")?
+                    && table_exists(&conn, "zellic_bytecodes")?;
+                let has_hash_metadata = table_exists(&conn, "bytecode_metadata_by_hash")?;
+                let parquet_files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
+                let max_contracts_block =
+                    max_contract_file_block_for_chain(&parquet_files, chain_id);
+                let max_zellic_block: Option<u64> = if chain_id == ETHEREUM_CHAIN_ID && has_zellic {
+                    let block: Option<u32> = conn
+                        .query_row(
+                            "SELECT MAX(block_number) FROM zellic_contracts",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or(None);
+                    block.map(u64::from)
+                } else {
+                    None
+                };
+                let has_external_contracts = max_contracts_block > max_zellic_block;
+                let use_external_recent = has_external_contracts
+                    && cursor
+                        .map(|cursor| cursor.block_number > max_zellic_block.unwrap_or(0))
+                        .unwrap_or(true);
+                if use_external_recent {
+                    let recent_files =
+                        recent_contract_parquet_files(&parquet_files, chain_id, cursor);
+                    create_recent_parquet_contracts_view(&conn, &recent_files, chain_id)?;
+                }
+                conn.execute_batch(&format!(
+                    r#"
                 CREATE OR REPLACE TEMP VIEW recent_enrichment AS
                 SELECT *
                 FROM enrichment_current
                 WHERE chain_id = {};
                 "#,
-                chain_id
-            ))
-            .context("create recent enrichment view")?;
-            conn.execute_batch(&format!(
-                r#"
+                    chain_id
+                ))
+                .context("create recent enrichment view")?;
+                conn.execute_batch(&format!(
+                    r#"
                 CREATE OR REPLACE TEMP VIEW recent_contracts_all AS
                 SELECT *
                 FROM contracts
                 WHERE chain_id = {};
                 "#,
-                chain_id
-            ))
-            .context("create recent contracts view")?;
-            let registry_loaded = verification_registry_loaded(&conn, chain_id)?;
+                    chain_id
+                ))
+                .context("create recent contracts view")?;
+                let registry_loaded = verification_registry_loaded(&conn, chain_id)?;
 
-            // For Zellic imports, compiler metadata is keyed by bytecode hash.
-            // Select the tiny recent page first, then join hash metadata; going
-            // through bytecode_metadata_current would expand hash metadata back
-            // to tens of millions of contract-address rows for every page.
-            let sql = if use_external_recent && has_hash_metadata && cursor.is_some() {
-                r#"
+                // For Zellic imports, compiler metadata is keyed by bytecode hash.
+                // Select the tiny recent page first, then join hash metadata; going
+                // through bytecode_metadata_current would expand hash metadata back
+                // to tens of millions of contract-address rows for every page.
+                let sql = if use_external_recent && has_hash_metadata && cursor.is_some() {
+                    r#"
                 WITH page AS (
                     SELECT
                         c.contract_address,
@@ -2069,8 +2486,8 @@ impl Db {
                 LEFT JOIN bytecode_metadata_by_hash h ON page.code_hash = h.code_hash
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
-            } else if use_external_recent && has_hash_metadata {
-                r#"
+                } else if use_external_recent && has_hash_metadata {
+                    r#"
                 WITH page AS (
                     SELECT
                         c.contract_address,
@@ -2098,8 +2515,8 @@ impl Db {
                 LEFT JOIN bytecode_metadata_by_hash h ON page.code_hash = h.code_hash
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
-            } else if use_external_recent && cursor.is_some() {
-                r#"
+                } else if use_external_recent && cursor.is_some() {
+                    r#"
                 WITH page AS (
                     SELECT
                         c.contract_address,
@@ -2129,8 +2546,8 @@ impl Db {
                 LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
-            } else if use_external_recent {
-                r#"
+                } else if use_external_recent {
+                    r#"
                 WITH page AS (
                     SELECT
                         c.contract_address,
@@ -2156,8 +2573,8 @@ impl Db {
                 LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
-            } else if has_zellic && has_hash_metadata && cursor.is_some() {
-                r#"
+                } else if has_zellic && has_hash_metadata && cursor.is_some() {
+                    r#"
                 WITH page AS (
                     SELECT
                         z.contract_address,
@@ -2188,8 +2605,8 @@ impl Db {
                 LEFT JOIN bytecode_metadata_by_hash h ON page.bytecode_hash = h.code_hash
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
-            } else if has_zellic && has_hash_metadata {
-                r#"
+                } else if has_zellic && has_hash_metadata {
+                    r#"
                 WITH page AS (
                     SELECT
                         z.contract_address,
@@ -2216,8 +2633,8 @@ impl Db {
                 LEFT JOIN bytecode_metadata_by_hash h ON page.bytecode_hash = h.code_hash
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
-            } else if has_zellic && cursor.is_some() {
-                r#"
+                } else if has_zellic && cursor.is_some() {
+                    r#"
                 WITH page AS (
                     SELECT
                         z.contract_address,
@@ -2247,8 +2664,8 @@ impl Db {
                 LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
-            } else if has_zellic {
-                r#"
+                } else if has_zellic {
+                    r#"
                 WITH page AS (
                     SELECT
                         z.contract_address,
@@ -2274,8 +2691,8 @@ impl Db {
                 LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
-            } else if cursor.is_some() {
-                r#"
+                } else if cursor.is_some() {
+                    r#"
                 WITH page AS (
                     SELECT
                         c.contract_address,
@@ -2306,75 +2723,99 @@ impl Db {
                 LEFT JOIN bytecode_metadata_current b ON page.contract_address = b.contract_address
                 ORDER BY page.block_number DESC, page.create_index DESC
                 "#
-            } else {
-                r#"
-                WITH page AS (
-                    SELECT
-                        c.contract_address,
-                        c.block_number,
-                        c.create_index,
-                        c.deployer,
-                        c.n_code_bytes
-                    FROM recent_contracts_all c
-                    WHERE c.block_number IS NOT NULL
-                    ORDER BY c.block_number DESC, c.create_index DESC
-                    LIMIT ?
-                )
-                SELECT
-                    page.contract_address,
-                    page.block_number,
-                    page.create_index,
-                    page.deployer,
-                    page.n_code_bytes,
-                    e.is_verified,
-                    e.contract_name,
-                    b.compiler_version
-                FROM page
-                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
-                LEFT JOIN bytecode_metadata_current b ON page.contract_address = b.contract_address
-                ORDER BY page.block_number DESC, page.create_index DESC
-                "#
-            };
-            let mut stmt = conn.prepare(sql)?;
-            let rows = if let Some(cursor) = cursor {
-                stmt.query_map(
-                    params![
-                        cursor.block_number as i64,
-                        cursor.block_number as i64,
-                        cursor.create_index as i64,
-                        page_limit
-                    ],
-                    read_recent_row,
-                )?
-            } else {
-                stmt.query_map(params![page_limit], read_recent_row)?
-            };
-            let mut out = Vec::new();
-            for r in rows {
-                let (addr, block, create_index, deployer, n_code, verified, name, compiler) = r?;
-                let block_u64 = block as u64;
-                let is_verified = if registry_loaded {
-                    Some(verified.unwrap_or(false))
                 } else {
-                    verified
+                    r#"
+                WITH page AS (
+                    SELECT
+                        c.contract_address,
+                        c.block_number,
+                        c.create_index,
+                        c.deployer,
+                        c.n_code_bytes
+                    FROM recent_contracts_all c
+                    WHERE c.block_number IS NOT NULL
+                    ORDER BY c.block_number DESC, c.create_index DESC
+                    LIMIT ?
+                )
+                SELECT
+                    page.contract_address,
+                    page.block_number,
+                    page.create_index,
+                    page.deployer,
+                    page.n_code_bytes,
+                    e.is_verified,
+                    e.contract_name,
+                    b.compiler_version
+                FROM page
+                LEFT JOIN recent_enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN bytecode_metadata_current b ON page.contract_address = b.contract_address
+                ORDER BY page.block_number DESC, page.create_index DESC
+                "#
                 };
-                out.push(RecentContract {
-                    address: format!("0x{}", hex::encode(&addr)),
-                    block_number: block_u64,
-                    create_index: create_index as u64,
-                    timestamp: crate::blocks::block_timestamp(chain_id, block_u64),
-                    deployer: format!("0x{}", hex::encode(deployer.unwrap_or_default())),
-                    n_code_bytes: n_code.unwrap_or(0) as u64,
-                    is_verified,
-                    contract_name: name,
-                    compiler_version: compiler,
-                });
-            }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| anyhow!("join error: {}", e))??;
-        let has_more = contracts.len() > limit as usize;
+                let mut stmt = conn.prepare(sql)?;
+                let rows = if let Some(cursor) = cursor {
+                    stmt.query_map(
+                        params![
+                            cursor.block_number as i64,
+                            cursor.block_number as i64,
+                            cursor.create_index as i64,
+                            page_limit
+                        ],
+                        read_recent_row,
+                    )?
+                } else {
+                    stmt.query_map(params![page_limit], read_recent_row)?
+                };
+                let mut out = Vec::new();
+                for r in rows {
+                    let (addr, block, create_index, deployer, n_code, verified, name, compiler) =
+                        r?;
+                    let block_u64 = block as u64;
+                    let is_verified = if registry_loaded {
+                        Some(verified.unwrap_or(false))
+                    } else {
+                        verified
+                    };
+                    out.push(RecentContract {
+                        address: format!("0x{}", hex::encode(&addr)),
+                        block_number: block_u64,
+                        create_index: create_index as u64,
+                        timestamp: crate::blocks::block_timestamp(chain_id, block_u64),
+                        deployer: format!("0x{}", hex::encode(deployer.unwrap_or_default())),
+                        n_code_bytes: n_code.unwrap_or(0) as u64,
+                        is_verified,
+                        contract_name: name,
+                        compiler_version: compiler,
+                    });
+                }
+                let last_block = out.last().map(|contract| contract.block_number);
+                let has_older_external = use_external_recent
+                    && last_block
+                        .map(|block| {
+                            parquet_files
+                                .iter()
+                                .cloned()
+                                .map(contract_file_with_range)
+                                .filter(|file| {
+                                    file.chain_id == Some(chain_id)
+                                        || (file.chain_id.is_none()
+                                            && chain_id == ETHEREUM_CHAIN_ID)
+                                })
+                                .filter_map(|file| file.end_block)
+                                .any(|end_block| end_block < block)
+                        })
+                        .unwrap_or(false);
+                let has_older_zellic = use_external_recent
+                    && last_block
+                        .zip(max_zellic_block)
+                        .map(|(block, zellic_block)| zellic_block < block)
+                        .unwrap_or(false);
+                Ok((out, has_older_external || has_older_zellic))
+            })
+            .await
+            .map_err(|e| anyhow!("join error: {}", e))??;
+        let has_more =
+            contracts.len() > limit as usize || (may_have_more_external && !contracts.is_empty());
         if has_more {
             contracts.truncate(limit as usize);
         }
@@ -2618,6 +3059,18 @@ mod tests {
         assert_eq!(stats.total_contracts, 2);
         assert_eq!(stats.first_block, 100);
         assert_eq!(stats.last_block, 200);
+
+        let deploys = db
+            .deploys_over_time(ETHEREUM_CHAIN_ID, 100, Some((0, 250)))
+            .await
+            .unwrap();
+        assert_eq!(
+            deploys
+                .iter()
+                .map(|bucket| (bucket.block_start, bucket.count))
+                .collect::<Vec<_>>(),
+            vec![(100, 1), (200, 1)]
+        );
 
         let recent = db
             .recent_contracts(ETHEREUM_CHAIN_ID, 5, None)

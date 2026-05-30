@@ -8,8 +8,8 @@
 //! Endpoints (all return JSON):
 //! - `GET /api/stats` — totals, verified pct, last block, verification coverage.
 //! - `GET /api/runtime` — serve-mode flags and background loop health.
-//! - `GET /api/deploys-over-time?bucket=hour|day|week|month` — time-series.
-//! - `GET /api/verified-ratio?bucket=...` — verified vs unverified vs unknown.
+//! - `GET /api/deploys-over-time?range=hour|day|week|month` — time-series.
+//! - `GET /api/verified-ratio?range=...` — verified vs unverified vs unknown.
 //! - `GET /api/bytecode-sizes` — semantic histogram of `n_code_bytes`.
 //! - `GET /api/compilers?limit=N` — top known compiler versions.
 //! - `GET /api/recent?limit=N` — newest contracts with verification join.
@@ -78,6 +78,8 @@ struct ApiCache {
 struct BucketCacheKey {
     chain_id: u64,
     bucket: u64,
+    start_block: Option<u64>,
+    end_block: Option<u64>,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -138,13 +140,6 @@ where
             .await
             .get(&key)
             .map(|(_, value)| value.clone())
-    }
-
-    async fn insert(&self, key: K, value: V) {
-        self.values
-            .lock()
-            .await
-            .insert(key, (Instant::now(), value));
     }
 
     async fn clear(&self) {
@@ -437,13 +432,22 @@ async fn runtime_handler(State(state): State<AppState>) -> Json<RuntimeResponse>
 struct BucketQuery {
     /// Chain ID to query. Defaults to Ethereum mainnet (1).
     chain_id: Option<u64>,
-    /// `day` (default), `week`, or a raw block count
+    /// Optional internal aggregation bucket: `hour`, `day`, `week`, `month`, or raw block count.
     #[serde(default)]
     bucket: Option<String>,
+    /// Visible time range: `hour`, `day`, `week`, or `month`.
+    #[serde(default)]
+    range: Option<String>,
 }
 
-fn parse_bucket(q: &BucketQuery, chain_id: u64, anchor_block: u64) -> u64 {
-    match q.bucket.as_deref() {
+#[derive(Clone, Copy)]
+struct TimeSeriesWindow {
+    bucket_blocks: u64,
+    block_range: Option<(u64, u64)>,
+}
+
+fn parse_bucket_value(bucket: Option<&str>, chain_id: u64, anchor_block: u64) -> u64 {
+    match bucket {
         None | Some("day") => blocks_per_day(chain_id, anchor_block),
         Some("hour") => blocks_per_day(chain_id, anchor_block) / 24,
         Some("week") => blocks_per_day(chain_id, anchor_block) * 7,
@@ -451,6 +455,39 @@ fn parse_bucket(q: &BucketQuery, chain_id: u64, anchor_block: u64) -> u64 {
         Some(other) => other
             .parse::<u64>()
             .unwrap_or_else(|_| blocks_per_day(chain_id, anchor_block)),
+    }
+}
+
+fn parse_time_series_window(q: &BucketQuery, chain_id: u64, anchor_block: u64) -> TimeSeriesWindow {
+    let blocks_per_day = blocks_per_day(chain_id, anchor_block).max(1);
+    let range = q.range.as_deref();
+    let (window_blocks, default_bucket) = match range {
+        Some("hour") => {
+            let window = (blocks_per_day / 24).max(1);
+            (window, (window / 12).max(1))
+        }
+        Some("day") => (blocks_per_day, (blocks_per_day / 24).max(1)),
+        Some("week") => (blocks_per_day * 7, blocks_per_day),
+        Some("month") => (blocks_per_day * 30, blocks_per_day),
+        _ => {
+            return TimeSeriesWindow {
+                bucket_blocks: parse_bucket_value(q.bucket.as_deref(), chain_id, anchor_block),
+                block_range: None,
+            };
+        }
+    };
+
+    TimeSeriesWindow {
+        bucket_blocks: q
+            .bucket
+            .as_deref()
+            .map(|bucket| parse_bucket_value(Some(bucket), chain_id, anchor_block))
+            .unwrap_or(default_bucket)
+            .max(1),
+        block_range: Some((
+            anchor_block.saturating_sub(window_blocks.saturating_sub(1)),
+            anchor_block,
+        )),
     }
 }
 
@@ -470,19 +507,26 @@ async fn deploys_handler(
 ) -> Result<Json<DeploysResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
     let highest = state.db.highest_block(chain_id).await?.unwrap_or(0);
-    let bucket = parse_bucket(&q, chain_id, highest);
-    let cache_key = BucketCacheKey { chain_id, bucket };
+    let window = parse_time_series_window(&q, chain_id, highest);
+    let cache_key = BucketCacheKey {
+        chain_id,
+        bucket: window.bucket_blocks,
+        start_block: window.block_range.map(|(start, _)| start),
+        end_block: window.block_range.map(|(_, end)| end),
+    };
     let buckets = state
         .cache
         .deploys
         .get_or_try_update(
             cache_key,
             API_CACHE_TTL,
-            state.db.deploys_over_time(chain_id, bucket),
+            state
+                .db
+                .deploys_over_time(chain_id, window.bucket_blocks, window.block_range),
         )
         .await?;
     Ok(Json(DeploysResponse {
-        bucket_blocks: bucket,
+        bucket_blocks: window.bucket_blocks,
         buckets,
     }))
 }
@@ -503,19 +547,26 @@ async fn verified_handler(
 ) -> Result<Json<VerifiedResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
     let highest = state.db.highest_block(chain_id).await?.unwrap_or(0);
-    let bucket = parse_bucket(&q, chain_id, highest);
-    let cache_key = BucketCacheKey { chain_id, bucket };
+    let window = parse_time_series_window(&q, chain_id, highest);
+    let cache_key = BucketCacheKey {
+        chain_id,
+        bucket: window.bucket_blocks,
+        start_block: window.block_range.map(|(start, _)| start),
+        end_block: window.block_range.map(|(_, end)| end),
+    };
     let buckets = state
         .cache
         .verified
         .get_or_try_update(
             cache_key,
             API_CACHE_TTL,
-            state.db.verified_ratio_over_time(chain_id, bucket),
+            state
+                .db
+                .verified_ratio_over_time(chain_id, window.bucket_blocks, window.block_range),
         )
         .await?;
     Ok(Json(VerifiedResponse {
-        bucket_blocks: bucket,
+        bucket_blocks: window.bucket_blocks,
         buckets,
     }))
 }
@@ -631,11 +682,17 @@ async fn recent_handler(
         }),
         _ => None,
     };
-    let page = match state.db.recent_contracts(chain_id, limit, cursor).await {
-        Ok(page) => {
-            state.cache.recent.insert(cache_key, page.clone()).await;
-            page
-        }
+    let page = match state
+        .cache
+        .recent
+        .get_or_try_update(
+            cache_key,
+            API_CACHE_TTL,
+            state.db.recent_contracts(chain_id, limit, cursor),
+        )
+        .await
+    {
+        Ok(page) => page,
         Err(err) => {
             tracing::warn!("recent contracts query failed: {:#}", err);
             state
@@ -843,5 +900,60 @@ async fn background_tail_loop(
             }
         }
         tokio::time::sleep(config.interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::chains::{ETHEREUM_CHAIN_ID, GNOSIS_CHAIN_ID};
+
+    use super::{parse_time_series_window, BucketQuery};
+
+    fn query(range: Option<&str>, bucket: Option<&str>) -> BucketQuery {
+        BucketQuery {
+            chain_id: None,
+            bucket: bucket.map(str::to_string),
+            range: range.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn day_range_limits_chart_to_last_day_with_hourly_buckets() {
+        let anchor_block = 20_000_000;
+        let window =
+            parse_time_series_window(&query(Some("day"), None), ETHEREUM_CHAIN_ID, anchor_block);
+
+        assert_eq!(window.block_range, Some((19_992_801, 20_000_000)));
+        assert_eq!(window.bucket_blocks, 300);
+    }
+
+    #[test]
+    fn week_range_limits_chart_to_last_week_with_daily_buckets() {
+        let anchor_block = 20_000_000;
+        let window =
+            parse_time_series_window(&query(Some("week"), None), ETHEREUM_CHAIN_ID, anchor_block);
+
+        assert_eq!(window.block_range, Some((19_949_601, 20_000_000)));
+        assert_eq!(window.bucket_blocks, 7_200);
+    }
+
+    #[test]
+    fn hour_range_uses_chain_specific_block_time() {
+        let anchor_block = 46_000_000;
+        let window =
+            parse_time_series_window(&query(Some("hour"), None), GNOSIS_CHAIN_ID, anchor_block);
+
+        assert_eq!(window.block_range, Some((45_999_281, 46_000_000)));
+        assert_eq!(window.bucket_blocks, 60);
+    }
+
+    #[test]
+    fn legacy_bucket_query_keeps_full_history_behavior() {
+        let anchor_block = 20_000_000;
+        let window =
+            parse_time_series_window(&query(None, Some("day")), ETHEREUM_CHAIN_ID, anchor_block);
+
+        assert_eq!(window.block_range, None);
+        assert_eq!(window.bucket_blocks, 7_200);
     }
 }
