@@ -52,12 +52,52 @@ pub fn block_timestamp(chain_id: u64, block_number: u64) -> DateTime<Utc> {
     Utc.timestamp_opt(secs, 0).single().unwrap_or_else(Utc::now)
 }
 
+/// Approximate the block number for a given chain and timestamp.
+pub fn block_number_at_time(chain_id: u64, timestamp: DateTime<Utc>) -> u64 {
+    match chain_id {
+        GNOSIS_CHAIN_ID => {
+            let secs = timestamp
+                .timestamp()
+                .saturating_sub(GNOSIS_GENESIS_TIMESTAMP);
+            (secs / GNOSIS_SECS_PER_BLOCK).max(0) as u64
+        }
+        _ => ethereum_block_number_at_time(timestamp.timestamp()),
+    }
+}
+
 fn ethereum_block_timestamp_secs(block_number: u64) -> i64 {
     if block_number >= POST_MERGE_BLOCK {
         POST_MERGE_TIMESTAMP + (block_number - POST_MERGE_BLOCK) as i64 * SECS_PER_BLOCK_POST_MERGE
     } else {
         interpolate_ethereum_pre_merge(block_number)
     }
+}
+
+fn ethereum_block_number_at_time(timestamp: i64) -> u64 {
+    if timestamp >= POST_MERGE_TIMESTAMP {
+        let blocks = (timestamp - POST_MERGE_TIMESTAMP) / SECS_PER_BLOCK_POST_MERGE;
+        return POST_MERGE_BLOCK + blocks.max(0) as u64;
+    }
+
+    let idx = match CHECKPOINTS.binary_search_by_key(&timestamp, |(_, t)| *t) {
+        Ok(i) => return CHECKPOINTS[i].0,
+        Err(i) => i,
+    };
+    if idx == 0 {
+        return CHECKPOINTS[0].0;
+    }
+    if idx >= CHECKPOINTS.len() {
+        return CHECKPOINTS[CHECKPOINTS.len() - 1].0;
+    }
+    let (b0, t0) = CHECKPOINTS[idx - 1];
+    let (b1, t1) = CHECKPOINTS[idx];
+    let span_secs = (t1 - t0) as i128;
+    if span_secs <= 0 {
+        return b0;
+    }
+    let span_blocks = (b1 - b0) as i128;
+    let offset = (timestamp - t0) as i128;
+    b0 + ((offset * span_blocks) / span_secs) as u64
 }
 
 fn interpolate_ethereum_pre_merge(block_number: u64) -> i64 {

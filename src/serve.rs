@@ -451,6 +451,15 @@ struct BucketQuery {
     /// Optional block number where the visible range should end. Defaults to the latest indexed block.
     #[serde(default)]
     end_block: Option<u64>,
+    /// Optional block number where the visible range should start.
+    #[serde(default)]
+    start_block: Option<u64>,
+    /// Optional ISO-8601 timestamp where the visible range should start.
+    #[serde(default)]
+    start_time: Option<DateTime<Utc>>,
+    /// Optional ISO-8601 timestamp where the visible range should end.
+    #[serde(default)]
+    end_time: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy)]
@@ -473,7 +482,31 @@ fn parse_bucket_value(bucket: Option<&str>, chain_id: u64, anchor_block: u64) ->
 
 fn parse_time_series_window(q: &BucketQuery, chain_id: u64, anchor_block: u64) -> TimeSeriesWindow {
     let blocks_per_day = blocks_per_day(chain_id, anchor_block).max(1);
-    let range_end = q.end_block.unwrap_or(anchor_block).min(anchor_block);
+    let explicit_end = q.end_block.or_else(|| {
+        q.end_time
+            .map(|time| crate::blocks::block_number_at_time(chain_id, time))
+    });
+    let range_end = explicit_end.unwrap_or(anchor_block).min(anchor_block);
+    let range_start = q
+        .start_block
+        .or_else(|| {
+            q.start_time
+                .map(|time| crate::blocks::block_number_at_time(chain_id, time))
+        })
+        .map(|start| start.min(range_end));
+    if let Some(range_start) = range_start {
+        let width = range_end.saturating_sub(range_start).saturating_add(1);
+        let default_bucket = (width / 96).max(1);
+        return TimeSeriesWindow {
+            bucket_blocks: q
+                .bucket
+                .as_deref()
+                .map(|bucket| parse_bucket_value(Some(bucket), chain_id, anchor_block))
+                .unwrap_or(default_bucket),
+            block_range: Some((range_start, range_end)),
+        };
+    }
+
     let range = q.range.as_deref();
     let (window_blocks, default_bucket) = match range {
         Some("hour") => {
@@ -949,6 +982,9 @@ mod tests {
             bucket: bucket.map(str::to_string),
             range: range.map(str::to_string),
             end_block: None,
+            start_block: None,
+            start_time: None,
+            end_time: None,
         }
     }
 
@@ -1004,5 +1040,17 @@ mod tests {
         q.end_block = Some(21_000_000);
         let capped = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, anchor_block);
         assert_eq!(capped.block_range, Some((19_992_801, 20_000_000)));
+    }
+
+    #[test]
+    fn explicit_start_block_creates_custom_window() {
+        let anchor_block = 20_000_000;
+        let mut q = query(None, None);
+        q.start_block = Some(19_900_000);
+        q.end_block = Some(19_950_000);
+        let window = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, anchor_block);
+
+        assert_eq!(window.block_range, Some((19_900_000, 19_950_000)));
+        assert_eq!(window.bucket_blocks, 520);
     }
 }
