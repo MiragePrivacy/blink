@@ -39,9 +39,8 @@ pub fn chain_chunk_path(output_dir: &Path, chain_id: u64, start: u64, end: u64) 
 pub fn resolve_rpc_url(rpc: Option<String>) -> Result<String> {
     let mut url = match rpc {
         Some(url) => url,
-        None => {
-            std::env::var("ETH_RPC_URL").map_err(|_| anyhow!("missing --rpc and ETH_RPC_URL"))?
-        }
+        None => std::env::var("BLINK_CONTRACTS_RPC")
+            .map_err(|_| anyhow!("missing --rpc and BLINK_CONTRACTS_RPC"))?,
     };
     if !url.starts_with("http") {
         url = format!("http://{}", url);

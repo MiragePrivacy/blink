@@ -2,7 +2,7 @@
 //!
 //! Hosts the JSON API consumed by the separate dashboard frontend.
 //! Optional background tasks:
-//! - repeated `--tail-rpc URL` flags poll one or more chain heads and extract
+//! - repeated `--rpc URL` flags poll one or more chain heads and extract
 //!   newly produced blocks into separate `tail__chain_*` parquet files.
 //!
 //! Endpoints (all return JSON):
@@ -248,20 +248,20 @@ impl RuntimeState {
 }
 
 pub async fn run_serve(args: ServeArgs) -> Result<()> {
-    if args.read_only && !args.tail_rpc.is_empty() {
+    if args.read_only && !args.rpc.is_empty() {
         tracing::warn!(
-            "--read-only is set; ignoring --tail-rpc values (tailing requires a write lock)"
+            "--read-only is set; ignoring --rpc values (background extraction requires a write lock)"
         );
     }
     let db = Db::open_with_mode(&args.data_dir, &args.contracts_glob, args.read_only)?;
-    let tail_rpcs = args
-        .tail_rpc
+    let rpcs = args
+        .rpc
         .iter()
         .map(|rpc| rpc.trim())
         .filter(|rpc| !rpc.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let tail_enabled = !tail_rpcs.is_empty() && !args.read_only;
+    let tail_enabled = !rpcs.is_empty() && !args.read_only;
     let runtime = Arc::new(RuntimeState::new(
         args.read_only,
         tail_enabled,
@@ -275,7 +275,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     };
 
     if !args.read_only {
-        for rpc in tail_rpcs {
+        for rpc in rpcs {
             let db_bg = db.clone();
             let config = TailLoopConfig {
                 rpc,

@@ -18,7 +18,7 @@ cargo build --release
 ## Usage
 
 ```bash
-# Basic usage (uses ETH_RPC_URL environment variable)
+# Basic usage (uses BLINK_CONTRACTS_RPC environment variable)
 blink contracts --start-block 0 --end-block 1000000
 
 # With explicit RPC URL
@@ -52,7 +52,7 @@ blink contracts --start-block 0 --overwrite
 blink contracts [OPTIONS] --start-block <START_BLOCK>
 
 Options:
-      --rpc <RPC>                          RPC URL (fallback: ETH_RPC_URL)
+      --rpc <RPC>                          RPC URL (env: BLINK_CONTRACTS_RPC)
       --start-block <START_BLOCK>          Start block (inclusive)
       --end-block <END_BLOCK>              End block or "latest" [default: latest]
       --chunk-size <CHUNK_SIZE>            Blocks per output file [default: 100000]

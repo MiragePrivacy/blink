@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = "1.0"
 arrow = "57.2"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 futures = "0.3"
 parquet = { version = "57.2", features = ["arrow"] }
 serde = { version = "1.0", features = ["derive"] }
