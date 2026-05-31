@@ -2874,6 +2874,49 @@ impl Db {
         .await
         .map_err(|e| anyhow!("join error: {}", e))?
     }
+
+    pub async fn highest_contract_block(&self, chain_id: u64) -> Result<Option<u64>> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<u64>> {
+            let conn = inner.blocking_lock();
+            let zellic_max = if chain_id == ETHEREUM_CHAIN_ID
+                && table_exists(&conn, "zellic_block_counts")?
+            {
+                let block: Option<u32> = conn
+                    .query_row(
+                        "SELECT MAX(block_number) FROM zellic_block_counts",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(None);
+                block.map(u64::from)
+            } else if chain_id == ETHEREUM_CHAIN_ID && table_exists(&conn, "zellic_contracts")? {
+                let block: Option<u32> = conn
+                    .query_row(
+                        "SELECT MAX(block_number) FROM zellic_contracts",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(None);
+                block.map(u64::from)
+            } else {
+                None
+            };
+            let parquet_max: Option<u32> = conn
+                .query_row(
+                    "SELECT MAX(block_number) FROM parquet_contracts WHERE chain_id = ?",
+                    params![chain_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(None);
+            Ok([zellic_max, parquet_max.map(u64::from)]
+                .into_iter()
+                .flatten()
+                .max())
+        })
+        .await
+        .map_err(|e| anyhow!("join error: {}", e))?
+    }
 }
 
 #[cfg(test)]
@@ -3003,6 +3046,34 @@ mod tests {
         .unwrap();
     }
 
+    fn write_sparse_gnosis_parquet(data_dir: &Path) {
+        let path = data_dir.join("contracts__chain_0000000100__0000000300__0000000500.parquet");
+        let path_sql = path.display().to_string().replace('\'', "''");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            r#"
+            COPY (
+                SELECT
+                    300::UINTEGER AS block_number,
+                    unhex(repeat('13', 32)) AS block_hash,
+                    0::UINTEGER AS create_index,
+                    unhex(repeat('14', 32)) AS transaction_hash,
+                    unhex(repeat('15', 20)) AS contract_address,
+                    unhex(repeat('16', 20)) AS deployer,
+                    unhex(repeat('17', 20)) AS factory,
+                    unhex('6000') AS init_code,
+                    unhex('6001') AS code,
+                    unhex(repeat('18', 32)) AS init_code_hash,
+                    2::UINTEGER AS n_init_code_bytes,
+                    2::UINTEGER AS n_code_bytes,
+                    unhex(repeat('19', 32)) AS code_hash,
+                    100::UBIGINT AS chain_id
+            ) TO '{path_sql}' (FORMAT PARQUET);
+            "#
+        ))
+        .unwrap();
+    }
+
     #[test]
     fn recent_parquet_selection_uses_filename_block_ranges() {
         let files = vec![
@@ -3082,6 +3153,17 @@ mod tests {
             recent.contracts[0].address,
             format!("0x{}", hex::encode(make_bytes(5, 20)))
         );
+    }
+
+    #[tokio::test]
+    async fn chart_anchor_uses_latest_contract_row_not_parquet_filename_end() {
+        let dir = TestDir::new("chart_anchor_actual_contract_block");
+        write_sparse_gnosis_parquet(&dir.path);
+
+        let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+
+        assert_eq!(db.highest_block(100).await.unwrap(), Some(500));
+        assert_eq!(db.highest_contract_block(100).await.unwrap(), Some(300));
     }
 
     #[tokio::test]

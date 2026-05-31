@@ -520,7 +520,11 @@ async fn deploys_handler(
     Query(q): Query<BucketQuery>,
 ) -> Result<Json<DeploysResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
-    let highest = state.db.highest_block(chain_id).await?.unwrap_or(0);
+    let highest = state
+        .db
+        .highest_contract_block(chain_id)
+        .await?
+        .unwrap_or(0);
     let window = parse_time_series_window(&q, chain_id, highest);
     let cache_key = BucketCacheKey {
         chain_id,
@@ -563,7 +567,11 @@ async fn verified_handler(
     Query(q): Query<BucketQuery>,
 ) -> Result<Json<VerifiedResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
-    let highest = state.db.highest_block(chain_id).await?.unwrap_or(0);
+    let highest = state
+        .db
+        .highest_contract_block(chain_id)
+        .await?
+        .unwrap_or(0);
     let window = parse_time_series_window(&q, chain_id, highest);
     let cache_key = BucketCacheKey {
         chain_id,
