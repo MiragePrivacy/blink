@@ -8,7 +8,7 @@
 //! Endpoints (all return JSON):
 //! - `GET /api/stats` — totals, verified pct, last block, verification coverage.
 //! - `GET /api/runtime` — serve-mode flags and background loop health.
-//! - `GET /api/deploys-over-time?range=hour|day|week|month` — time-series.
+//! - `GET /api/deploys-over-time?range=hour|day|week|month|year` — time-series.
 //! - `GET /api/verified-ratio?range=...` — verified vs unverified vs unknown.
 //! - `GET /api/bytecode-sizes` — semantic histogram of `n_code_bytes`.
 //! - `GET /api/compilers?limit=N` — top known compiler versions.
@@ -57,6 +57,11 @@ struct AppState {
 }
 
 const API_CACHE_TTL: Duration = Duration::from_secs(30);
+const DEFAULT_COMPILER_LIMIT: u32 = 12;
+const DEFAULT_RECENT_LIMIT: u32 = 20;
+const INITIAL_DEPLOYS_RANGE: &str = "day";
+const INITIAL_VERIFIED_RANGE: &str = "week";
+const PRESET_CHART_RANGES: &[&str] = &["hour", "day", "week", "month", "year"];
 const API_TAG: &str = "Dashboard";
 
 #[derive(OpenApi)]
@@ -123,18 +128,23 @@ where
         {
             let guard = self.values.lock().await;
             if let Some((stored_at, value)) = guard.get(&key) {
-                if stored_at.elapsed() <= ttl {
-                    return Ok(value.clone());
+                if stored_at.elapsed() > ttl {
+                    tracing::debug!("serving stale dashboard cache entry");
                 }
+                return Ok(value.clone());
             }
         }
 
         let value = future.await?;
+        self.insert(key, value.clone()).await;
+        Ok(value)
+    }
+
+    async fn insert(&self, key: K, value: V) {
         self.values
             .lock()
             .await
-            .insert(key, (Instant::now(), value.clone()));
-        Ok(value)
+            .insert(key, (Instant::now(), value));
     }
 
     async fn get(&self, key: K) -> Option<V> {
@@ -143,23 +153,6 @@ where
             .await
             .get(&key)
             .map(|(_, value)| value.clone())
-    }
-
-    async fn clear(&self) {
-        self.values.lock().await.clear();
-    }
-}
-
-impl ApiCache {
-    async fn clear_contract_data(&self) {
-        self.stats.clear().await;
-        self.deploys.clear().await;
-        self.verified.clear().await;
-        self.bytecode_sizes.clear().await;
-        self.compilers.clear().await;
-        self.recent.clear().await;
-        self.languages.clear().await;
-        self.standards.clear().await;
     }
 }
 
@@ -273,6 +266,16 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         runtime: runtime.clone(),
         cache: cache.clone(),
     };
+
+    prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
+    {
+        let db_warm = db.clone();
+        let cache_warm = cache.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            prewarm_extended_dashboard_cache(db_warm, cache_warm).await;
+        });
+    }
 
     if !args.read_only {
         for rpc in rpcs {
@@ -437,15 +440,15 @@ async fn runtime_handler(State(state): State<AppState>) -> Json<RuntimeResponse>
     Json(state.runtime.response().await)
 }
 
-#[derive(Deserialize, IntoParams)]
+#[derive(Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 struct BucketQuery {
     /// Chain ID to query. Defaults to Ethereum mainnet (1).
     chain_id: Option<u64>,
-    /// Optional internal aggregation bucket: `hour`, `day`, `week`, `month`, or raw block count.
+    /// Optional internal aggregation bucket: `hour`, `day`, `week`, `month`, `year`, or raw block count.
     #[serde(default)]
     bucket: Option<String>,
-    /// Visible time range: `hour`, `day`, `week`, or `month`.
+    /// Visible time range: `hour`, `day`, `week`, `month`, or `year`.
     #[serde(default)]
     range: Option<String>,
     /// Optional block number where the visible range should end. Defaults to the latest indexed block.
@@ -474,6 +477,7 @@ fn parse_bucket_value(bucket: Option<&str>, chain_id: u64, anchor_block: u64) ->
         Some("hour") => blocks_per_day(chain_id, anchor_block) / 24,
         Some("week") => blocks_per_day(chain_id, anchor_block) * 7,
         Some("month") => blocks_per_day(chain_id, anchor_block) * 30,
+        Some("year") => blocks_per_day(chain_id, anchor_block) * 365,
         Some(other) => other
             .parse::<u64>()
             .unwrap_or_else(|_| blocks_per_day(chain_id, anchor_block)),
@@ -516,6 +520,7 @@ fn parse_time_series_window(q: &BucketQuery, chain_id: u64, anchor_block: u64) -
         Some("day") => (blocks_per_day, (blocks_per_day / 24).max(1)),
         Some("week") => (blocks_per_day * 7, blocks_per_day),
         Some("month") => (blocks_per_day * 30, blocks_per_day),
+        Some("year") => (blocks_per_day * 365, blocks_per_day * 30),
         _ => {
             return TimeSeriesWindow {
                 bucket_blocks: parse_bucket_value(q.bucket.as_deref(), chain_id, anchor_block),
@@ -906,6 +911,156 @@ struct LanguagesResponse {
     languages: Vec<crate::db::LanguageCount>,
 }
 
+async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
+    let started = Instant::now();
+    for chain in chains::supported_chains() {
+        prewarm_chain_dashboard_cache(
+            &db,
+            &cache,
+            chain.chain_id,
+            &[INITIAL_DEPLOYS_RANGE, INITIAL_VERIFIED_RANGE],
+            true,
+        )
+        .await;
+    }
+    tracing::info!(
+        "initial dashboard cache warmed in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+}
+
+async fn prewarm_extended_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
+    let started = Instant::now();
+    for chain in chains::supported_chains() {
+        prewarm_chain_dashboard_cache(&db, &cache, chain.chain_id, PRESET_CHART_RANGES, false)
+            .await;
+    }
+    tracing::info!(
+        "extended chart cache warmed in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+}
+
+async fn prewarm_chain_dashboard_cache(
+    db: &Db,
+    cache: &ApiCache,
+    chain_id: u64,
+    chart_ranges: &[&str],
+    include_widgets: bool,
+) {
+    let started = Instant::now();
+    let highest = match db.highest_contract_block(chain_id).await {
+        Ok(Some(block)) => block,
+        Ok(None) => 0,
+        Err(err) => {
+            log_prewarm_error(chain_id, "highest block", err);
+            return;
+        }
+    };
+
+    if include_widgets {
+        match db.stats(chain_id).await {
+            Ok(stats) => cache.stats.insert(chain_id, stats).await,
+            Err(err) => log_prewarm_error(chain_id, "stats", err),
+        }
+
+        match db.bytecode_size_distribution(chain_id).await {
+            Ok(bins) => cache.bytecode_sizes.insert(chain_id, bins).await,
+            Err(err) => log_prewarm_error(chain_id, "bytecode sizes", err),
+        }
+
+        let compiler_key = LimitCacheKey {
+            chain_id,
+            limit: DEFAULT_COMPILER_LIMIT,
+        };
+        match async {
+            Ok::<_, anyhow::Error>((
+                db.top_compilers(chain_id, DEFAULT_COMPILER_LIMIT).await?,
+                db.compiler_version_total(chain_id).await?,
+            ))
+        }
+        .await
+        {
+            Ok(compilers) => cache.compilers.insert(compiler_key, compilers).await,
+            Err(err) => log_prewarm_error(chain_id, "compilers", err),
+        }
+
+        match db.language_distribution(chain_id).await {
+            Ok(languages) => cache.languages.insert(chain_id, languages).await,
+            Err(err) => log_prewarm_error(chain_id, "languages", err),
+        }
+
+        match db.standards_breakdown(chain_id).await {
+            Ok(standards) => cache.standards.insert(chain_id, standards).await,
+            Err(err) => log_prewarm_error(chain_id, "standards", err),
+        }
+
+        let recent_key = RecentCacheKey {
+            chain_id,
+            limit: DEFAULT_RECENT_LIMIT,
+            before_block: None,
+            before_create_index: None,
+        };
+        match db
+            .recent_contracts(chain_id, DEFAULT_RECENT_LIMIT, None)
+            .await
+        {
+            Ok(recent) => cache.recent.insert(recent_key, recent).await,
+            Err(err) => log_prewarm_error(chain_id, "recent deployments", err),
+        }
+    }
+
+    for range in chart_ranges {
+        prewarm_chart_range(db, cache, chain_id, highest, range).await;
+    }
+
+    tracing::debug!(
+        "dashboard cache warmed for chain_id={} in {:.1}s",
+        chain_id,
+        started.elapsed().as_secs_f64()
+    );
+}
+
+async fn prewarm_chart_range(db: &Db, cache: &ApiCache, chain_id: u64, highest: u64, range: &str) {
+    let query = BucketQuery {
+        chain_id: Some(chain_id),
+        range: Some(range.to_string()),
+        ..BucketQuery::default()
+    };
+    let window = parse_time_series_window(&query, chain_id, highest);
+    let cache_key = BucketCacheKey {
+        chain_id,
+        bucket: window.bucket_blocks,
+        start_block: window.block_range.map(|(start, _)| start),
+        end_block: window.block_range.map(|(_, end)| end),
+    };
+
+    match db
+        .deploys_over_time(chain_id, window.bucket_blocks, window.block_range)
+        .await
+    {
+        Ok(buckets) => cache.deploys.insert(cache_key, buckets).await,
+        Err(err) => log_prewarm_error(chain_id, &format!("deployments {range}"), err),
+    }
+
+    match db
+        .verified_ratio_over_time(chain_id, window.bucket_blocks, window.block_range)
+        .await
+    {
+        Ok(buckets) => cache.verified.insert(cache_key, buckets).await,
+        Err(err) => log_prewarm_error(chain_id, &format!("verification {range}"), err),
+    }
+}
+
+fn log_prewarm_error(chain_id: u64, label: &str, err: anyhow::Error) {
+    tracing::warn!(
+        "dashboard cache prewarm failed (chain_id={}, {}): {:#}",
+        chain_id,
+        label,
+        err
+    );
+}
+
 async fn background_tail_loop(
     db: Db,
     config: TailLoopConfig,
@@ -948,7 +1103,20 @@ async fn background_tail_loop(
                 runtime
                     .mark_tail_ok(Some(report.end_block), report.rows as u64)
                     .await;
-                cache.clear_contract_data().await;
+                if let Some(chain_id) = chain_id {
+                    let db_refresh = db.clone();
+                    let cache_refresh = cache.clone();
+                    tokio::spawn(async move {
+                        prewarm_chain_dashboard_cache(
+                            &db_refresh,
+                            &cache_refresh,
+                            chain_id,
+                            PRESET_CHART_RANGES,
+                            true,
+                        )
+                        .await;
+                    });
+                }
                 tracing::info!(
                     "tail extracted blocks {}-{} ({} contracts)",
                     report.start_block,
@@ -1006,6 +1174,16 @@ mod tests {
 
         assert_eq!(window.block_range, Some((19_949_601, 20_000_000)));
         assert_eq!(window.bucket_blocks, 7_200);
+    }
+
+    #[test]
+    fn year_range_limits_chart_to_last_year_with_monthly_buckets() {
+        let anchor_block = 20_000_000;
+        let window =
+            parse_time_series_window(&query(Some("year"), None), ETHEREUM_CHAIN_ID, anchor_block);
+
+        assert_eq!(window.block_range, Some((17_372_001, 20_000_000)));
+        assert_eq!(window.bucket_blocks, 216_000);
     }
 
     #[test]
