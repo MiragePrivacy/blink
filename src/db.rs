@@ -32,7 +32,7 @@ pub struct Db {
     contracts_glob: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct Stats {
     pub total_contracts: u64,
     pub verified_count: u64,
@@ -44,7 +44,7 @@ pub struct Stats {
     pub last_updated: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct DeployBucket {
     pub block_start: u64,
     pub block_end: u64,
@@ -52,7 +52,7 @@ pub struct DeployBucket {
     pub count: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct VerifiedRatioBucket {
     pub block_start: u64,
     pub block_end: u64,
@@ -62,7 +62,7 @@ pub struct VerifiedRatioBucket {
     pub unknown: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct SizeBin {
     pub label: String,
     pub size_min: u64,
@@ -70,19 +70,19 @@ pub struct SizeBin {
     pub count: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct CompilerCount {
     pub compiler_version: String,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct LanguageCount {
     pub language: String,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct StandardsBreakdown {
     pub erc20: u64,
     pub erc721: u64,
@@ -94,7 +94,7 @@ pub struct StandardsBreakdown {
     pub total_decoded: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct RecentContract {
     pub address: String,
     pub block_number: u64,
@@ -113,15 +113,16 @@ pub struct RecentCursor {
     pub create_index: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct RecentPage {
     pub contracts: Vec<RecentContract>,
     pub has_more: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct SqlQueryResult {
     pub columns: Vec<String>,
+    #[schema(value_type = Vec<Vec<Object>>)]
     pub rows: Vec<Vec<Value>>,
     pub row_count: usize,
     pub limit: u32,

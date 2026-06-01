@@ -30,13 +30,15 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::{get, post},
-    Router,
+    routing::get,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::Mutex};
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
+use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa_axum::{router::OpenApiRouter, routes};
+use utoipa_scalar::{Scalar, Servable};
 
 use crate::{
     blocks::blocks_per_day,
@@ -56,6 +58,13 @@ struct AppState {
 }
 
 const API_CACHE_TTL: Duration = Duration::from_secs(30);
+const API_TAG: &str = "Dashboard";
+
+#[derive(OpenApi)]
+#[openapi(tags(
+    (name = API_TAG, description = "Blink dashboard and contract intelligence endpoints")
+))]
+struct ApiDoc;
 
 #[derive(Default)]
 struct ApiCache {
@@ -148,7 +157,7 @@ struct RuntimeState {
     snapshot: Mutex<RuntimeSnapshot>,
 }
 
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, ToSchema)]
 struct RuntimeSnapshot {
     metadata_sync_running: bool,
     metadata_last_ok_at: Option<DateTime<Utc>>,
@@ -163,7 +172,7 @@ struct RuntimeSnapshot {
     tail_last_error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct RuntimeResponse {
     read_only: bool,
     metadata_sync_enabled: bool,
@@ -328,17 +337,24 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         });
     }
 
-    let app = Router::new()
-        .route("/api/stats", get(stats_handler))
-        .route("/api/runtime", get(runtime_handler))
-        .route("/api/deploys-over-time", get(deploys_handler))
-        .route("/api/verified-ratio", get(verified_handler))
-        .route("/api/bytecode-sizes", get(bytecode_sizes_handler))
-        .route("/api/compilers", get(compilers_handler))
-        .route("/api/languages", get(languages_handler))
-        .route("/api/standards", get(standards_handler))
-        .route("/api/recent", get(recent_handler))
-        .route("/api/query", post(query_handler))
+    let (api_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(routes!(stats_handler))
+        .routes(routes!(runtime_handler))
+        .routes(routes!(deploys_handler))
+        .routes(routes!(verified_handler))
+        .routes(routes!(bytecode_sizes_handler))
+        .routes(routes!(compilers_handler))
+        .routes(routes!(languages_handler))
+        .routes(routes!(standards_handler))
+        .routes(routes!(recent_handler))
+        .routes(routes!(query_handler))
+        .split_for_parts();
+    let openapi_json = api
+        .to_pretty_json()
+        .context("failed to generate openapi json")?;
+    let app = api_router
+        .route("/openapi.json", get(|| async { openapi_json }))
+        .merge(Scalar::with_url("/scalar", api))
         .fallback_service(ServeDir::new(&args.static_dir).append_index_html_on_directories(true))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -359,7 +375,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         .context("axum server failed")
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct ApiError {
     error: String,
 }
@@ -396,6 +412,15 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/stats",
+    tag = API_TAG,
+    responses(
+        (status = OK, body = crate::db::Stats),
+        (status = INTERNAL_SERVER_ERROR, body = ApiError)
+    )
+)]
 async fn stats_handler(State(state): State<AppState>) -> Result<Json<crate::db::Stats>, AppError> {
     let stats = state
         .cache
@@ -405,11 +430,18 @@ async fn stats_handler(State(state): State<AppState>) -> Result<Json<crate::db::
     Ok(Json(stats))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/runtime",
+    tag = API_TAG,
+    responses((status = OK, body = RuntimeResponse))
+)]
 async fn runtime_handler(State(state): State<AppState>) -> Json<RuntimeResponse> {
     Json(state.runtime.response().await)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct BucketQuery {
     /// `day` (default), `week`, or a raw block count
     #[serde(default)]
@@ -428,6 +460,16 @@ fn parse_bucket(q: &BucketQuery, anchor_block: u64) -> u64 {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/deploys-over-time",
+    tag = API_TAG,
+    params(BucketQuery),
+    responses(
+        (status = OK, body = DeploysResponse),
+        (status = INTERNAL_SERVER_ERROR, body = ApiError)
+    )
+)]
 async fn deploys_handler(
     State(state): State<AppState>,
     Query(q): Query<BucketQuery>,
@@ -445,6 +487,16 @@ async fn deploys_handler(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/verified-ratio",
+    tag = API_TAG,
+    params(BucketQuery),
+    responses(
+        (status = OK, body = VerifiedResponse),
+        (status = INTERNAL_SERVER_ERROR, body = ApiError)
+    )
+)]
 async fn verified_handler(
     State(state): State<AppState>,
     Query(q): Query<BucketQuery>,
@@ -466,6 +518,15 @@ async fn verified_handler(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/bytecode-sizes",
+    tag = API_TAG,
+    responses(
+        (status = OK, body = SizeResponse),
+        (status = INTERNAL_SERVER_ERROR, body = ApiError)
+    )
+)]
 async fn bytecode_sizes_handler(
     State(state): State<AppState>,
 ) -> Result<Json<SizeResponse>, AppError> {
@@ -477,18 +538,34 @@ async fn bytecode_sizes_handler(
     Ok(Json(SizeResponse { bins: bins_out }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct LimitQuery {
+    /// Maximum number of compiler versions to return.
     limit: Option<u32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 struct PageQuery {
+    /// Maximum number of contracts to return.
     limit: Option<u32>,
+    /// Cursor block number from the previous page.
     before_block: Option<u64>,
+    /// Cursor create index from the previous page.
     before_create_index: Option<u64>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/compilers",
+    tag = API_TAG,
+    params(LimitQuery),
+    responses(
+        (status = OK, body = CompilersResponse),
+        (status = INTERNAL_SERVER_ERROR, body = ApiError)
+    )
+)]
 async fn compilers_handler(
     State(state): State<AppState>,
     Query(q): Query<LimitQuery>,
@@ -510,6 +587,16 @@ async fn compilers_handler(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/recent",
+    tag = API_TAG,
+    params(PageQuery),
+    responses(
+        (status = OK, body = RecentResponse),
+        (status = INTERNAL_SERVER_ERROR, body = ApiError)
+    )
+)]
 async fn recent_handler(
     State(state): State<AppState>,
     Query(q): Query<PageQuery>,
@@ -530,12 +617,25 @@ async fn recent_handler(
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct SqlQueryRequest {
+    /// Read-only SQL query over dashboard views.
     sql: String,
+    /// Maximum rows to return.
     limit: Option<u32>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/query",
+    tag = API_TAG,
+    request_body = SqlQueryRequest,
+    responses(
+        (status = OK, body = crate::db::SqlQueryResult),
+        (status = BAD_REQUEST, body = ApiError),
+        (status = INTERNAL_SERVER_ERROR, body = ApiError)
+    )
+)]
 async fn query_handler(
     State(state): State<AppState>,
     Json(req): Json<SqlQueryRequest>,
@@ -548,6 +648,15 @@ async fn query_handler(
         .map_err(AppError::bad_request)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/languages",
+    tag = API_TAG,
+    responses(
+        (status = OK, body = LanguagesResponse),
+        (status = INTERNAL_SERVER_ERROR, body = ApiError)
+    )
+)]
 async fn languages_handler(
     State(state): State<AppState>,
 ) -> Result<Json<LanguagesResponse>, AppError> {
@@ -559,6 +668,15 @@ async fn languages_handler(
     Ok(Json(LanguagesResponse { languages }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/standards",
+    tag = API_TAG,
+    responses(
+        (status = OK, body = crate::db::StandardsBreakdown),
+        (status = INTERNAL_SERVER_ERROR, body = ApiError)
+    )
+)]
 async fn standards_handler(
     State(state): State<AppState>,
 ) -> Result<Json<crate::db::StandardsBreakdown>, AppError> {
@@ -570,37 +688,37 @@ async fn standards_handler(
     Ok(Json(standards))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct DeploysResponse {
     bucket_blocks: u64,
     buckets: Vec<crate::db::DeployBucket>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct VerifiedResponse {
     bucket_blocks: u64,
     buckets: Vec<crate::db::VerifiedRatioBucket>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct SizeResponse {
     bins: Vec<crate::db::SizeBin>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct CompilersResponse {
     compilers: Vec<crate::db::CompilerCount>,
     total_known: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct RecentResponse {
     contracts: Vec<crate::db::RecentContract>,
     limit: u32,
     has_more: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 struct LanguagesResponse {
     languages: Vec<crate::db::LanguageCount>,
 }
