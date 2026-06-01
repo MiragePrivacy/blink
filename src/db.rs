@@ -411,6 +411,109 @@ fn create_recent_parquet_contracts_view(
     create_contract_parquet_view(conn, "recent_parquet_contracts", files, chain_id)
 }
 
+fn contract_code_counts_sql(
+    conn: &Connection,
+    data_dir: &Path,
+    contracts_glob: &str,
+    chain_id: u64,
+    block_range: Option<(u64, u64)>,
+) -> Result<String> {
+    let mut sources = Vec::new();
+    let has_zellic = chain_id == ETHEREUM_CHAIN_ID
+        && table_exists(conn, "zellic_contracts")?
+        && table_exists(conn, "zellic_bytecodes")?;
+
+    if has_zellic {
+        if let Some((start, end)) = block_range {
+            sources.push(format!(
+                r#"
+                SELECT
+                    z.bytecode_hash AS code_hash,
+                    any_value(b.n_code_bytes)::UINTEGER AS n_code_bytes,
+                    COUNT(*)::UBIGINT AS contract_count
+                FROM zellic_contracts z
+                LEFT JOIN zellic_bytecodes b ON z.bytecode_hash = b.code_hash
+                WHERE z.bytecode_hash IS NOT NULL
+                  AND z.chain_id = {chain_id}
+                  AND z.block_number BETWEEN {start} AND {end}
+                GROUP BY z.bytecode_hash
+                "#
+            ));
+        } else if table_exists(conn, "zellic_bytecode_counts")? {
+            sources.push(
+                r#"
+                SELECT
+                    c.code_hash,
+                    any_value(b.n_code_bytes)::UINTEGER AS n_code_bytes,
+                    SUM(c.contract_count)::UBIGINT AS contract_count
+                FROM zellic_bytecode_counts c
+                LEFT JOIN zellic_bytecodes b ON c.code_hash = b.code_hash
+                WHERE c.code_hash IS NOT NULL
+                GROUP BY c.code_hash
+                "#
+                .to_string(),
+            );
+        }
+    }
+
+    let parquet_source = if let Some(range) = block_range {
+        let files = list_contract_parquet_files(data_dir, contracts_glob)?;
+        let files = contract_parquet_files_for_block_range(&files, chain_id, Some(range));
+        if files.is_empty() {
+            None
+        } else {
+            create_contract_parquet_view(conn, "dashboard_range_code_contracts", &files, chain_id)?;
+            Some("dashboard_range_code_contracts")
+        }
+    } else {
+        Some("parquet_contracts")
+    };
+
+    if let Some(source) = parquet_source {
+        let range_filter = block_range
+            .map(|(start, end)| format!("AND block_number BETWEEN {start} AND {end}"))
+            .unwrap_or_default();
+        sources.push(format!(
+            r#"
+            SELECT
+                code_hash,
+                any_value(n_code_bytes)::UINTEGER AS n_code_bytes,
+                COUNT(*)::UBIGINT AS contract_count
+            FROM {source}
+            WHERE code_hash IS NOT NULL
+              AND chain_id = {chain_id}
+              {range_filter}
+            GROUP BY code_hash
+            "#
+        ));
+    }
+
+    if sources.is_empty() {
+        return Ok(r#"
+            SELECT
+                CAST(NULL AS BLOB) AS code_hash,
+                CAST(NULL AS UINTEGER) AS n_code_bytes,
+                0::UBIGINT AS contract_count
+            WHERE FALSE
+            "#
+        .to_string());
+    }
+
+    Ok(format!(
+        r#"
+        SELECT
+            code_hash,
+            any_value(n_code_bytes)::UINTEGER AS n_code_bytes,
+            SUM(contract_count)::UBIGINT AS contract_count
+        FROM (
+            {}
+        )
+        GROUP BY code_hash
+        "#,
+        sources.join("\nUNION ALL\n")
+    ))
+}
+
 fn ensure_parquet_block_counts(conn: &Connection, files: &[PathBuf]) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -1988,7 +2091,7 @@ impl Db {
                 ORDER BY bucket_id
                 "#,
             };
-            let mut stmt = conn.prepare(sql)?;
+            let mut stmt = conn.prepare(&sql)?;
             let rows = match block_range {
                 None => stmt.query_map(
                     params![bucket_blocks, chain_id],
@@ -2019,8 +2122,14 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn bytecode_size_distribution(&self, chain_id: u64) -> Result<Vec<SizeBin>> {
+    pub async fn bytecode_size_distribution(
+        &self,
+        chain_id: u64,
+        block_range: Option<(u64, u64)>,
+    ) -> Result<Vec<SizeBin>> {
         let inner = self.inner.clone();
+        let data_dir = self.data_dir.clone();
+        let contracts_glob = self.contracts_glob.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<SizeBin>> {
             let conn = inner.blocking_lock();
 
@@ -2041,70 +2150,39 @@ impl Db {
                 (16_385, 24_576, "16-24 KB"),
             ];
             let mut counts = vec![0u64; bucket_defs.len()];
-            let use_zellic = chain_id == ETHEREUM_CHAIN_ID
-                && table_exists(&conn, "zellic_bytecodes")?
-                && table_exists(&conn, "zellic_bytecode_counts")?;
-            let sql = if use_zellic {
+            let count_source =
+                contract_code_counts_sql(&conn, &data_dir, &contracts_glob, chain_id, block_range)?;
+            let sql = format!(
                 r#"
+                WITH counts AS (
+                    {count_source}
+                )
                 SELECT
                     CASE
-                        WHEN b.n_code_bytes = 0 THEN 0
-                        WHEN b.n_code_bytes <= 32 THEN 1
-                        WHEN b.n_code_bytes <= 44 THEN 2
-                        WHEN b.n_code_bytes = 45 AND COALESCE(m.is_proxy_minimal, false) THEN 3
-                        WHEN b.n_code_bytes = 45 THEN 4
-                        WHEN b.n_code_bytes <= 64 THEN 5
-                        WHEN b.n_code_bytes <= 256 THEN 6
-                        WHEN b.n_code_bytes <= 1024 THEN 7
-                        WHEN b.n_code_bytes <= 4096 THEN 8
-                        WHEN b.n_code_bytes <= 8192 THEN 9
-                        WHEN b.n_code_bytes <= 16384 THEN 10
+                        WHEN counts.n_code_bytes = 0 THEN 0
+                        WHEN counts.n_code_bytes <= 32 THEN 1
+                        WHEN counts.n_code_bytes <= 44 THEN 2
+                        WHEN counts.n_code_bytes = 45 AND COALESCE(m.is_proxy_minimal, false) THEN 3
+                        WHEN counts.n_code_bytes = 45 THEN 4
+                        WHEN counts.n_code_bytes <= 64 THEN 5
+                        WHEN counts.n_code_bytes <= 256 THEN 6
+                        WHEN counts.n_code_bytes <= 1024 THEN 7
+                        WHEN counts.n_code_bytes <= 4096 THEN 8
+                        WHEN counts.n_code_bytes <= 8192 THEN 9
+                        WHEN counts.n_code_bytes <= 16384 THEN 10
                         ELSE 11
                     END AS bin_id,
-                    SUM(c.contract_count)::UBIGINT AS cnt
-                FROM zellic_bytecodes b
-                JOIN zellic_bytecode_counts c ON b.code_hash = c.code_hash
-                LEFT JOIN bytecode_metadata_by_hash m ON b.code_hash = m.code_hash
-                WHERE b.n_code_bytes IS NOT NULL
-                  AND b.n_code_bytes <= 24576
+                    SUM(counts.contract_count)::UBIGINT AS cnt
+                FROM counts
+                LEFT JOIN bytecode_metadata_by_hash m ON counts.code_hash = m.code_hash
+                WHERE counts.n_code_bytes IS NOT NULL
+                  AND counts.n_code_bytes <= 24576
                 GROUP BY bin_id
                 ORDER BY bin_id
                 "#
-                .to_string()
-            } else {
-                r#"
-                SELECT
-                    CASE
-                        WHEN c.n_code_bytes = 0 THEN 0
-                        WHEN c.n_code_bytes <= 32 THEN 1
-                        WHEN c.n_code_bytes <= 44 THEN 2
-                        WHEN c.n_code_bytes = 45 AND COALESCE(m.is_proxy_minimal, false) THEN 3
-                        WHEN c.n_code_bytes = 45 THEN 4
-                        WHEN c.n_code_bytes <= 64 THEN 5
-                        WHEN c.n_code_bytes <= 256 THEN 6
-                        WHEN c.n_code_bytes <= 1024 THEN 7
-                        WHEN c.n_code_bytes <= 4096 THEN 8
-                        WHEN c.n_code_bytes <= 8192 THEN 9
-                        WHEN c.n_code_bytes <= 16384 THEN 10
-                        ELSE 11
-                    END AS bin_id,
-                    COUNT(*)::UBIGINT AS cnt
-                FROM contracts c
-                LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
-                WHERE c.n_code_bytes IS NOT NULL
-                  AND c.n_code_bytes <= 24576
-                  AND c.chain_id = ?
-                GROUP BY bin_id
-                ORDER BY bin_id
-                "#
-                .to_string()
-            };
+            );
             let mut stmt = conn.prepare(&sql)?;
-            let rows = if use_zellic {
-                stmt.query_map([], read_u64_pair)?
-            } else {
-                stmt.query_map(params![chain_id], read_u64_pair)?
-            };
+            let rows = stmt.query_map([], read_u64_pair)?;
             for r in rows {
                 let (bin_id, count) = r?;
                 if let Some(slot) = counts.get_mut(bin_id as usize) {
@@ -2126,35 +2204,27 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn top_compilers(&self, chain_id: u64, limit: u32) -> Result<Vec<CompilerCount>> {
+    pub async fn top_compilers(
+        &self,
+        chain_id: u64,
+        limit: u32,
+        block_range: Option<(u64, u64)>,
+    ) -> Result<Vec<CompilerCount>> {
         let inner = self.inner.clone();
+        let data_dir = self.data_dir.clone();
+        let contracts_glob = self.contracts_glob.clone();
         let limit = limit.clamp(1, 50);
         tokio::task::spawn_blocking(move || -> Result<Vec<CompilerCount>> {
             let conn = inner.blocking_lock();
             // Compiler distribution is bytecode-derived. Verification sources
             // can confirm source publication, but local decode remains the
             // source of truth for compiler metadata in this dashboard.
-            let use_zellic = chain_id == ETHEREUM_CHAIN_ID
-                && table_exists(&conn, "zellic_bytecode_counts")?
-                && table_exists(&conn, "bytecode_metadata_by_hash")?;
-            let sql = if use_zellic {
-                r#"
-                SELECT m.compiler_version, SUM(c.contract_count)::UBIGINT AS cnt
-                FROM bytecode_metadata_by_hash m
-                JOIN zellic_bytecode_counts c ON m.code_hash = c.code_hash
-                WHERE m.compiler_version IS NOT NULL
-                GROUP BY m.compiler_version
-                ORDER BY cnt DESC
-                LIMIT ?
-                "#
-            } else {
+            let count_source =
+                contract_code_counts_sql(&conn, &data_dir, &contracts_glob, chain_id, block_range)?;
+            let sql = format!(
                 r#"
                 WITH counts AS (
-                    SELECT code_hash, COUNT(*)::UBIGINT AS contract_count
-                    FROM contracts
-                    WHERE chain_id = ?
-                      AND code_hash IS NOT NULL
-                    GROUP BY code_hash
+                    {count_source}
                 )
                 SELECT m.compiler_version, SUM(c.contract_count)::UBIGINT AS cnt
                 FROM counts c
@@ -2164,13 +2234,9 @@ impl Db {
                 ORDER BY cnt DESC
                 LIMIT ?
                 "#
-            };
-            let mut stmt = conn.prepare(sql)?;
-            let rows = if use_zellic {
-                stmt.query_map(params![limit as i64], read_string_u64_pair)?
-            } else {
-                stmt.query_map(params![chain_id, limit as i64], read_string_u64_pair)?
-            };
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![limit as i64], read_string_u64_pair)?;
             let mut out = Vec::new();
             for r in rows {
                 let (compiler_version, count) = r?;
@@ -2185,47 +2251,30 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn compiler_version_total(&self, chain_id: u64) -> Result<u64> {
+    pub async fn compiler_version_total(
+        &self,
+        chain_id: u64,
+        block_range: Option<(u64, u64)>,
+    ) -> Result<u64> {
         let inner = self.inner.clone();
+        let data_dir = self.data_dir.clone();
+        let contracts_glob = self.contracts_glob.clone();
         tokio::task::spawn_blocking(move || -> Result<u64> {
             let conn = inner.blocking_lock();
-            if chain_id == ETHEREUM_CHAIN_ID
-                && table_exists(&conn, "zellic_bytecode_counts")?
-                && table_exists(&conn, "bytecode_metadata_by_hash")?
-            {
-                let count: i64 = conn
-                    .query_row(
-                        r#"
-                        SELECT COALESCE(SUM(c.contract_count), 0)::BIGINT
-                        FROM bytecode_metadata_by_hash m
-                        JOIN zellic_bytecode_counts c ON m.code_hash = c.code_hash
-                        WHERE m.compiler_version IS NOT NULL
-                        "#,
-                        [],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                return Ok(count.max(0) as u64);
-            }
-            let count: i64 = conn
-                .query_row(
-                    r#"
-                    WITH counts AS (
-                        SELECT code_hash, COUNT(*)::UBIGINT AS contract_count
-                        FROM contracts
-                        WHERE chain_id = ?
-                          AND code_hash IS NOT NULL
-                        GROUP BY code_hash
-                    )
-                    SELECT COALESCE(SUM(c.contract_count), 0)::BIGINT
-                    FROM counts c
-                    JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
-                    WHERE m.compiler_version IS NOT NULL
-                    "#,
-                    params![chain_id],
-                    |row| row.get(0),
+            let count_source =
+                contract_code_counts_sql(&conn, &data_dir, &contracts_glob, chain_id, block_range)?;
+            let sql = format!(
+                r#"
+                WITH counts AS (
+                    {count_source}
                 )
-                .unwrap_or(0);
+                SELECT COALESCE(SUM(c.contract_count), 0)::BIGINT
+                FROM counts c
+                JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
+                WHERE m.compiler_version IS NOT NULL
+                "#
+            );
+            let count: i64 = conn.query_row(&sql, [], |row| row.get(0)).unwrap_or(0);
             Ok(count.max(0) as u64)
         })
         .await
@@ -2282,64 +2331,22 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
-    pub async fn standards_breakdown(&self, chain_id: u64) -> Result<StandardsBreakdown> {
+    pub async fn standards_breakdown(
+        &self,
+        chain_id: u64,
+        block_range: Option<(u64, u64)>,
+    ) -> Result<StandardsBreakdown> {
         let inner = self.inner.clone();
+        let data_dir = self.data_dir.clone();
+        let contracts_glob = self.contracts_glob.clone();
         tokio::task::spawn_blocking(move || -> Result<StandardsBreakdown> {
             let conn = inner.blocking_lock();
-            if chain_id == ETHEREUM_CHAIN_ID
-                && table_exists(&conn, "zellic_bytecode_counts")?
-                && table_exists(&conn, "bytecode_metadata_by_hash")?
-            {
-                return conn
-                    .query_row(
-                        r#"
-                        SELECT
-                            COALESCE(SUM(CASE WHEN m.is_erc20 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                            COALESCE(SUM(CASE WHEN m.is_erc721 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                            COALESCE(SUM(CASE WHEN m.is_erc1155 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                            COALESCE(SUM(CASE WHEN m.is_proxy_eip1967 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                            COALESCE(SUM(CASE WHEN m.is_proxy_minimal THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                            COALESCE(SUM(CASE WHEN m.uses_push0 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                            COALESCE(SUM(CASE WHEN m.has_source_hash THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                            COALESCE(SUM(CASE WHEN m.code_hash IS NOT NULL THEN c.contract_count ELSE 0 END), 0)::UBIGINT
-                        FROM zellic_bytecode_counts c
-                        LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
-                        "#,
-                        [],
-                        |row| {
-                            Ok(StandardsBreakdown {
-                                erc20: row.get(0)?,
-                                erc721: row.get(1)?,
-                                erc1155: row.get(2)?,
-                                proxy_eip1967: row.get(3)?,
-                                proxy_minimal: row.get(4)?,
-                                uses_push0: row.get(5)?,
-                                has_source_hash: row.get(6)?,
-                                total_decoded: row.get(7)?,
-                            })
-                        },
-                    )
-                    .or_else(|_| {
-                        Ok(StandardsBreakdown {
-                            erc20: 0,
-                            erc721: 0,
-                            erc1155: 0,
-                            proxy_eip1967: 0,
-                            proxy_minimal: 0,
-                            uses_push0: 0,
-                            has_source_hash: 0,
-                            total_decoded: 0,
-                        })
-                    });
-            }
-            conn.query_row(
+            let count_source =
+                contract_code_counts_sql(&conn, &data_dir, &contracts_glob, chain_id, block_range)?;
+            let sql = format!(
                 r#"
                 WITH counts AS (
-                    SELECT code_hash, COUNT(*)::UBIGINT AS contract_count
-                    FROM contracts
-                    WHERE chain_id = ?
-                      AND code_hash IS NOT NULL
-                    GROUP BY code_hash
+                    {count_source}
                 )
                 SELECT
                     COALESCE(SUM(CASE WHEN m.is_erc20 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
@@ -2352,8 +2359,11 @@ impl Db {
                     COALESCE(SUM(CASE WHEN m.code_hash IS NOT NULL THEN c.contract_count ELSE 0 END), 0)::UBIGINT
                 FROM counts c
                 LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
-                "#,
-                params![chain_id],
+                "#
+            );
+            conn.query_row(
+                &sql,
+                [],
                 |row| {
                     Ok(StandardsBreakdown {
                         erc20: row.get(0)?,

@@ -61,6 +61,7 @@ const DEFAULT_COMPILER_LIMIT: u32 = 12;
 const DEFAULT_RECENT_LIMIT: u32 = 20;
 const INITIAL_DEPLOYS_RANGE: &str = "day";
 const INITIAL_VERIFIED_RANGE: &str = "week";
+const INITIAL_AGGREGATE_RANGE: &str = "month";
 const PRESET_CHART_RANGES: &[&str] = &["hour", "day", "week", "month", "year"];
 const API_TAG: &str = "Dashboard";
 
@@ -75,11 +76,11 @@ struct ApiCache {
     stats: CacheMap<u64, crate::db::Stats>,
     deploys: CacheMap<BucketCacheKey, Vec<crate::db::DeployBucket>>,
     verified: CacheMap<BucketCacheKey, Vec<crate::db::VerifiedRatioBucket>>,
-    bytecode_sizes: CacheMap<u64, Vec<crate::db::SizeBin>>,
-    compilers: CacheMap<LimitCacheKey, (Vec<crate::db::CompilerCount>, u64)>,
+    bytecode_sizes: CacheMap<RangeCacheKey, Vec<crate::db::SizeBin>>,
+    compilers: CacheMap<LimitRangeCacheKey, (Vec<crate::db::CompilerCount>, u64)>,
     recent: CacheMap<RecentCacheKey, crate::db::RecentPage>,
     languages: CacheMap<u64, Vec<crate::db::LanguageCount>>,
-    standards: CacheMap<u64, crate::db::StandardsBreakdown>,
+    standards: CacheMap<RangeCacheKey, crate::db::StandardsBreakdown>,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -91,9 +92,18 @@ struct BucketCacheKey {
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct LimitCacheKey {
+struct RangeCacheKey {
+    chain_id: u64,
+    start_block: Option<u64>,
+    end_block: Option<u64>,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct LimitRangeCacheKey {
     chain_id: u64,
     limit: u32,
+    start_block: Option<u64>,
+    end_block: Option<u64>,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -463,6 +473,17 @@ struct BucketQuery {
     /// Optional ISO-8601 timestamp where the visible range should end.
     #[serde(default)]
     end_time: Option<DateTime<Utc>>,
+    /// Maximum number of compiler versions to return.
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+fn range_cache_key(chain_id: u64, block_range: Option<(u64, u64)>) -> RangeCacheKey {
+    RangeCacheKey {
+        chain_id,
+        start_block: block_range.map(|(start, _)| start),
+        end_block: block_range.map(|(_, end)| end),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -641,7 +662,7 @@ async fn verified_handler(
     get,
     path = "/api/bytecode-sizes",
     tag = API_TAG,
-    params(ChainQuery),
+    params(BucketQuery),
     responses(
         (status = OK, body = SizeResponse),
         (status = INTERNAL_SERVER_ERROR, body = ApiError)
@@ -649,28 +670,28 @@ async fn verified_handler(
 )]
 async fn bytecode_sizes_handler(
     State(state): State<AppState>,
-    Query(q): Query<ChainQuery>,
+    Query(q): Query<BucketQuery>,
 ) -> Result<Json<SizeResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
+    let highest = state
+        .db
+        .highest_contract_block(chain_id)
+        .await?
+        .unwrap_or(0);
+    let window = parse_time_series_window(&q, chain_id, highest);
+    let cache_key = range_cache_key(chain_id, window.block_range);
     let bins_out = state
         .cache
         .bytecode_sizes
         .get_or_try_update(
-            chain_id,
+            cache_key,
             API_CACHE_TTL,
-            state.db.bytecode_size_distribution(chain_id),
+            state
+                .db
+                .bytecode_size_distribution(chain_id, window.block_range),
         )
         .await?;
     Ok(Json(SizeResponse { bins: bins_out }))
-}
-
-#[derive(Deserialize, IntoParams)]
-#[into_params(parameter_in = Query)]
-struct LimitQuery {
-    /// Chain ID to query. Defaults to Ethereum mainnet (1).
-    chain_id: Option<u64>,
-    /// Maximum number of compiler versions to return.
-    limit: Option<u32>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -690,7 +711,7 @@ struct PageQuery {
     get,
     path = "/api/compilers",
     tag = API_TAG,
-    params(LimitQuery),
+    params(BucketQuery),
     responses(
         (status = OK, body = CompilersResponse),
         (status = INTERNAL_SERVER_ERROR, body = ApiError)
@@ -698,18 +719,35 @@ struct PageQuery {
 )]
 async fn compilers_handler(
     State(state): State<AppState>,
-    Query(q): Query<LimitQuery>,
+    Query(q): Query<BucketQuery>,
 ) -> Result<Json<CompilersResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
-    let limit = q.limit.unwrap_or(15);
-    let cache_key = LimitCacheKey { chain_id, limit };
+    let limit = q.limit.unwrap_or(DEFAULT_COMPILER_LIMIT);
+    let highest = state
+        .db
+        .highest_contract_block(chain_id)
+        .await?
+        .unwrap_or(0);
+    let window = parse_time_series_window(&q, chain_id, highest);
+    let cache_key = LimitRangeCacheKey {
+        chain_id,
+        limit,
+        start_block: window.block_range.map(|(start, _)| start),
+        end_block: window.block_range.map(|(_, end)| end),
+    };
     let (compilers, total_known) = state
         .cache
         .compilers
         .get_or_try_update(cache_key, API_CACHE_TTL, async {
             Ok((
-                state.db.top_compilers(chain_id, limit).await?,
-                state.db.compiler_version_total(chain_id).await?,
+                state
+                    .db
+                    .top_compilers(chain_id, limit, window.block_range)
+                    .await?,
+                state
+                    .db
+                    .compiler_version_total(chain_id, window.block_range)
+                    .await?,
             ))
         })
         .await?;
@@ -847,7 +885,7 @@ async fn languages_handler(
     get,
     path = "/api/standards",
     tag = API_TAG,
-    params(ChainQuery),
+    params(BucketQuery),
     responses(
         (status = OK, body = crate::db::StandardsBreakdown),
         (status = INTERNAL_SERVER_ERROR, body = ApiError)
@@ -855,16 +893,23 @@ async fn languages_handler(
 )]
 async fn standards_handler(
     State(state): State<AppState>,
-    Query(q): Query<ChainQuery>,
+    Query(q): Query<BucketQuery>,
 ) -> Result<Json<crate::db::StandardsBreakdown>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
+    let highest = state
+        .db
+        .highest_contract_block(chain_id)
+        .await?
+        .unwrap_or(0);
+    let window = parse_time_series_window(&q, chain_id, highest);
+    let cache_key = range_cache_key(chain_id, window.block_range);
     let standards = state
         .cache
         .standards
         .get_or_try_update(
-            chain_id,
+            cache_key,
             API_CACHE_TTL,
-            state.db.standards_breakdown(chain_id),
+            state.db.standards_breakdown(chain_id, window.block_range),
         )
         .await?;
     Ok(Json(standards))
@@ -959,24 +1004,43 @@ async fn prewarm_chain_dashboard_cache(
     };
 
     if include_widgets {
+        let aggregate_query = BucketQuery {
+            chain_id: Some(chain_id),
+            range: Some(INITIAL_AGGREGATE_RANGE.to_string()),
+            ..BucketQuery::default()
+        };
+        let aggregate_window = parse_time_series_window(&aggregate_query, chain_id, highest);
+        let aggregate_key = range_cache_key(chain_id, aggregate_window.block_range);
+
         match db.stats(chain_id).await {
             Ok(stats) => cache.stats.insert(chain_id, stats).await,
             Err(err) => log_prewarm_error(chain_id, "stats", err),
         }
 
-        match db.bytecode_size_distribution(chain_id).await {
-            Ok(bins) => cache.bytecode_sizes.insert(chain_id, bins).await,
+        match db
+            .bytecode_size_distribution(chain_id, aggregate_window.block_range)
+            .await
+        {
+            Ok(bins) => cache.bytecode_sizes.insert(aggregate_key, bins).await,
             Err(err) => log_prewarm_error(chain_id, "bytecode sizes", err),
         }
 
-        let compiler_key = LimitCacheKey {
+        let compiler_key = LimitRangeCacheKey {
             chain_id,
             limit: DEFAULT_COMPILER_LIMIT,
+            start_block: aggregate_window.block_range.map(|(start, _)| start),
+            end_block: aggregate_window.block_range.map(|(_, end)| end),
         };
         match async {
             Ok::<_, anyhow::Error>((
-                db.top_compilers(chain_id, DEFAULT_COMPILER_LIMIT).await?,
-                db.compiler_version_total(chain_id).await?,
+                db.top_compilers(
+                    chain_id,
+                    DEFAULT_COMPILER_LIMIT,
+                    aggregate_window.block_range,
+                )
+                .await?,
+                db.compiler_version_total(chain_id, aggregate_window.block_range)
+                    .await?,
             ))
         }
         .await
@@ -990,8 +1054,11 @@ async fn prewarm_chain_dashboard_cache(
             Err(err) => log_prewarm_error(chain_id, "languages", err),
         }
 
-        match db.standards_breakdown(chain_id).await {
-            Ok(standards) => cache.standards.insert(chain_id, standards).await,
+        match db
+            .standards_breakdown(chain_id, aggregate_window.block_range)
+            .await
+        {
+            Ok(standards) => cache.standards.insert(aggregate_key, standards).await,
             Err(err) => log_prewarm_error(chain_id, "standards", err),
         }
 
@@ -1153,6 +1220,7 @@ mod tests {
             start_block: None,
             start_time: None,
             end_time: None,
+            limit: None,
         }
     }
 
