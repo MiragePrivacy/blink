@@ -30,11 +30,14 @@ fn run_load_blocking(args: LoadArgs) -> Result<()> {
         .with_context(|| format!("create data dir {}", args.data_dir.display()))?;
 
     let inputs = detect_inputs(&args.contracts_dir, &args.contracts_glob)?;
+    let verifier_alliance = detect_verifier_alliance_inputs(args.verifier_alliance_dir.as_deref())?;
 
-    if !inputs.has_normalized_csv && inputs.parquet_files.is_empty() {
+    if !inputs.has_normalized_csv && inputs.parquet_files.is_empty() && verifier_alliance.is_none()
+    {
         return Err(anyhow!(
             "no loadable data in {} — expected either a normalized CSV pair \
-             (contracts.csv + bytecodes.csv) or Parquet files matching `{}`",
+             (contracts.csv + bytecodes.csv), Parquet files matching `{}`, \
+             or --va pointing to a Verifier Alliance export",
             args.contracts_dir.display(),
             args.contracts_glob
         ));
@@ -56,6 +59,16 @@ fn run_load_blocking(args: LoadArgs) -> Result<()> {
                 "{} Parquet file(s) matching `{}`",
                 inputs.parquet_files.len(),
                 args.contracts_glob
+            ),
+        );
+    }
+    if let Some(va) = &verifier_alliance {
+        print_kv_accent(
+            "detected",
+            &format!(
+                "Verifier Alliance registry ({} deployment files · {} verification files)",
+                va.contract_deployments.len(),
+                va.verified_contracts.len()
             ),
         );
     }
@@ -84,6 +97,15 @@ fn run_load_blocking(args: LoadArgs) -> Result<()> {
             args.overwrite,
         )?;
     }
+    if let Some(va) = verifier_alliance {
+        load_verifier_alliance_registry(
+            &args.data_dir,
+            &va,
+            &args.memory_limit,
+            args.threads,
+            args.chain_id,
+        )?;
+    }
 
     Ok(())
 }
@@ -94,6 +116,13 @@ struct LoadInputs {
     csv_bytecodes: PathBuf,
     has_normalized_csv: bool,
     parquet_files: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct VerifierAllianceInputs {
+    root: PathBuf,
+    contract_deployments: Vec<PathBuf>,
+    verified_contracts: Vec<PathBuf>,
 }
 
 fn detect_inputs(contracts_dir: &Path, contracts_glob: &str) -> Result<LoadInputs> {
@@ -108,6 +137,40 @@ fn detect_inputs(contracts_dir: &Path, contracts_glob: &str) -> Result<LoadInput
         has_normalized_csv,
         parquet_files,
     })
+}
+
+fn detect_verifier_alliance_inputs(root: Option<&Path>) -> Result<Option<VerifierAllianceInputs>> {
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    if !root.is_dir() {
+        return Err(anyhow!("--va {} is not a directory", root.display()));
+    }
+
+    let deployments_dir = root.join("contract_deployments");
+    let verifications_dir = root.join("verified_contracts");
+    if !deployments_dir.is_dir() || !verifications_dir.is_dir() {
+        return Err(anyhow!(
+            "--va needs both {} and {}",
+            deployments_dir.display(),
+            verifications_dir.display()
+        ));
+    }
+
+    let contract_deployments = list_parquet_files(&deployments_dir, "*.parquet")?;
+    let verified_contracts = list_parquet_files(&verifications_dir, "*.parquet")?;
+    if contract_deployments.is_empty() || verified_contracts.is_empty() {
+        return Err(anyhow!(
+            "--va {} has the expected folders but no Parquet files",
+            root.display()
+        ));
+    }
+
+    Ok(Some(VerifierAllianceInputs {
+        root: root.to_path_buf(),
+        contract_deployments,
+        verified_contracts,
+    }))
 }
 
 fn load_parquet_links(
@@ -347,6 +410,149 @@ fn print_existing_counts(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_verification_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS enrichment (
+            contract_address BLOB,
+            is_verified BOOLEAN NOT NULL,
+            contract_name VARCHAR,
+            checked_at TIMESTAMP NOT NULL
+        );
+        ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS verification_source VARCHAR;
+        ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS match_type VARCHAR;
+        ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS block_number UINTEGER;
+        ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS create_index UINTEGER;
+        CREATE INDEX IF NOT EXISTS enrichment_verified_idx ON enrichment(is_verified);
+        CREATE INDEX IF NOT EXISTS enrichment_source_idx ON enrichment(verification_source);
+
+        CREATE TABLE IF NOT EXISTS verification_registry_imports (
+            source VARCHAR NOT NULL,
+            chain_id UBIGINT NOT NULL,
+            imported_at TIMESTAMP NOT NULL,
+            verified_count UBIGINT NOT NULL,
+            PRIMARY KEY (source, chain_id)
+        );
+        "#,
+    )
+    .context("create verification registry schema")
+}
+
+fn load_verifier_alliance_registry(
+    data_dir: &Path,
+    inputs: &VerifierAllianceInputs,
+    memory_limit: &str,
+    threads: Option<usize>,
+    chain_id: u64,
+) -> Result<()> {
+    let started = Instant::now();
+    print_kv("step", "import Verifier Alliance registry");
+
+    let db_path = data_dir.join("blink.duckdb");
+    let conn =
+        Connection::open(&db_path).with_context(|| format!("open duckdb {}", db_path.display()))?;
+    configure_duckdb(&conn, memory_limit, threads)?;
+    ensure_verification_schema(&conn)?;
+
+    let deployments_glob = sql_path(&inputs.root.join("contract_deployments").join("*.parquet"));
+    let verifications_glob = sql_path(&inputs.root.join("verified_contracts").join("*.parquet"));
+
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .context("begin Verifier Alliance import")?;
+
+    let result = (|| -> Result<()> {
+        conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS enrichment_next;
+            DELETE FROM verification_registry_imports
+            WHERE source = 'verifier_alliance';
+            "#,
+        )
+        .context("prepare verification registry import")?;
+
+        let sql = format!(
+            r#"
+            CREATE OR REPLACE TEMP TABLE va_verified_contracts AS
+            SELECT
+                cd.address AS contract_address,
+                (max(cd.block_number) FILTER (WHERE cd.block_number >= 0))::UINTEGER
+                    AS block_number,
+                (min(cd.transaction_index) FILTER (WHERE cd.transaction_index >= 0))::UINTEGER
+                    AS create_index,
+                max(vc.created_at)::TIMESTAMP AS checked_at,
+                bool_or(COALESCE(vc.runtime_match, false)) AS runtime_match,
+                bool_or(COALESCE(vc.creation_match, false)) AS creation_match,
+                bool_or(COALESCE(vc.runtime_metadata_match, false)) AS runtime_metadata_match,
+                bool_or(COALESCE(vc.creation_metadata_match, false)) AS creation_metadata_match
+            FROM read_parquet('{verifications_glob}') vc
+            JOIN read_parquet('{deployments_glob}') cd
+              ON cd.id = vc.deployment_id
+            WHERE cd.chain_id = {chain_id}
+              AND cd.address IS NOT NULL
+            GROUP BY cd.address;
+
+            CREATE TABLE enrichment_next AS
+            SELECT
+                contract_address,
+                true AS is_verified,
+                CAST(NULL AS VARCHAR) AS contract_name,
+                COALESCE(checked_at, CURRENT_TIMESTAMP) AS checked_at,
+                'verifier_alliance' AS verification_source,
+                CASE
+                    WHEN runtime_match AND creation_match THEN 'runtime+creation'
+                    WHEN runtime_match THEN 'runtime'
+                    WHEN creation_match THEN 'creation'
+                    WHEN runtime_metadata_match OR creation_metadata_match THEN 'metadata'
+                    ELSE 'verified'
+                END AS match_type,
+                block_number,
+                create_index
+            FROM va_verified_contracts;
+
+            DROP TABLE IF EXISTS enrichment;
+            ALTER TABLE enrichment_next RENAME TO enrichment;
+            CREATE INDEX enrichment_addr_idx ON enrichment(contract_address);
+            CREATE INDEX enrichment_verified_idx ON enrichment(is_verified);
+            CREATE INDEX enrichment_source_idx ON enrichment(verification_source);
+
+            INSERT INTO verification_registry_imports (
+                source,
+                chain_id,
+                imported_at,
+                verified_count
+            )
+            SELECT
+                'verifier_alliance',
+                {chain_id},
+                CURRENT_TIMESTAMP,
+                COUNT(*)::UBIGINT
+            FROM va_verified_contracts;
+            "#
+        );
+        conn.execute_batch(&sql)
+            .context("import Verifier Alliance verified addresses")?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(err);
+    }
+    conn.execute_batch("COMMIT;")
+        .context("commit Verifier Alliance import")?;
+
+    let verified = count_table(&conn, "enrichment")?;
+    print_kv_accent(
+        "verified",
+        &format!(
+            "{} from Verifier Alliance · {:.1}s",
+            format_count(verified),
+            started.elapsed().as_secs_f64()
+        ),
+    );
+    Ok(())
+}
+
 fn import_bytecodes(conn: &Connection, bytecodes_csv: &Path) -> Result<()> {
     let started = Instant::now();
     print_kv("step", "import unique bytecodes");
@@ -574,6 +780,35 @@ mod tests {
             names(&inputs.parquet_files),
             vec!["ethereum__contracts__1_to_2.parquet"]
         );
+    }
+
+    #[test]
+    fn detect_verifier_alliance_inputs_requires_both_tables() {
+        let dir = TestDir::new("va_missing_table");
+        fs::create_dir_all(dir.path.join("contract_deployments")).unwrap();
+
+        let err = detect_verifier_alliance_inputs(Some(&dir.path)).unwrap_err();
+
+        assert!(err.to_string().contains("--va needs both"));
+    }
+
+    #[test]
+    fn detect_verifier_alliance_inputs_finds_required_parquet_files() {
+        let dir = TestDir::new("va_tables");
+        let deployments = dir.path.join("contract_deployments");
+        let verifications = dir.path.join("verified_contracts");
+        fs::create_dir_all(&deployments).unwrap();
+        fs::create_dir_all(&verifications).unwrap();
+        fs::write(deployments.join("contract_deployments_0_1.parquet"), []).unwrap();
+        fs::write(verifications.join("verified_contracts_0_1.parquet"), []).unwrap();
+
+        let inputs = detect_verifier_alliance_inputs(Some(&dir.path))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(inputs.root, dir.path);
+        assert_eq!(inputs.contract_deployments.len(), 1);
+        assert_eq!(inputs.verified_contracts.len(), 1);
     }
 
     #[test]

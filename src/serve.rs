@@ -1,13 +1,12 @@
 //! Public dashboard HTTP server.
 //!
-//! Hosts the JSON API consumed by the static frontend and serves the
-//! frontend itself out of `--static-dir`. Optional background tasks:
-//! - `--metadata-sync` runs [`crate::metadata::metadata_sync_loop`] continuously.
+//! Hosts the JSON API consumed by the separate dashboard frontend.
+//! Optional background tasks:
 //! - `--tail-rpc URL` polls the chain head and extracts newly produced
 //!   blocks into a separate `tail__*.parquet` file (see [`crate::extract::tail`]).
 //!
 //! Endpoints (all return JSON):
-//! - `GET /api/stats` — totals, verified pct, last block, metadata sync coverage.
+//! - `GET /api/stats` — totals, verified pct, last block, verification coverage.
 //! - `GET /api/runtime` — serve-mode flags and background loop health.
 //! - `GET /api/deploys-over-time?bucket=hour|day|week|month` — time-series.
 //! - `GET /api/verified-ratio?bucket=...` — verified vs unverified vs unknown.
@@ -35,7 +34,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::Mutex};
-use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_scalar::{Scalar, Servable};
@@ -44,10 +43,6 @@ use crate::{
     blocks::blocks_per_day,
     cli::ServeArgs,
     db::{Db, RecentCursor},
-    metadata::{
-        metadata_sync_loop, resolve_api_key, EtherscanClient, MetadataSyncOptions, SourcifyClient,
-        VerificationSources,
-    },
 };
 
 #[derive(Clone)]
@@ -151,7 +146,6 @@ where
 #[derive(Debug)]
 struct RuntimeState {
     read_only: bool,
-    metadata_sync_enabled: bool,
     tail_enabled: bool,
     tail_interval_secs: u64,
     snapshot: Mutex<RuntimeSnapshot>,
@@ -159,11 +153,6 @@ struct RuntimeState {
 
 #[derive(Debug, Default, Clone, Serialize, ToSchema)]
 struct RuntimeSnapshot {
-    metadata_sync_running: bool,
-    metadata_last_ok_at: Option<DateTime<Utc>>,
-    metadata_last_processed: Option<u64>,
-    metadata_last_error_at: Option<DateTime<Utc>>,
-    metadata_last_error: Option<String>,
     tail_running: bool,
     tail_last_ok_at: Option<DateTime<Utc>>,
     tail_last_block: Option<u64>,
@@ -175,7 +164,6 @@ struct RuntimeSnapshot {
 #[derive(Debug, Serialize, ToSchema)]
 struct RuntimeResponse {
     read_only: bool,
-    metadata_sync_enabled: bool,
     tail_enabled: bool,
     tail_interval_secs: u64,
     #[serde(flatten)]
@@ -192,15 +180,9 @@ struct TailLoopConfig {
 }
 
 impl RuntimeState {
-    fn new(
-        read_only: bool,
-        metadata_sync_enabled: bool,
-        tail_enabled: bool,
-        tail_interval_secs: u64,
-    ) -> Self {
+    fn new(read_only: bool, tail_enabled: bool, tail_interval_secs: u64) -> Self {
         Self {
             read_only,
-            metadata_sync_enabled,
             tail_enabled,
             tail_interval_secs,
             snapshot: Mutex::new(RuntimeSnapshot::default()),
@@ -210,31 +192,10 @@ impl RuntimeState {
     async fn response(&self) -> RuntimeResponse {
         RuntimeResponse {
             read_only: self.read_only,
-            metadata_sync_enabled: self.metadata_sync_enabled,
             tail_enabled: self.tail_enabled,
             tail_interval_secs: self.tail_interval_secs,
             snapshot: self.snapshot.lock().await.clone(),
         }
-    }
-
-    async fn mark_metadata_sync_start(&self) {
-        self.snapshot.lock().await.metadata_sync_running = true;
-    }
-
-    async fn mark_metadata_sync_ok(&self, processed: u64) {
-        let mut snapshot = self.snapshot.lock().await;
-        snapshot.metadata_sync_running = false;
-        snapshot.metadata_last_ok_at = Some(Utc::now());
-        snapshot.metadata_last_processed = Some(processed);
-        snapshot.metadata_last_error = None;
-        snapshot.metadata_last_error_at = None;
-    }
-
-    async fn mark_metadata_sync_error(&self, message: String) {
-        let mut snapshot = self.snapshot.lock().await;
-        snapshot.metadata_sync_running = false;
-        snapshot.metadata_last_error_at = Some(Utc::now());
-        snapshot.metadata_last_error = Some(message);
     }
 
     async fn mark_tail_start(&self) {
@@ -262,17 +223,13 @@ impl RuntimeState {
 }
 
 pub async fn run_serve(args: ServeArgs) -> Result<()> {
-    if args.read_only && (args.metadata_sync || args.tail_rpc.is_some()) {
-        tracing::warn!(
-            "--read-only is set; ignoring --metadata-sync / --tail-rpc (both require a write lock)"
-        );
+    if args.read_only && args.tail_rpc.is_some() {
+        tracing::warn!("--read-only is set; ignoring --tail-rpc (it requires a write lock)");
     }
     let db = Db::open_with_mode(&args.data_dir, &args.contracts_glob, args.read_only)?;
-    let metadata_sync_enabled = args.metadata_sync && !args.read_only;
     let tail_enabled = args.tail_rpc.is_some() && !args.read_only;
     let runtime = Arc::new(RuntimeState::new(
         args.read_only,
-        metadata_sync_enabled,
         tail_enabled,
         args.tail_interval_secs.max(15),
     ));
@@ -281,45 +238,6 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         runtime: runtime.clone(),
         cache: Arc::new(ApiCache::default()),
     };
-
-    if metadata_sync_enabled {
-        // Etherscan is the primary verifier when a key is present; Sourcify is
-        // kept as a free fallback and no-key mode.
-        let sourcify = Some(Arc::new(SourcifyClient::new(
-            args.sourcify_url.clone(),
-            args.chain_id,
-        )?));
-        let etherscan = match resolve_api_key(args.etherscan_api_key.clone()) {
-            Ok(key) => Some(Arc::new(EtherscanClient::new(
-                args.etherscan_url.clone(),
-                key,
-                args.chain_id,
-            )?)),
-            Err(_) => {
-                tracing::info!(
-                    "no Etherscan API key — background metadata sync will use Sourcify only"
-                );
-                None
-            }
-        };
-        let db_bg = db.clone();
-        let rps = args.metadata_sync_rate_limit_rps;
-        let recheck = args.recheck_unverified_after_secs;
-        let runtime_bg = runtime.clone();
-        tokio::spawn(async move {
-            background_metadata_sync_loop(
-                db_bg,
-                VerificationSources {
-                    etherscan,
-                    sourcify,
-                },
-                rps,
-                recheck,
-                runtime_bg,
-            )
-            .await;
-        });
-    }
 
     if let Some(rpc) = args.tail_rpc.clone().filter(|_| !args.read_only) {
         let db_bg = db.clone();
@@ -355,7 +273,6 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     let app = api_router
         .route("/openapi.json", get(|| async { openapi_json }))
         .merge(Scalar::with_url("/scalar", api))
-        .fallback_service(ServeDir::new(&args.static_dir).append_index_html_on_directories(true))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -369,7 +286,6 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         .with_context(|| format!("bind {}", addr))?;
     tracing::info!("serving blink dashboard on http://{}", addr);
     tracing::info!(" data dir: {}", args.data_dir.display());
-    tracing::info!(" static dir: {}", args.static_dir.display());
     axum::serve(listener, app)
         .await
         .context("axum server failed")
@@ -721,65 +637,6 @@ struct RecentResponse {
 #[derive(Serialize, ToSchema)]
 struct LanguagesResponse {
     languages: Vec<crate::db::LanguageCount>,
-}
-
-async fn background_metadata_sync_loop(
-    db: Db,
-    sources: VerificationSources,
-    rps: u32,
-    recheck_after_secs: i64,
-    runtime: Arc<RuntimeState>,
-) {
-    tracing::info!(
-        "background metadata sync loop starting (rps={}, sourcify={}, etherscan={})",
-        rps,
-        sources.sourcify.is_some(),
-        sources.etherscan.is_some()
-    );
-    loop {
-        runtime.mark_metadata_sync_start().await;
-        match metadata_sync_loop(
-            db.clone(),
-            sources.clone(),
-            MetadataSyncOptions {
-                limit: 0,
-                rate_limit_rps: rps,
-                recheck_after_secs,
-                newest_first: true,
-            },
-        )
-        .await
-        {
-            Ok(stats) if stats.processed == 0 => {
-                runtime.mark_metadata_sync_ok(stats.processed).await;
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
-            Ok(stats) => {
-                runtime.mark_metadata_sync_ok(stats.processed).await;
-                tracing::info!(
-                    "metadata sync pass done: processed={} verified={} unverified={} failed={}",
-                    stats.processed,
-                    stats.verified,
-                    stats.unverified,
-                    stats.failed
-                );
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            Err(err) => {
-                let msg = format!("{:#}", err);
-                runtime.mark_metadata_sync_error(msg.clone()).await;
-                if msg.contains("API key") {
-                    tracing::error!(
-                        "background metadata sync loop disabled: {}. Restart the server with a valid key.",
-                        msg
-                    );
-                    return;
-                }
-                tracing::warn!("metadata sync pass failed: {}", msg);
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
-        }
-    }
 }
 
 async fn background_tail_loop(db: Db, config: TailLoopConfig, runtime: Arc<RuntimeState>) {

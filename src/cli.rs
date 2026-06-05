@@ -39,9 +39,6 @@ pub enum Commands {
     Contracts(ContractsArgs),
     /// Load local contract datasets into Blink
     Load(LoadArgs),
-    /// Sync extracted contracts with verification metadata
-    #[command(name = "metadata-sync", alias = "sync")]
-    MetadataSync(MetadataSyncArgs),
     /// Decode bytecode locally: compiler version, language, ERC standards, proxy detection
     Decode(DecodeArgs),
     /// Serve the public monitoring dashboard
@@ -59,7 +56,6 @@ fn command() -> Command {
         let title = match subcommand.get_name() {
             "contracts" => Some("blink contracts"),
             "load" => Some("blink load"),
-            "metadata-sync" => Some("blink metadata-sync"),
             "decode" => Some("blink decode"),
             "serve" => Some("blink serve"),
             _ => None,
@@ -122,6 +118,9 @@ pub struct LoadArgs {
     /// Directory containing contract Parquet files or normalized CSV files
     #[arg(long, default_value = "./data/blink")]
     pub contracts_dir: PathBuf,
+    /// Verifier Alliance export directory containing contract_deployments/ and verified_contracts/
+    #[arg(long = "va")]
+    pub verifier_alliance_dir: Option<PathBuf>,
     /// Blink data directory where blink.duckdb and Parquet links are stored
     #[arg(long, default_value = "./data/blink")]
     pub data_dir: PathBuf,
@@ -134,53 +133,12 @@ pub struct LoadArgs {
     /// Rebuild existing CSV import tables or replace existing Parquet links
     #[arg(long)]
     pub overwrite: bool,
-    /// DuckDB memory limit for CSV imports
+    /// DuckDB memory limit for CSV and verification imports
     #[arg(long, default_value = "8GB")]
     pub memory_limit: String,
     /// DuckDB worker threads for CSV imports (default: DuckDB decides)
     #[arg(long)]
     pub threads: Option<usize>,
-}
-
-#[derive(Parser, Debug, Clone)]
-pub struct MetadataSyncArgs {
-    /// Data directory containing contract parquet files
-    #[arg(long, default_value = "./data/blink")]
-    pub data_dir: PathBuf,
-    /// Glob (relative to data_dir) for contract parquet files
-    #[arg(long, default_value = "*.parquet")]
-    pub contracts_glob: String,
-    /// Etherscan API key (fallback: ETHERSCAN_API_KEY). Optional —
-    /// not needed when --skip-etherscan is set.
-    #[arg(long)]
-    pub etherscan_api_key: Option<String>,
-    /// Chain id passed to verification APIs
-    #[arg(long, default_value_t = 1)]
-    pub chain_id: u64,
-    /// Etherscan API base URL
-    #[arg(long, default_value = "https://api.etherscan.io/v2/api")]
-    pub etherscan_url: String,
-    /// Sourcify server base URL (free fallback / no-key mode)
-    #[arg(long, default_value = "https://sourcify.dev/server")]
-    pub sourcify_url: String,
-    /// Skip Sourcify entirely
-    #[arg(long)]
-    pub skip_sourcify: bool,
-    /// Skip Etherscan entirely (Sourcify only — no API key needed)
-    #[arg(long)]
-    pub skip_etherscan: bool,
-    /// Max verification requests per second
-    #[arg(long, default_value_t = 4)]
-    pub rate_limit_rps: u32,
-    /// Max addresses to sync in this run (0 = no limit)
-    #[arg(long, default_value_t = 0)]
-    pub limit: u64,
-    /// Re-check addresses already marked unverified after this many seconds
-    #[arg(long, default_value_t = 7 * 24 * 3600)]
-    pub recheck_unverified_after_secs: i64,
-    /// Process newest contracts first
-    #[arg(long, default_value_t = true)]
-    pub newest_first: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -211,40 +169,10 @@ pub struct ServeArgs {
     /// Glob (relative to data_dir) for contract parquet files
     #[arg(long, default_value = "*.parquet")]
     pub contracts_glob: String,
-    /// Static files directory (frontend)
-    #[arg(long, default_value = "./static")]
-    pub static_dir: PathBuf,
     /// Open DuckDB in read-only mode so the dashboard can run alongside an
-    /// active `blink decode` or `blink metadata-sync`. Disables
-    /// `--metadata-sync` and `--tail-rpc` automatically.
+    /// active `blink decode`. Disables `--tail-rpc` automatically.
     #[arg(long)]
     pub read_only: bool,
-    /// Run background metadata sync loop
-    #[arg(long = "metadata-sync", alias = "sync")]
-    pub metadata_sync: bool,
-    /// Etherscan API key (fallback: ETHERSCAN_API_KEY). Without a key,
-    /// background metadata sync uses Sourcify only.
-    #[arg(long)]
-    pub etherscan_api_key: Option<String>,
-    /// Chain id passed to verification APIs
-    #[arg(long, default_value_t = 1)]
-    pub chain_id: u64,
-    /// Etherscan API base URL
-    #[arg(long, default_value = "https://api.etherscan.io/v2/api")]
-    pub etherscan_url: String,
-    /// Sourcify server base URL (free fallback / no-key mode)
-    #[arg(long, default_value = "https://sourcify.dev/server")]
-    pub sourcify_url: String,
-    /// Max verification requests per second
-    #[arg(
-        long = "metadata-sync-rate-limit-rps",
-        alias = "sync-rate-limit-rps",
-        default_value_t = 4
-    )]
-    pub metadata_sync_rate_limit_rps: u32,
-    /// Re-check unverified addresses after this many seconds
-    #[arg(long, default_value_t = 7 * 24 * 3600)]
-    pub recheck_unverified_after_secs: i64,
     /// Run continuous tail extraction against this RPC URL
     #[arg(long)]
     pub tail_rpc: Option<String>,

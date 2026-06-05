@@ -6,7 +6,6 @@ mod db;
 mod decode;
 mod extract;
 mod load;
-mod metadata;
 mod serve;
 mod types;
 mod util;
@@ -23,7 +22,6 @@ async fn main() -> Result<()> {
     match cli.command {
         cli::Commands::Contracts(args) => run_contracts(args).await,
         cli::Commands::Load(args) => load::run_load(args).await,
-        cli::Commands::MetadataSync(args) => metadata::run_metadata_sync(args).await,
         cli::Commands::Decode(args) => decode::run_decode(args).await,
         cli::Commands::Serve(args) => serve::run_serve(args).await,
     }
