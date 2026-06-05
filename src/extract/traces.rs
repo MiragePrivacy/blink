@@ -1,3 +1,9 @@
+//! Decoder from `trace_block` results to [`ContractRow`]s.
+//!
+//! Walks each transaction's trace tree, tracks the originating EOA, and emits
+//! one row per `CREATE`/`CREATE2` whose result reports a non-empty bytecode.
+//! Computes Keccak hashes for both init and runtime code.
+
 use alloy::{
     primitives::{keccak256, Address},
     rpc::types::trace::parity::{Action, LocalizedTransactionTrace, TraceOutput},

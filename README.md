@@ -111,7 +111,3 @@ and per-chunk metadata including output file paths and sizes.
 
 - Ethereum node with `trace_block` support (Erigon, Reth, or tracing-enabled Geth)
 - Rust 1.70+
-
-## License
-
-MIT

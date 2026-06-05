@@ -1,3 +1,9 @@
+//! Parquet schema and row → `RecordBatch` conversion for contract creations.
+//!
+//! Defines the canonical 14-column blink schema and provides helpers to open
+//! an [`ArrowWriter`] for a chunk file and to materialize batches of
+//! [`ContractRow`]s into Arrow arrays before writing.
+
 use std::{fs::File, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
