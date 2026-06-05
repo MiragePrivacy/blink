@@ -4,7 +4,7 @@
 //! that exposes:
 //! - a `contracts` view over every `*.parquet` file in the data directory
 //!   (multi-source: blink, cryo, paradigm — `union_by_name = true`);
-//! - an `enrichment` table populated by metadata-sync verification sources.
+//! - an `enrichment` table populated by bulk verification-registry imports.
 //!
 //! All query methods return owned, JSON-serializable structs and run on
 //! `spawn_blocking` so axum handlers stay async. The connection is wrapped
@@ -14,7 +14,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Instant, SystemTime},
+    time::Instant,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -23,7 +23,7 @@ use duckdb::{params, types::ValueRef, AccessMode, Config, Connection, Row};
 use serde_json::{Number, Value};
 use tokio::sync::Mutex;
 
-use crate::{metadata::VerificationResult, util::match_simple_glob};
+use crate::util::match_simple_glob;
 
 #[derive(Clone)]
 pub struct Db {
@@ -476,6 +476,20 @@ fn create_enrichment_current_view(conn: &Connection) -> Result<()> {
         .context("create enrichment compatibility view")
 }
 
+fn verification_registry_loaded(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "verification_registry_imports")? {
+        return Ok(false);
+    }
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM verification_registry_imports WHERE source = 'verifier_alliance'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    Ok(count > 0)
+}
+
 fn create_standard_query_views(conn: &Connection, has_zellic: bool) -> Result<()> {
     let has_hash = table_exists(conn, "bytecode_metadata_by_hash")?;
     let has_counts = table_exists(conn, "zellic_bytecode_counts")?;
@@ -605,6 +619,11 @@ fn create_standard_query_views(conn: &Connection, has_zellic: bool) -> Result<()
             LEFT JOIN bytecode_metadata_current m ON c.contract_address = m.contract_address
         "#
     };
+    let is_verified_expr = if verification_registry_loaded(conn)? {
+        "COALESCE(e.is_verified, false) AS is_verified"
+    } else {
+        "e.is_verified"
+    };
     let contract_metadata_sql = format!(
         r#"
         CREATE OR REPLACE TEMP VIEW contract_metadata AS
@@ -635,7 +654,7 @@ fn create_standard_query_views(conn: &Connection, has_zellic: bool) -> Result<()
             COALESCE(m.is_proxy_minimal, false) AS is_proxy_minimal,
             COALESCE(m.uses_push0, false) AS uses_push0,
             m.decoded_at,
-            e.is_verified,
+            {is_verified_expr},
             e.contract_name,
             e.verification_source,
             e.match_type,
@@ -715,19 +734,7 @@ fn backfill_enrichment_blocks(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-pub struct MetadataSyncTarget {
-    pub address: Vec<u8>,
-    pub address_hex: String,
-    pub block_number: Option<u64>,
-    pub create_index: Option<u64>,
-}
-
 impl Db {
-    pub fn open(data_dir: &Path, contracts_glob: &str) -> Result<Self> {
-        Self::open_with_mode(data_dir, contracts_glob, false)
-    }
-
     pub fn open_with_mode(data_dir: &Path, contracts_glob: &str, read_only: bool) -> Result<Self> {
         if !read_only {
             std::fs::create_dir_all(data_dir)
@@ -736,8 +743,8 @@ impl Db {
         let db_path = data_dir.join("blink.duckdb");
 
         let conn = if read_only {
-            // Read-only connection coexists with an active writer (decode/sync)
-            // since DuckDB only takes an exclusive lock on writers.
+            // Read-only connection coexists with an active writer since DuckDB
+            // only takes an exclusive lock on writers.
             let config = Config::default()
                 .access_mode(AccessMode::ReadOnly)
                 .context("set read-only access mode")?;
@@ -763,12 +770,12 @@ impl Db {
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS enrichment (
-                contract_address BLOB PRIMARY KEY,
+                contract_address BLOB,
                 is_verified BOOLEAN NOT NULL,
                 contract_name VARCHAR,
                 checked_at TIMESTAMP NOT NULL
             );
-            -- Track where each verification came from (sourcify, etherscan, none).
+            -- Track where each verification came from (verifier_alliance).
             -- Added in a later migration; the IF NOT EXISTS guard keeps older
             -- databases working without an explicit migration step.
             ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS verification_source VARCHAR;
@@ -1022,13 +1029,28 @@ impl Db {
             let first_block = first_block.unwrap_or(0) as u64;
             let last_block = last_block.unwrap_or(0) as u64;
 
-            let (enriched, verified): (i64, i64) = conn
-                .query_row(
+            let registry_loaded = verification_registry_loaded(&conn)?;
+            let (enriched, verified): (i64, i64) = if registry_loaded {
+                let verified_sql = format!(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM {source_table} c
+                    JOIN enrichment e ON c.contract_address = e.contract_address
+                    WHERE e.is_verified
+                    "#
+                );
+                let verified = conn
+                    .query_row(&verified_sql, [], |row| row.get(0))
+                    .unwrap_or(0);
+                (total as i64, verified)
+            } else {
+                conn.query_row(
                     "SELECT COUNT(*), COUNT(*) FILTER (WHERE is_verified) FROM enrichment",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .unwrap_or((0, 0));
+                .unwrap_or((0, 0))
+            };
 
             let verified_count = verified.max(0) as u64;
             let enriched_count = enriched.max(0) as u64;
@@ -1129,12 +1151,42 @@ impl Db {
         tokio::task::spawn_blocking(move || -> Result<Vec<VerifiedRatioBucket>> {
             let conn = inner.blocking_lock();
             let mut out = Vec::new();
+            let registry_loaded = verification_registry_loaded(&conn)?;
             if table_exists(&conn, "zellic_contracts")? {
                 if !table_exists(&conn, "zellic_block_counts")? {
                     return Ok(out);
                 }
 
-                let mut stmt = conn.prepare(
+                let sql = if registry_loaded {
+                    r#"
+                    WITH totals AS (
+                        SELECT
+                            (block_number / ?)::UBIGINT AS bucket_id,
+                            SUM(contract_count)::UBIGINT AS total
+                        FROM zellic_block_counts
+                        WHERE block_number IS NOT NULL
+                        GROUP BY bucket_id
+                    ),
+                    checked AS (
+                        SELECT
+                            (z.block_number / ?)::UBIGINT AS bucket_id,
+                            COUNT(*)::UBIGINT AS verified
+                        FROM zellic_contracts z
+                        JOIN enrichment_current e ON z.contract_address = e.contract_address
+                        WHERE z.block_number IS NOT NULL
+                          AND e.is_verified
+                        GROUP BY bucket_id
+                    )
+                    SELECT
+                        totals.bucket_id,
+                        COALESCE(checked.verified, 0)::UBIGINT AS verified,
+                        GREATEST(totals.total - COALESCE(checked.verified, 0), 0)::UBIGINT AS unverified,
+                        0::UBIGINT AS unknown
+                    FROM totals
+                    LEFT JOIN checked ON totals.bucket_id = checked.bucket_id
+                    ORDER BY totals.bucket_id
+                    "#
+                } else {
                     r#"
                     WITH totals AS (
                         SELECT
@@ -1166,8 +1218,9 @@ impl Db {
                     FROM totals
                     LEFT JOIN checked ON totals.bucket_id = checked.bucket_id
                     ORDER BY totals.bucket_id
-                    "#,
-                )?;
+                    "#
+                };
+                let mut stmt = conn.prepare(sql)?;
                 let rows = stmt.query_map(params![bucket_blocks, bucket_blocks], |row| {
                     Ok((
                         row.get::<_, u64>(0)?,
@@ -1193,7 +1246,20 @@ impl Db {
                 return Ok(out);
             }
 
-            let mut stmt = conn.prepare(
+            let sql = if registry_loaded {
+                r#"
+                SELECT
+                    (c.block_number / ?)::UBIGINT AS bucket_id,
+                    COUNT(*) FILTER (WHERE e.is_verified)::UBIGINT AS verified,
+                    COUNT(*) FILTER (WHERE e.is_verified IS NULL OR e.is_verified IS FALSE)::UBIGINT AS unverified,
+                    0::UBIGINT AS unknown
+                FROM contracts c
+                LEFT JOIN enrichment e ON c.contract_address = e.contract_address
+                WHERE c.block_number IS NOT NULL
+                GROUP BY bucket_id
+                ORDER BY bucket_id
+                "#
+            } else {
                 r#"
                 SELECT
                     (c.block_number / ?)::UBIGINT AS bucket_id,
@@ -1205,8 +1271,9 @@ impl Db {
                 WHERE c.block_number IS NOT NULL
                 GROUP BY bucket_id
                 ORDER BY bucket_id
-                "#,
-            )?;
+                "#
+            };
+            let mut stmt = conn.prepare(sql)?;
             let rows = stmt.query_map(params![bucket_blocks], |row| {
                 Ok((
                     row.get::<_, u64>(0)?,
@@ -1563,6 +1630,7 @@ impl Db {
             let has_zellic = table_exists(&conn, "zellic_contracts")?
                 && table_exists(&conn, "zellic_bytecodes")?;
             let has_hash_metadata = table_exists(&conn, "bytecode_metadata_by_hash")?;
+            let registry_loaded = verification_registry_loaded(&conn)?;
 
             // For Zellic imports, compiler metadata is keyed by bytecode hash.
             // Select the tiny recent page first, then join hash metadata; going
@@ -1765,6 +1833,11 @@ impl Db {
             for r in rows {
                 let (addr, block, create_index, deployer, n_code, verified, name, compiler) = r?;
                 let block_u64 = block as u64;
+                let is_verified = if registry_loaded {
+                    Some(verified.unwrap_or(false))
+                } else {
+                    verified
+                };
                 out.push(RecentContract {
                     address: format!("0x{}", hex::encode(&addr)),
                     block_number: block_u64,
@@ -1772,7 +1845,7 @@ impl Db {
                     timestamp: crate::blocks::block_timestamp(block_u64),
                     deployer: format!("0x{}", hex::encode(deployer.unwrap_or_default())),
                     n_code_bytes: n_code.unwrap_or(0) as u64,
-                    is_verified: verified,
+                    is_verified,
                     contract_name: name,
                     compiler_version: compiler,
                 });
@@ -1789,118 +1862,6 @@ impl Db {
             contracts,
             has_more,
         })
-    }
-
-    pub async fn pick_metadata_sync_targets(
-        &self,
-        limit: u64,
-        recheck_after_secs: i64,
-        newest_first: bool,
-    ) -> Result<Vec<MetadataSyncTarget>> {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<MetadataSyncTarget>> {
-            let conn = inner.blocking_lock();
-            let order = if newest_first { "DESC" } else { "ASC" };
-            // Hard cap each pass: DuckDB pushes the LIMIT into the parquet scan,
-            // so we only read the newest few files instead of all 50+.
-            let effective_limit = if limit == 0 { 5_000 } else { limit };
-            let scan_limit = effective_limit.saturating_mul(3).max(effective_limit);
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let recheck_cutoff_secs = now - recheck_after_secs;
-            // We skip DISTINCT ON: duplicate addresses across files are negligible
-            // in practice (would require CREATE2 redeploys after SELFDESTRUCT) and
-            // a Rust-side HashSet handles the rare case far cheaper than a sort.
-            let sql = format!(
-                r#"
-                SELECT c.contract_address, c.block_number, c.create_index
-                FROM contracts c
-                LEFT JOIN enrichment e ON c.contract_address = e.contract_address
-                WHERE c.contract_address IS NOT NULL
-                  AND (e.contract_address IS NULL
-                       OR (e.is_verified IS FALSE
-                           AND CAST(epoch(e.checked_at) AS BIGINT) < ?))
-                ORDER BY c.block_number {order}, c.create_index {order}
-                LIMIT ?
-                "#,
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![recheck_cutoff_secs, scan_limit as i64], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Option<u32>>(1)?,
-                    row.get::<_, Option<u32>>(2)?,
-                ))
-            })?;
-            let mut out = Vec::with_capacity(effective_limit as usize);
-            let mut seen = std::collections::HashSet::new();
-            for r in rows {
-                let (addr, block_number, create_index) = r?;
-                if addr.len() != 20 || !seen.insert(addr.clone()) {
-                    continue;
-                }
-                let address_hex = format!("0x{}", hex::encode(&addr));
-                out.push(MetadataSyncTarget {
-                    address: addr,
-                    address_hex,
-                    block_number: block_number.map(u64::from),
-                    create_index: create_index.map(u64::from),
-                });
-                if out.len() as u64 >= effective_limit {
-                    break;
-                }
-            }
-            Ok(out)
-        })
-        .await
-        .map_err(|e| anyhow!("join error: {}", e))?
-    }
-
-    pub async fn upsert_enrichment(
-        &self,
-        address: Vec<u8>,
-        result: VerificationResult,
-        source: Option<String>,
-        match_type: Option<String>,
-        block_number: Option<u64>,
-        create_index: Option<u64>,
-    ) -> Result<()> {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = inner.blocking_lock();
-            conn.execute(
-                r#"
-                INSERT INTO enrichment (
-                    contract_address, is_verified, contract_name,
-                    verification_source, match_type,
-                    block_number, create_index, checked_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT (contract_address) DO UPDATE SET
-                    is_verified         = excluded.is_verified,
-                    contract_name       = excluded.contract_name,
-                    verification_source = excluded.verification_source,
-                    match_type          = excluded.match_type,
-                    block_number        = COALESCE(excluded.block_number, enrichment.block_number),
-                    create_index        = COALESCE(excluded.create_index, enrichment.create_index),
-                    checked_at          = excluded.checked_at
-                "#,
-                params![
-                    address,
-                    result.is_verified,
-                    result.contract_name,
-                    source,
-                    match_type,
-                    block_number.map(|v| v as u32),
-                    create_index.map(|v| v as u32)
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("join error: {}", e))?
     }
 
     pub async fn highest_block(&self) -> Result<Option<u64>> {

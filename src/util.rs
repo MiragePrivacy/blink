@@ -115,22 +115,6 @@ pub fn match_simple_glob(pattern: &str, name: &str) -> bool {
     helper(pattern.as_bytes(), name.as_bytes())
 }
 
-/// Truncate by character count so error messages never slice through a UTF-8 codepoint.
-pub fn truncate_chars(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
-    let mut out = String::new();
-    for _ in 0..max_chars {
-        match chars.next() {
-            Some(ch) => out.push(ch),
-            None => return s.to_string(),
-        }
-    }
-    if chars.next().is_some() {
-        out.push('…');
-    }
-    out
-}
-
 pub fn color_red(text: &str) -> String {
     format!("\x1b[38;2;255;77;77m{}\x1b[0m", text)
 }
