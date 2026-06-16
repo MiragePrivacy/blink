@@ -25,6 +25,8 @@ use tokio::sync::Mutex;
 
 use crate::util::match_simple_glob;
 
+const RECENT_PARQUET_FILE_LIMIT: usize = 64;
+
 #[derive(Clone)]
 pub struct Db {
     inner: Arc<Mutex<Connection>>,
@@ -162,6 +164,164 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
         )
         .unwrap_or(0);
     Ok(count > 0)
+}
+
+#[derive(Debug)]
+struct ContractParquetFile {
+    path: PathBuf,
+    start_block: Option<u64>,
+    end_block: Option<u64>,
+}
+
+fn list_contract_parquet_files(data_dir: &Path, contracts_glob: &str) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(data_dir)
+        .with_context(|| format!("read data dir {}", data_dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|s| s.to_str()) == Some("parquet")
+                && match_simple_glob(
+                    contracts_glob,
+                    p.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+                )
+                && p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|n| n != "enrichment.parquet")
+                    .unwrap_or(true)
+        })
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+fn contract_file_with_range(path: PathBuf) -> ContractParquetFile {
+    let nums = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(decimal_runs)
+        .unwrap_or_default();
+    let len = nums.len();
+    let (start_block, end_block) = if len >= 2 {
+        (Some(nums[len - 2]), Some(nums[len - 1]))
+    } else {
+        (None, None)
+    };
+    ContractParquetFile {
+        path,
+        start_block,
+        end_block,
+    }
+}
+
+fn decimal_runs(input: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut current: Option<u64> = None;
+    for byte in input.bytes() {
+        if byte.is_ascii_digit() {
+            let digit = u64::from(byte - b'0');
+            current = Some(
+                current
+                    .unwrap_or(0)
+                    .saturating_mul(10)
+                    .saturating_add(digit),
+            );
+        } else if let Some(value) = current.take() {
+            out.push(value);
+        }
+    }
+    if let Some(value) = current {
+        out.push(value);
+    }
+    out
+}
+
+fn max_contract_file_block(files: &[PathBuf]) -> Option<u64> {
+    files
+        .iter()
+        .filter_map(|path| contract_file_with_range(path.clone()).end_block)
+        .max()
+}
+
+fn recent_contract_parquet_files(files: &[PathBuf], cursor: Option<RecentCursor>) -> Vec<PathBuf> {
+    let cursor_block = cursor.map(|cursor| cursor.block_number);
+    let mut ranged = files
+        .iter()
+        .cloned()
+        .map(contract_file_with_range)
+        .collect::<Vec<_>>();
+    ranged.sort_by(|a, b| {
+        b.end_block
+            .unwrap_or(0)
+            .cmp(&a.end_block.unwrap_or(0))
+            .then_with(|| b.start_block.unwrap_or(0).cmp(&a.start_block.unwrap_or(0)))
+            .then_with(|| b.path.cmp(&a.path))
+    });
+
+    ranged
+        .into_iter()
+        .filter(|file| {
+            cursor_block
+                .map(|block| file.start_block.unwrap_or(0) <= block)
+                .unwrap_or(true)
+        })
+        .take(RECENT_PARQUET_FILE_LIMIT)
+        .map(|file| file.path)
+        .collect()
+}
+
+fn parquet_read_list(files: &[PathBuf]) -> String {
+    files
+        .iter()
+        .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn create_recent_parquet_contracts_view(conn: &Connection, files: &[PathBuf]) -> Result<()> {
+    let body = if files.is_empty() {
+        r#"
+            SELECT
+                CAST(NULL AS UINTEGER) AS block_number,
+                CAST(NULL AS BLOB) AS block_hash,
+                CAST(NULL AS UINTEGER) AS create_index,
+                CAST(NULL AS BLOB) AS transaction_hash,
+                CAST(NULL AS BLOB) AS contract_address,
+                CAST(NULL AS BLOB) AS deployer,
+                CAST(NULL AS BLOB) AS factory,
+                CAST(NULL AS BLOB) AS init_code,
+                CAST(NULL AS BLOB) AS code,
+                CAST(NULL AS BLOB) AS init_code_hash,
+                CAST(NULL AS UINTEGER) AS n_init_code_bytes,
+                CAST(NULL AS UINTEGER) AS n_code_bytes,
+                CAST(NULL AS BLOB) AS code_hash,
+                CAST(NULL AS UBIGINT) AS chain_id
+            WHERE FALSE
+        "#
+        .to_string()
+    } else {
+        format!(
+            r#"
+                SELECT
+                    block_number, block_hash, create_index, transaction_hash,
+                    contract_address, deployer, factory, init_code, code,
+                    init_code_hash, n_init_code_bytes, n_code_bytes,
+                    code_hash, chain_id
+                FROM read_parquet([{}], union_by_name = true)
+            "#,
+            parquet_read_list(files)
+        )
+    };
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE TEMP VIEW recent_parquet_contracts AS\n{};",
+        body
+    ))
+    .with_context(|| {
+        format!(
+            "create recent parquet contracts view ({} of newest files)",
+            files.len()
+        )
+    })?;
+    Ok(())
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -758,13 +918,12 @@ impl Db {
         if read_only {
             // Schema is owned by the writer. If the tables aren't there yet
             // (decode hasn't run), the queries will fail gracefully.
-            let db = Self {
+            rebuild_contracts_view_for_conn(&conn, data_dir, contracts_glob)?;
+            return Ok(Self {
                 inner: Arc::new(Mutex::new(conn)),
                 data_dir: data_dir.to_path_buf(),
                 contracts_glob: contracts_glob.to_string(),
-            };
-            db.rebuild_contracts_view_blocking()?;
-            return Ok(db);
+            });
         }
 
         conn.execute_batch(
@@ -833,47 +992,42 @@ impl Db {
         .context("create blink schema")?;
         ensure_zellic_summary_tables(&conn)?;
         backfill_enrichment_blocks(&conn)?;
+        rebuild_contracts_view_for_conn(&conn, data_dir, contracts_glob)?;
 
-        let db = Self {
+        Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
             data_dir: data_dir.to_path_buf(),
             contracts_glob: contracts_glob.to_string(),
-        };
-        db.rebuild_contracts_view_blocking()?;
-        Ok(db)
+        })
     }
 
     fn rebuild_contracts_view_blocking(&self) -> Result<()> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&self.data_dir)
-            .with_context(|| format!("read data dir {}", self.data_dir.display()))?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension().and_then(|s| s.to_str()) == Some("parquet")
-                    && match_simple_glob(
-                        &self.contracts_glob,
-                        p.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
-                    )
-                    && p.file_name()
-                        .and_then(|s| s.to_str())
-                        .map(|n| n != "enrichment.parquet")
-                        .unwrap_or(true)
-            })
-            .collect();
-        files.sort();
+        let conn = self.inner.blocking_lock();
+        rebuild_contracts_view_for_conn(&conn, &self.data_dir, &self.contracts_glob)
+    }
 
-        let conn = self
-            .inner
-            .try_lock()
-            .map_err(|_| anyhow!("db lock contended at startup"))?;
+    pub async fn refresh_contracts_view(&self) -> Result<()> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.rebuild_contracts_view_blocking())
+            .await
+            .map_err(|e| anyhow!("join error: {}", e))?
+    }
+}
 
-        // Use TEMP VIEWs so read-only mode (where the main database is locked
-        // for writes) can still set this up — temp views live in a session-
-        // scoped schema and don't require write access to the on-disk DB.
-        let has_zellic =
-            table_exists(&conn, "zellic_contracts")? && table_exists(&conn, "zellic_bytecodes")?;
+fn rebuild_contracts_view_for_conn(
+    conn: &Connection,
+    data_dir: &Path,
+    contracts_glob: &str,
+) -> Result<()> {
+    let files = list_contract_parquet_files(data_dir, contracts_glob)?;
 
-        let empty_select = r#"
+    // Use TEMP VIEWs so read-only mode (where the main database is locked
+    // for writes) can still set this up — temp views live in a session-
+    // scoped schema and don't require write access to the on-disk DB.
+    let has_zellic =
+        table_exists(conn, "zellic_contracts")? && table_exists(conn, "zellic_bytecodes")?;
+
+    let empty_select = r#"
             SELECT
                 CAST(NULL AS UINTEGER) AS block_number,
                 CAST(NULL AS BLOB) AS block_hash,
@@ -892,16 +1046,16 @@ impl Db {
             WHERE FALSE
         "#;
 
-        let parquet_select = if files.is_empty() {
-            None
-        } else {
-            let list = files
-                .iter()
-                .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Some(format!(
-                r#"
+    let parquet_select = if files.is_empty() {
+        None
+    } else {
+        let list = files
+            .iter()
+            .map(|p| format!("'{}'", p.display().to_string().replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            r#"
                 SELECT
                     block_number, block_hash, create_index, transaction_hash,
                     contract_address, deployer, factory, init_code, code,
@@ -909,13 +1063,13 @@ impl Db {
                     code_hash, chain_id
                 FROM read_parquet([{}], union_by_name = true)
                 "#,
-                list
-            ))
-        };
+            list
+        ))
+    };
 
-        let zellic_select = if has_zellic {
-            Some(
-                r#"
+    let zellic_select = if has_zellic {
+        Some(
+            r#"
                 SELECT
                     z.block_number,
                     CAST(NULL AS BLOB) AS block_hash,
@@ -934,37 +1088,48 @@ impl Db {
                 FROM zellic_contracts z
                 LEFT JOIN zellic_bytecodes b ON z.bytecode_hash = b.code_hash
                 "#
-                .to_string(),
-            )
-        } else {
+            .to_string(),
+        )
+    } else {
+        None
+    };
+
+    let parquet_body = parquet_select
+        .clone()
+        .unwrap_or_else(|| empty_select.to_string());
+    let parquet_sql = format!(
+        "CREATE OR REPLACE TEMP VIEW parquet_contracts AS\n{};",
+        parquet_body
+    );
+    conn.execute_batch(&parquet_sql)
+        .with_context(|| format!("create parquet contracts view ({} files)", files.len()))?;
+
+    let selects = [
+        if files.is_empty() {
             None
-        };
-
-        let selects = [parquet_select, zellic_select]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        let body = if selects.is_empty() {
-            empty_select.to_string()
         } else {
-            selects.join("\nUNION ALL\n")
-        };
-        let sql = format!("CREATE OR REPLACE TEMP VIEW contracts AS\n{};", body);
-        conn.execute_batch(&sql)
-            .with_context(|| format!("create contracts view ({} files)", files.len()))?;
-        create_metadata_current_view(&conn)?;
-        create_enrichment_current_view(&conn)?;
-        create_standard_query_views(&conn, has_zellic)?;
-        Ok(())
-    }
+            Some("SELECT * FROM parquet_contracts".to_string())
+        },
+        zellic_select,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let body = if selects.is_empty() {
+        empty_select.to_string()
+    } else {
+        selects.join("\nUNION ALL\n")
+    };
+    let sql = format!("CREATE OR REPLACE TEMP VIEW contracts AS\n{};", body);
+    conn.execute_batch(&sql)
+        .with_context(|| format!("create contracts view ({} files)", files.len()))?;
+    create_metadata_current_view(conn)?;
+    create_enrichment_current_view(conn)?;
+    create_standard_query_views(conn, has_zellic)?;
+    Ok(())
+}
 
-    pub async fn refresh_contracts_view(&self) -> Result<()> {
-        let this = self.clone();
-        tokio::task::spawn_blocking(move || this.rebuild_contracts_view_blocking())
-            .await
-            .map_err(|e| anyhow!("join error: {}", e))?
-    }
-
+impl Db {
     pub async fn query_sql(&self, sql: String, limit: u32) -> Result<SqlQueryResult> {
         let inner = self.inner.clone();
         let normalized = normalize_read_only_sql(&sql)?;
@@ -1008,40 +1173,80 @@ impl Db {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || -> Result<Stats> {
             let conn = inner.blocking_lock();
-            let source_table = if table_exists(&conn, "zellic_contracts")? {
-                "zellic_contracts"
-            } else {
-                "contracts"
-            };
-            let source_sql = format!(
-                "SELECT COUNT(*), MIN(block_number), MAX(block_number) FROM {}",
-                source_table
-            );
-            let (total, first_block, last_block) = conn
-                .query_row::<(Option<i64>, Option<u32>, Option<u32>), _, _>(
-                    &source_sql,
+            let (zellic_total, zellic_first, zellic_last): (i64, Option<u32>, Option<u32>) =
+                if table_exists(&conn, "zellic_block_counts")? {
+                    conn.query_row(
+                        r#"
+                        SELECT
+                            COALESCE(SUM(contract_count), 0)::BIGINT,
+                            MIN(block_number),
+                            MAX(block_number)
+                        FROM zellic_block_counts
+                        "#,
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap_or((0, None, None))
+                } else if table_exists(&conn, "zellic_contracts")? {
+                    conn.query_row(
+                        "SELECT COUNT(*), MIN(block_number), MAX(block_number) FROM zellic_contracts",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap_or((0, None, None))
+                } else {
+                    (0, None, None)
+                };
+            let (parquet_total, parquet_first, parquet_last): (i64, Option<u32>, Option<u32>) =
+                conn.query_row(
+                    "SELECT COUNT(*), MIN(block_number), MAX(block_number) FROM parquet_contracts",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
-                .context("contracts agg")?;
+                .unwrap_or((0, None, None));
 
-            let total = total.unwrap_or(0).max(0) as u64;
-            let first_block = first_block.unwrap_or(0) as u64;
-            let last_block = last_block.unwrap_or(0) as u64;
+            let total = (zellic_total.max(0) + parquet_total.max(0)) as u64;
+            let first_block = [zellic_first, parquet_first]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(0) as u64;
+            let last_block = [zellic_last, parquet_last]
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or(0) as u64;
 
             let registry_loaded = verification_registry_loaded(&conn)?;
             let (enriched, verified): (i64, i64) = if registry_loaded {
-                let verified_sql = format!(
-                    r#"
+                let verified_zellic: i64 = if table_exists(&conn, "zellic_contracts")? {
+                    conn.query_row(
+                        r#"
                     SELECT COUNT(*)
-                    FROM {source_table} c
+                    FROM zellic_contracts c
                     JOIN enrichment e ON c.contract_address = e.contract_address
                     WHERE e.is_verified
-                    "#
-                );
-                let verified = conn
-                    .query_row(&verified_sql, [], |row| row.get(0))
+                    "#,
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                let verified_parquet: i64 = conn
+                    .query_row(
+                        r#"
+                        SELECT COUNT(*)
+                        FROM parquet_contracts c
+                        JOIN enrichment e ON c.contract_address = e.contract_address
+                        WHERE e.is_verified
+                        "#,
+                        [],
+                        |row| row.get(0),
+                    )
                     .unwrap_or(0);
+                let verified = verified_zellic + verified_parquet;
                 (total as i64, verified)
             } else {
                 conn.query_row(
@@ -1623,6 +1828,8 @@ impl Db {
         cursor: Option<RecentCursor>,
     ) -> Result<RecentPage> {
         let inner = self.inner.clone();
+        let data_dir = self.data_dir.clone();
+        let contracts_glob = self.contracts_glob.clone();
         let limit = limit.clamp(1, 200);
         let mut contracts = tokio::task::spawn_blocking(move || -> Result<Vec<RecentContract>> {
             let conn = inner.blocking_lock();
@@ -1630,13 +1837,156 @@ impl Db {
             let has_zellic = table_exists(&conn, "zellic_contracts")?
                 && table_exists(&conn, "zellic_bytecodes")?;
             let has_hash_metadata = table_exists(&conn, "bytecode_metadata_by_hash")?;
+            let parquet_files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
+            let max_contracts_block = max_contract_file_block(&parquet_files);
+            let max_zellic_block: Option<u64> = if has_zellic {
+                let block: Option<u32> = conn
+                    .query_row(
+                        "SELECT MAX(block_number) FROM zellic_contracts",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(None);
+                block.map(u64::from)
+            } else {
+                None
+            };
+            let has_external_contracts = max_contracts_block > max_zellic_block;
+            let use_external_recent = has_external_contracts
+                && cursor
+                    .map(|cursor| cursor.block_number > max_zellic_block.unwrap_or(0))
+                    .unwrap_or(true);
+            if use_external_recent {
+                let recent_files = recent_contract_parquet_files(&parquet_files, cursor);
+                create_recent_parquet_contracts_view(&conn, &recent_files)?;
+            }
             let registry_loaded = verification_registry_loaded(&conn)?;
 
             // For Zellic imports, compiler metadata is keyed by bytecode hash.
             // Select the tiny recent page first, then join hash metadata; going
             // through bytecode_metadata_current would expand hash metadata back
             // to tens of millions of contract-address rows for every page.
-            let sql = if has_zellic && has_hash_metadata && cursor.is_some() {
+            let sql = if use_external_recent && has_hash_metadata && cursor.is_some() {
+                r#"
+                WITH page AS (
+                    SELECT
+                        c.contract_address,
+                        c.block_number,
+                        c.create_index,
+                        c.deployer,
+                        c.n_code_bytes,
+                        c.code_hash
+                    FROM recent_parquet_contracts c
+                    WHERE c.block_number IS NOT NULL
+                      AND (
+                          c.block_number < ?
+                          OR (c.block_number = ? AND c.create_index < ?)
+                      )
+                    ORDER BY c.block_number DESC, c.create_index DESC
+                    LIMIT ?
+                )
+                SELECT
+                    page.contract_address,
+                    page.block_number,
+                    page.create_index,
+                    page.deployer,
+                    page.n_code_bytes,
+                    e.is_verified,
+                    e.contract_name,
+                    h.compiler_version
+                FROM page
+                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN bytecode_metadata_by_hash h ON page.code_hash = h.code_hash
+                ORDER BY page.block_number DESC, page.create_index DESC
+                "#
+            } else if use_external_recent && has_hash_metadata {
+                r#"
+                WITH page AS (
+                    SELECT
+                        c.contract_address,
+                        c.block_number,
+                        c.create_index,
+                        c.deployer,
+                        c.n_code_bytes,
+                        c.code_hash
+                    FROM recent_parquet_contracts c
+                    WHERE c.block_number IS NOT NULL
+                    ORDER BY c.block_number DESC, c.create_index DESC
+                    LIMIT ?
+                )
+                SELECT
+                    page.contract_address,
+                    page.block_number,
+                    page.create_index,
+                    page.deployer,
+                    page.n_code_bytes,
+                    e.is_verified,
+                    e.contract_name,
+                    h.compiler_version
+                FROM page
+                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                LEFT JOIN bytecode_metadata_by_hash h ON page.code_hash = h.code_hash
+                ORDER BY page.block_number DESC, page.create_index DESC
+                "#
+            } else if use_external_recent && cursor.is_some() {
+                r#"
+                WITH page AS (
+                    SELECT
+                        c.contract_address,
+                        c.block_number,
+                        c.create_index,
+                        c.deployer,
+                        c.n_code_bytes
+                    FROM recent_parquet_contracts c
+                    WHERE c.block_number IS NOT NULL
+                      AND (
+                          c.block_number < ?
+                          OR (c.block_number = ? AND c.create_index < ?)
+                      )
+                    ORDER BY c.block_number DESC, c.create_index DESC
+                    LIMIT ?
+                )
+                SELECT
+                    page.contract_address,
+                    page.block_number,
+                    page.create_index,
+                    page.deployer,
+                    page.n_code_bytes,
+                    e.is_verified,
+                    e.contract_name,
+                    CAST(NULL AS VARCHAR) AS compiler_version
+                FROM page
+                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                ORDER BY page.block_number DESC, page.create_index DESC
+                "#
+            } else if use_external_recent {
+                r#"
+                WITH page AS (
+                    SELECT
+                        c.contract_address,
+                        c.block_number,
+                        c.create_index,
+                        c.deployer,
+                        c.n_code_bytes
+                    FROM recent_parquet_contracts c
+                    WHERE c.block_number IS NOT NULL
+                    ORDER BY c.block_number DESC, c.create_index DESC
+                    LIMIT ?
+                )
+                SELECT
+                    page.contract_address,
+                    page.block_number,
+                    page.create_index,
+                    page.deployer,
+                    page.n_code_bytes,
+                    e.is_verified,
+                    e.contract_name,
+                    CAST(NULL AS VARCHAR) AS compiler_version
+                FROM page
+                LEFT JOIN enrichment e ON page.contract_address = e.contract_address
+                ORDER BY page.block_number DESC, page.create_index DESC
+                "#
+            } else if has_zellic && has_hash_metadata && cursor.is_some() {
                 r#"
                 WITH page AS (
                     SELECT
@@ -1866,16 +2216,191 @@ impl Db {
 
     pub async fn highest_block(&self) -> Result<Option<u64>> {
         let inner = self.inner.clone();
+        let data_dir = self.data_dir.clone();
+        let contracts_glob = self.contracts_glob.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<u64>> {
+            let parquet_max =
+                max_contract_file_block(&list_contract_parquet_files(&data_dir, &contracts_glob)?);
             let conn = inner.blocking_lock();
+            let zellic_max = if table_exists(&conn, "zellic_contracts")? {
+                let block: Option<u32> = conn
+                    .query_row(
+                        "SELECT MAX(block_number) FROM zellic_contracts",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(None);
+                block.map(u64::from)
+            } else {
+                None
+            };
+            let known_max = [parquet_max, zellic_max].into_iter().flatten().max();
+            if known_max.is_some() {
+                return Ok(known_max);
+            }
+
             let block: Option<u32> = conn
                 .query_row("SELECT MAX(block_number) FROM contracts", [], |row| {
                     row.get(0)
                 })
                 .unwrap_or(None);
-            Ok(block.map(|b| b as u64))
+            Ok(block.map(u64::from))
         })
         .await
         .map_err(|e| anyhow!("join error: {}", e))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use duckdb::Connection;
+
+    use super::{max_contract_file_block, recent_contract_parquet_files, Db, RecentCursor};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "blink_db_test_{}_{}_{}",
+                std::process::id(),
+                name,
+                unique
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn make_bytes(value: u8, len: usize) -> Vec<u8> {
+        vec![value; len]
+    }
+
+    fn insert_zellic_snapshot(data_dir: &Path) {
+        let conn = Connection::open(data_dir.join("blink.duckdb")).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE zellic_bytecodes (
+                code_hash BLOB,
+                code BLOB,
+                n_code_bytes UINTEGER
+            );
+            CREATE TABLE zellic_contracts (
+                contract_address BLOB,
+                bytecode_hash BLOB,
+                block_number UINTEGER,
+                create_index UINTEGER,
+                chain_id UBIGINT
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zellic_bytecodes VALUES (?, ?, ?)",
+            duckdb::params![make_bytes(1, 32), make_bytes(0x60, 4), 4u32],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zellic_contracts VALUES (?, ?, ?, ?, ?)",
+            duckdb::params![make_bytes(2, 20), make_bytes(1, 32), 100u32, 0u32, 1u64],
+        )
+        .unwrap();
+    }
+
+    fn write_backfill_parquet(data_dir: &Path) {
+        let path = data_dir.join("contracts__0000000200__0000000200.parquet");
+        let path_sql = path.display().to_string().replace('\'', "''");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            r#"
+            COPY (
+                SELECT
+                    200::UINTEGER AS block_number,
+                    unhex(repeat('03', 32)) AS block_hash,
+                    0::UINTEGER AS create_index,
+                    unhex(repeat('04', 32)) AS transaction_hash,
+                    unhex(repeat('05', 20)) AS contract_address,
+                    unhex(repeat('06', 20)) AS deployer,
+                    unhex(repeat('07', 20)) AS factory,
+                    unhex('6000') AS init_code,
+                    unhex('6001') AS code,
+                    unhex(repeat('08', 32)) AS init_code_hash,
+                    2::UINTEGER AS n_init_code_bytes,
+                    2::UINTEGER AS n_code_bytes,
+                    unhex(repeat('09', 32)) AS code_hash,
+                    1::UBIGINT AS chain_id
+            ) TO '{path_sql}' (FORMAT PARQUET);
+            "#
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn recent_parquet_selection_uses_filename_block_ranges() {
+        let files = vec![
+            PathBuf::from("/tmp/contracts__0021850001__0021950000.parquet"),
+            PathBuf::from("/tmp/tail__0025330032__0025330040.parquet"),
+            PathBuf::from("/tmp/tail__0025330041__0025330048.parquet"),
+        ];
+
+        assert_eq!(max_contract_file_block(&files), Some(25_330_048));
+
+        let latest = recent_contract_parquet_files(&files, None);
+        assert_eq!(
+            latest[0].file_name().and_then(|name| name.to_str()),
+            Some("tail__0025330041__0025330048.parquet")
+        );
+
+        let cursor_page = recent_contract_parquet_files(
+            &files,
+            Some(RecentCursor {
+                block_number: 25_330_040,
+                create_index: 0,
+            }),
+        );
+        assert_eq!(
+            cursor_page[0].file_name().and_then(|name| name.to_str()),
+            Some("tail__0025330032__0025330040.parquet")
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_and_recent_include_parquet_rows_newer_than_zellic() {
+        let dir = TestDir::new("parquet_newer_than_zellic");
+        insert_zellic_snapshot(&dir.path);
+        write_backfill_parquet(&dir.path);
+
+        let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+
+        let stats = db.stats().await.unwrap();
+        assert_eq!(stats.total_contracts, 2);
+        assert_eq!(stats.first_block, 100);
+        assert_eq!(stats.last_block, 200);
+
+        let recent = db.recent_contracts(5, None).await.unwrap();
+        assert_eq!(recent.contracts.len(), 1);
+        assert_eq!(recent.contracts[0].block_number, 200);
+        assert_eq!(
+            recent.contracts[0].address,
+            format!("0x{}", hex::encode(make_bytes(5, 20)))
+        );
     }
 }

@@ -51,6 +51,8 @@ pub async fn tail_once(
         "tail__{:010}__{:010}.parquet",
         start_block, end_block
     ));
+    let temp_output_path = output_path.with_extension("parquet.tmp");
+    let _ = std::fs::remove_file(&temp_output_path);
 
     let batch_client = Arc::new(BatchClient::new(
         rpc_url.to_string(),
@@ -111,7 +113,10 @@ pub async fn tail_once(
                         .then_with(|| a.create_index.cmp(&b.create_index))
                 });
                 if writer.is_none() {
-                    writer = Some(parquet_io::create_writer(&output_path, schema.clone())?);
+                    writer = Some(parquet_io::create_writer(
+                        &temp_output_path,
+                        schema.clone(),
+                    )?);
                 }
                 let batch = parquet_io::rows_to_batch(&batch_rows, schema.clone())?;
                 if let Some(writer) = writer.as_mut() {
@@ -125,6 +130,13 @@ pub async fn tail_once(
 
     if let Some(writer) = writer {
         writer.close()?;
+        std::fs::rename(&temp_output_path, &output_path).with_context(|| {
+            format!(
+                "rename {} -> {}",
+                temp_output_path.display(),
+                output_path.display()
+            )
+        })?;
     }
 
     db.refresh_contracts_view().await?;
