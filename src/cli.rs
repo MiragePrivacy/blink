@@ -69,8 +69,8 @@ fn command() -> Command {
 
 #[derive(Parser, Debug, Clone)]
 pub struct ContractsArgs {
-    /// RPC URL (fallback: ETH_RPC_URL)
-    #[arg(long)]
+    /// RPC URL for this extraction run (env: BLINK_CONTRACTS_RPC)
+    #[arg(long, env = "BLINK_CONTRACTS_RPC")]
     pub rpc: Option<String>,
     /// Start block (inclusive)
     #[arg(long)]
@@ -160,32 +160,34 @@ pub struct DecodeArgs {
 
 #[derive(Parser, Debug, Clone)]
 pub struct ServeArgs {
-    /// Bind address
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    /// Bind address (env: BLINK_BIND)
+    #[arg(long, env = "BLINK_BIND", default_value = "127.0.0.1:8080")]
     pub bind: String,
-    /// Data directory containing contract parquet files
-    #[arg(long, default_value = "./data/blink")]
+    /// Data directory containing contract parquet files (env: BLINK_DATA_DIR)
+    #[arg(long, env = "BLINK_DATA_DIR", default_value = "./data/blink")]
     pub data_dir: PathBuf,
     /// Glob (relative to data_dir) for contract parquet files
     #[arg(long, default_value = "*.parquet")]
     pub contracts_glob: String,
     /// Open DuckDB in read-only mode so the dashboard can run alongside an
-    /// active `blink decode`. Disables `--tail-rpc` automatically.
+    /// active `blink decode`. Disables background RPC polling automatically.
     #[arg(long)]
     pub read_only: bool,
-    /// Run continuous tail extraction against this RPC URL
-    #[arg(long)]
-    pub tail_rpc: Option<String>,
-    /// Tail extraction poll interval (seconds)
+    /// Run continuous contract extraction against one or more RPC URLs.
+    /// Repeat for multi-chain serving; Blink infers each chain ID from its RPC.
+    /// BLINK_SERVE_RPCS accepts a comma-separated list.
+    #[arg(long, env = "BLINK_SERVE_RPCS", value_delimiter = ',')]
+    pub rpc: Vec<String>,
+    /// Background extraction poll interval (seconds)
     #[arg(long, default_value_t = 60)]
     pub tail_interval_secs: u64,
-    /// Tail extraction confirmation depth (lag behind head by this many blocks)
+    /// Background extraction confirmation depth (lag behind head by this many blocks)
     #[arg(long, default_value_t = 12)]
     pub tail_confirmations: u64,
-    /// Tail extraction batch size (blocks per JSON-RPC request)
+    /// Background extraction batch size (blocks per JSON-RPC request)
     #[arg(long, default_value_t = 50)]
     pub tail_batch_size: usize,
-    /// Tail extraction max concurrent HTTP requests
+    /// Background extraction max concurrent HTTP requests
     #[arg(long, default_value_t = 16)]
     pub tail_max_concurrent_requests: usize,
 }

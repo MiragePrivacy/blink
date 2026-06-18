@@ -415,14 +415,18 @@ fn ensure_verification_schema(conn: &Connection) -> Result<()> {
         r#"
         CREATE TABLE IF NOT EXISTS enrichment (
             contract_address BLOB,
+            chain_id UBIGINT DEFAULT 1,
             is_verified BOOLEAN NOT NULL,
             contract_name VARCHAR,
             checked_at TIMESTAMP NOT NULL
         );
+        ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS chain_id UBIGINT DEFAULT 1;
         ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS verification_source VARCHAR;
         ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS match_type VARCHAR;
         ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS block_number UINTEGER;
         ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS create_index UINTEGER;
+        UPDATE enrichment SET chain_id = 1 WHERE chain_id IS NULL;
+        CREATE INDEX IF NOT EXISTS enrichment_chain_addr_idx ON enrichment(chain_id, contract_address);
         CREATE INDEX IF NOT EXISTS enrichment_verified_idx ON enrichment(is_verified);
         CREATE INDEX IF NOT EXISTS enrichment_source_idx ON enrichment(verification_source);
 
@@ -461,13 +465,17 @@ fn load_verifier_alliance_registry(
         .context("begin Verifier Alliance import")?;
 
     let result = (|| -> Result<()> {
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             r#"
             DROP TABLE IF EXISTS enrichment_next;
             DELETE FROM verification_registry_imports
-            WHERE source = 'verifier_alliance';
+            WHERE source = 'verifier_alliance'
+              AND chain_id = {chain_id};
+            DELETE FROM enrichment
+            WHERE verification_source = 'verifier_alliance'
+              AND chain_id = {chain_id};
             "#,
-        )
+        ))
         .context("prepare verification registry import")?;
 
         let sql = format!(
@@ -494,6 +502,7 @@ fn load_verifier_alliance_registry(
             CREATE TABLE enrichment_next AS
             SELECT
                 contract_address,
+                {chain_id}::UBIGINT AS chain_id,
                 true AS is_verified,
                 CAST(NULL AS VARCHAR) AS contract_name,
                 COALESCE(checked_at, CURRENT_TIMESTAMP) AS checked_at,
@@ -509,11 +518,28 @@ fn load_verifier_alliance_registry(
                 create_index
             FROM va_verified_contracts;
 
-            DROP TABLE IF EXISTS enrichment;
-            ALTER TABLE enrichment_next RENAME TO enrichment;
-            CREATE INDEX enrichment_addr_idx ON enrichment(contract_address);
-            CREATE INDEX enrichment_verified_idx ON enrichment(is_verified);
-            CREATE INDEX enrichment_source_idx ON enrichment(verification_source);
+            INSERT INTO enrichment (
+                contract_address,
+                chain_id,
+                is_verified,
+                contract_name,
+                checked_at,
+                verification_source,
+                match_type,
+                block_number,
+                create_index
+            )
+            SELECT
+                contract_address,
+                chain_id,
+                is_verified,
+                contract_name,
+                checked_at,
+                verification_source,
+                match_type,
+                block_number,
+                create_index
+            FROM enrichment_next;
 
             INSERT INTO verification_registry_imports (
                 source,
@@ -541,12 +567,18 @@ fn load_verifier_alliance_registry(
     conn.execute_batch("COMMIT;")
         .context("commit Verifier Alliance import")?;
 
-    let verified = count_table(&conn, "enrichment")?;
+    let verified: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM enrichment WHERE verification_source = 'verifier_alliance' AND chain_id = ?",
+            params![chain_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
     print_kv_accent(
         "verified",
         &format!(
             "{} from Verifier Alliance · {:.1}s",
-            format_count(verified),
+            format_count(verified.max(0) as u64),
             started.elapsed().as_secs_f64()
         ),
     );
