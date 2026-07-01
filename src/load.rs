@@ -2,7 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Instant, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -104,6 +104,7 @@ fn run_load_blocking(args: LoadArgs) -> Result<()> {
             &args.memory_limit,
             args.threads,
             args.chain_id,
+            args.rebuild_va,
         )?;
     }
 
@@ -123,6 +124,15 @@ struct VerifierAllianceInputs {
     root: PathBuf,
     contract_deployments: Vec<PathBuf>,
     verified_contracts: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct VaFileEntry {
+    table_name: &'static str,
+    path: PathBuf,
+    path_key: String,
+    size_bytes: i64,
+    modified_unix_ns: i64,
 }
 
 fn detect_inputs(contracts_dir: &Path, contracts_glob: &str) -> Result<LoadInputs> {
@@ -437,6 +447,30 @@ fn ensure_verification_schema(conn: &Connection) -> Result<()> {
             verified_count UBIGINT NOT NULL,
             PRIMARY KEY (source, chain_id)
         );
+
+        CREATE TABLE IF NOT EXISTS verification_registry_files (
+            source VARCHAR NOT NULL,
+            chain_id UBIGINT NOT NULL,
+            table_name VARCHAR NOT NULL,
+            path VARCHAR NOT NULL,
+            size_bytes BIGINT NOT NULL,
+            modified_unix_ns BIGINT NOT NULL,
+            imported_at TIMESTAMP NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS verification_registry_files_idx
+            ON verification_registry_files(source, chain_id, table_name, path);
+
+        CREATE TABLE IF NOT EXISTS verification_registry_file_addresses (
+            source VARCHAR NOT NULL,
+            chain_id UBIGINT NOT NULL,
+            table_name VARCHAR NOT NULL,
+            path VARCHAR NOT NULL,
+            contract_address BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS verification_registry_file_addresses_idx
+            ON verification_registry_file_addresses(source, chain_id, table_name, path);
+        CREATE INDEX IF NOT EXISTS verification_registry_file_addresses_addr_idx
+            ON verification_registry_file_addresses(chain_id, contract_address);
         "#,
     )
     .context("create verification registry schema")
@@ -448,9 +482,17 @@ fn load_verifier_alliance_registry(
     memory_limit: &str,
     threads: Option<usize>,
     chain_id: u64,
+    rebuild_va: bool,
 ) -> Result<()> {
     let started = Instant::now();
-    print_kv("step", "import Verifier Alliance registry");
+    print_kv(
+        "step",
+        if rebuild_va {
+            "rebuild Verifier Alliance registry"
+        } else {
+            "import Verifier Alliance registry incrementally"
+        },
+    );
 
     let db_path = data_dir.join("blink.duckdb");
     let conn =
@@ -458,16 +500,29 @@ fn load_verifier_alliance_registry(
     configure_duckdb(&conn, memory_limit, threads)?;
     ensure_verification_schema(&conn)?;
 
-    let deployments_glob = sql_path(&inputs.root.join("contract_deployments").join("*.parquet"));
-    let verifications_glob = sql_path(&inputs.root.join("verified_contracts").join("*.parquet"));
+    let entries = verifier_alliance_file_entries(inputs)?;
+    if rebuild_va {
+        rebuild_verifier_alliance_registry(&conn, inputs, &entries, chain_id, started)
+    } else {
+        import_verifier_alliance_registry_incremental(&conn, inputs, &entries, chain_id, started)
+    }
+}
 
+fn rebuild_verifier_alliance_registry(
+    conn: &Connection,
+    inputs: &VerifierAllianceInputs,
+    entries: &[VaFileEntry],
+    chain_id: u64,
+    started: Instant,
+) -> Result<()> {
+    let deployments_list = sql_path_list(&inputs.contract_deployments)?;
+    let verifications_list = sql_path_list(&inputs.verified_contracts)?;
     conn.execute_batch("BEGIN TRANSACTION;")
         .context("begin Verifier Alliance import")?;
 
     let result = (|| -> Result<()> {
         conn.execute_batch(&format!(
             r#"
-            DROP TABLE IF EXISTS enrichment_next;
             DELETE FROM verification_registry_imports
             WHERE source = 'verifier_alliance'
               AND chain_id = {chain_id};
@@ -492,14 +547,14 @@ fn load_verifier_alliance_registry(
                 bool_or(COALESCE(vc.creation_match, false)) AS creation_match,
                 bool_or(COALESCE(vc.runtime_metadata_match, false)) AS runtime_metadata_match,
                 bool_or(COALESCE(vc.creation_metadata_match, false)) AS creation_metadata_match
-            FROM read_parquet('{verifications_glob}') vc
-            JOIN read_parquet('{deployments_glob}') cd
+            FROM read_parquet({verifications_list}) vc
+            JOIN read_parquet({deployments_list}) cd
               ON cd.id = vc.deployment_id
             WHERE cd.chain_id = {chain_id}
               AND cd.address IS NOT NULL
             GROUP BY cd.address;
 
-            CREATE TABLE enrichment_next AS
+            CREATE OR REPLACE TEMP TABLE enrichment_next AS
             SELECT
                 contract_address,
                 {chain_id}::UBIGINT AS chain_id,
@@ -557,6 +612,8 @@ fn load_verifier_alliance_registry(
         );
         conn.execute_batch(&sql)
             .context("import Verifier Alliance verified addresses")?;
+        rebuild_va_file_addresses(conn, inputs, chain_id)?;
+        replace_va_file_manifest(conn, chain_id, entries)?;
         Ok(())
     })();
 
@@ -567,21 +624,414 @@ fn load_verifier_alliance_registry(
     conn.execute_batch("COMMIT;")
         .context("commit Verifier Alliance import")?;
 
-    let verified: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM enrichment WHERE verification_source = 'verifier_alliance' AND chain_id = ?",
-            params![chain_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let verified = va_verified_count(conn, chain_id)?;
     print_kv_accent(
         "verified",
         &format!(
             "{} from Verifier Alliance · {:.1}s",
-            format_count(verified.max(0) as u64),
+            format_count(verified),
             started.elapsed().as_secs_f64()
         ),
     );
+    Ok(())
+}
+
+fn import_verifier_alliance_registry_incremental(
+    conn: &Connection,
+    inputs: &VerifierAllianceInputs,
+    entries: &[VaFileEntry],
+    chain_id: u64,
+    started: Instant,
+) -> Result<()> {
+    let changed_entries = changed_va_file_entries(conn, chain_id, entries)?;
+    let import_exists = verification_registry_import_exists(conn, chain_id)?;
+    let deployment_changed = changed_entries
+        .iter()
+        .any(|entry| entry.table_name == "contract_deployments");
+
+    let mut changed_verified = if deployment_changed || !import_exists {
+        entries
+            .iter()
+            .filter(|entry| entry.table_name == "verified_contracts")
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        changed_entries
+            .iter()
+            .filter(|entry| entry.table_name == "verified_contracts")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    changed_verified.sort_by_key(|entry| entry.path_key.clone());
+    changed_verified.dedup_by(|a, b| a.path_key == b.path_key);
+
+    if changed_entries.is_empty() && import_exists {
+        let verified = va_verified_count(conn, chain_id)?;
+        print_kv_accent(
+            "verified",
+            &format!(
+                "{} from Verifier Alliance · already current · {:.1}s",
+                format_count(verified),
+                started.elapsed().as_secs_f64()
+            ),
+        );
+        return Ok(());
+    }
+
+    if changed_verified.is_empty() {
+        upsert_va_file_manifest_entries(conn, chain_id, &changed_entries)?;
+        let verified = va_verified_count(conn, chain_id)?;
+        print_kv_accent(
+            "verified",
+            &format!(
+                "{} from Verifier Alliance · metadata refreshed · {:.1}s",
+                format_count(verified),
+                started.elapsed().as_secs_f64()
+            ),
+        );
+        return Ok(());
+    }
+
+    let deployments_list = sql_path_list(&inputs.contract_deployments)?;
+    let verifications_list = sql_path_list(&inputs.verified_contracts)?;
+    let changed_verifications_list =
+        sql_path_list(changed_verified.iter().map(|entry| &entry.path))?;
+    let changed_file_values =
+        sql_string_values(changed_verified.iter().map(|entry| entry.path_key.as_str()));
+
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .context("begin incremental Verifier Alliance import")?;
+
+    let result = (|| -> Result<()> {
+        let sql = format!(
+            r#"
+            CREATE OR REPLACE TEMP TABLE va_changed_files AS
+            SELECT col0 AS path
+            FROM (VALUES {changed_file_values});
+
+            CREATE OR REPLACE TEMP TABLE va_previous_affected_addresses AS
+            SELECT DISTINCT contract_address
+            FROM verification_registry_file_addresses
+            WHERE source = 'verifier_alliance'
+              AND chain_id = {chain_id}
+              AND table_name = 'verified_contracts'
+              AND path IN (SELECT path FROM va_changed_files);
+
+            CREATE OR REPLACE TEMP TABLE va_changed_file_addresses AS
+            SELECT DISTINCT
+                vc.filename AS path,
+                cd.address AS contract_address
+            FROM read_parquet({changed_verifications_list}, filename=true) vc
+            JOIN read_parquet({deployments_list}) cd
+              ON cd.id = vc.deployment_id
+            WHERE cd.chain_id = {chain_id}
+              AND cd.address IS NOT NULL;
+
+            CREATE OR REPLACE TEMP TABLE va_affected_addresses AS
+            SELECT contract_address FROM va_previous_affected_addresses
+            UNION
+            SELECT contract_address FROM va_changed_file_addresses;
+
+            DELETE FROM enrichment
+            WHERE verification_source = 'verifier_alliance'
+              AND chain_id = {chain_id}
+              AND contract_address IN (
+                  SELECT contract_address FROM va_affected_addresses
+              );
+
+            DELETE FROM verification_registry_file_addresses
+            WHERE source = 'verifier_alliance'
+              AND chain_id = {chain_id}
+              AND table_name = 'verified_contracts'
+              AND path IN (SELECT path FROM va_changed_files);
+
+            INSERT INTO verification_registry_file_addresses (
+                source,
+                chain_id,
+                table_name,
+                path,
+                contract_address
+            )
+            SELECT
+                'verifier_alliance',
+                {chain_id},
+                'verified_contracts',
+                path,
+                contract_address
+            FROM va_changed_file_addresses;
+
+            CREATE OR REPLACE TEMP TABLE va_verified_contracts AS
+            SELECT
+                cd.address AS contract_address,
+                (max(cd.block_number) FILTER (WHERE cd.block_number >= 0))::UINTEGER
+                    AS block_number,
+                (min(cd.transaction_index) FILTER (WHERE cd.transaction_index >= 0))::UINTEGER
+                    AS create_index,
+                max(vc.created_at)::TIMESTAMP AS checked_at,
+                bool_or(COALESCE(vc.runtime_match, false)) AS runtime_match,
+                bool_or(COALESCE(vc.creation_match, false)) AS creation_match,
+                bool_or(COALESCE(vc.runtime_metadata_match, false)) AS runtime_metadata_match,
+                bool_or(COALESCE(vc.creation_metadata_match, false)) AS creation_metadata_match
+            FROM read_parquet({verifications_list}) vc
+            JOIN read_parquet({deployments_list}) cd
+              ON cd.id = vc.deployment_id
+            JOIN va_affected_addresses affected
+              ON affected.contract_address = cd.address
+            WHERE cd.chain_id = {chain_id}
+              AND cd.address IS NOT NULL
+            GROUP BY cd.address;
+
+            INSERT INTO enrichment (
+                contract_address,
+                chain_id,
+                is_verified,
+                contract_name,
+                checked_at,
+                verification_source,
+                match_type,
+                block_number,
+                create_index
+            )
+            SELECT
+                contract_address,
+                {chain_id}::UBIGINT AS chain_id,
+                true AS is_verified,
+                CAST(NULL AS VARCHAR) AS contract_name,
+                COALESCE(checked_at, CURRENT_TIMESTAMP) AS checked_at,
+                'verifier_alliance' AS verification_source,
+                CASE
+                    WHEN runtime_match AND creation_match THEN 'runtime+creation'
+                    WHEN runtime_match THEN 'runtime'
+                    WHEN creation_match THEN 'creation'
+                    WHEN runtime_metadata_match OR creation_metadata_match THEN 'metadata'
+                    ELSE 'verified'
+                END AS match_type,
+                block_number,
+                create_index
+            FROM va_verified_contracts;
+
+            DELETE FROM verification_registry_imports
+            WHERE source = 'verifier_alliance'
+              AND chain_id = {chain_id};
+
+            INSERT INTO verification_registry_imports (
+                source,
+                chain_id,
+                imported_at,
+                verified_count
+            )
+            SELECT
+                'verifier_alliance',
+                {chain_id},
+                CURRENT_TIMESTAMP,
+                COUNT(*)::UBIGINT
+            FROM enrichment
+            WHERE verification_source = 'verifier_alliance'
+              AND chain_id = {chain_id};
+            "#
+        );
+        conn.execute_batch(&sql)
+            .context("import changed Verifier Alliance verified addresses")?;
+        upsert_va_file_manifest_entries(conn, chain_id, &changed_entries)?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(err);
+    }
+    conn.execute_batch("COMMIT;")
+        .context("commit incremental Verifier Alliance import")?;
+
+    let verified = va_verified_count(conn, chain_id)?;
+    print_kv_accent(
+        "verified",
+        &format!(
+            "{} from Verifier Alliance · {} changed file(s) · {:.1}s",
+            format_count(verified),
+            changed_entries.len(),
+            started.elapsed().as_secs_f64()
+        ),
+    );
+    Ok(())
+}
+
+fn rebuild_va_file_addresses(
+    conn: &Connection,
+    inputs: &VerifierAllianceInputs,
+    chain_id: u64,
+) -> Result<()> {
+    let deployments_list = sql_path_list(&inputs.contract_deployments)?;
+    let verifications_list = sql_path_list(&inputs.verified_contracts)?;
+    let sql = format!(
+        r#"
+        DELETE FROM verification_registry_file_addresses
+        WHERE source = 'verifier_alliance'
+          AND chain_id = {chain_id};
+
+        INSERT INTO verification_registry_file_addresses (
+            source,
+            chain_id,
+            table_name,
+            path,
+            contract_address
+        )
+        SELECT DISTINCT
+            'verifier_alliance',
+            {chain_id},
+            'verified_contracts',
+            vc.filename,
+            cd.address
+        FROM read_parquet({verifications_list}, filename=true) vc
+        JOIN read_parquet({deployments_list}) cd
+          ON cd.id = vc.deployment_id
+        WHERE cd.chain_id = {chain_id}
+          AND cd.address IS NOT NULL;
+        "#
+    );
+    conn.execute_batch(&sql)
+        .context("rebuild Verifier Alliance file address map")
+}
+
+fn verification_registry_import_exists(conn: &Connection, chain_id: u64) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM verification_registry_imports WHERE source = 'verifier_alliance' AND chain_id = ?",
+        params![chain_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn va_verified_count(conn: &Connection, chain_id: u64) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM enrichment WHERE verification_source = 'verifier_alliance' AND chain_id = ?",
+        params![chain_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count.max(0) as u64)
+}
+
+fn verifier_alliance_file_entries(inputs: &VerifierAllianceInputs) -> Result<Vec<VaFileEntry>> {
+    let mut entries = Vec::new();
+    for path in &inputs.contract_deployments {
+        entries.push(va_file_entry("contract_deployments", path)?);
+    }
+    for path in &inputs.verified_contracts {
+        entries.push(va_file_entry("verified_contracts", path)?);
+    }
+    entries.sort_by_key(|entry| (entry.table_name, entry.path_key.clone()));
+    Ok(entries)
+}
+
+fn va_file_entry(table_name: &'static str, path: &Path) -> Result<VaFileEntry> {
+    let canonical =
+        std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
+    let metadata =
+        std::fs::metadata(&canonical).with_context(|| format!("stat {}", canonical.display()))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| {
+            duration.as_secs() as i64 * 1_000_000_000 + i64::from(duration.subsec_nanos())
+        })
+        .unwrap_or(0);
+    Ok(VaFileEntry {
+        table_name,
+        path_key: canonical.display().to_string(),
+        path: canonical,
+        size_bytes: metadata.len().min(i64::MAX as u64) as i64,
+        modified_unix_ns: modified,
+    })
+}
+
+fn changed_va_file_entries(
+    conn: &Connection,
+    chain_id: u64,
+    entries: &[VaFileEntry],
+) -> Result<Vec<VaFileEntry>> {
+    let mut changed = Vec::new();
+    for entry in entries {
+        let count: i64 = conn.query_row(
+            r#"
+                SELECT COUNT(*)
+                FROM verification_registry_files
+                WHERE source = 'verifier_alliance'
+                  AND chain_id = ?
+                  AND table_name = ?
+                  AND path = ?
+                  AND size_bytes = ?
+                  AND modified_unix_ns = ?
+                "#,
+            params![
+                chain_id,
+                entry.table_name,
+                entry.path_key,
+                entry.size_bytes,
+                entry.modified_unix_ns
+            ],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            changed.push(entry.clone());
+        }
+    }
+    Ok(changed)
+}
+
+fn replace_va_file_manifest(
+    conn: &Connection,
+    chain_id: u64,
+    entries: &[VaFileEntry],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM verification_registry_files WHERE source = 'verifier_alliance' AND chain_id = ?",
+        params![chain_id],
+    )
+    .context("clear Verifier Alliance file manifest")?;
+    upsert_va_file_manifest_entries(conn, chain_id, entries)
+}
+
+fn upsert_va_file_manifest_entries(
+    conn: &Connection,
+    chain_id: u64,
+    entries: &[VaFileEntry],
+) -> Result<()> {
+    for entry in entries {
+        conn.execute(
+            r#"
+            DELETE FROM verification_registry_files
+            WHERE source = 'verifier_alliance'
+              AND chain_id = ?
+              AND table_name = ?
+              AND path = ?
+            "#,
+            params![chain_id, entry.table_name, entry.path_key],
+        )
+        .context("delete Verifier Alliance file manifest row")?;
+        conn.execute(
+            r#"
+            INSERT INTO verification_registry_files (
+                source,
+                chain_id,
+                table_name,
+                path,
+                size_bytes,
+                modified_unix_ns,
+                imported_at
+            )
+            VALUES ('verifier_alliance', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            "#,
+            params![
+                chain_id,
+                entry.table_name,
+                entry.path_key,
+                entry.size_bytes,
+                entry.modified_unix_ns
+            ],
+        )
+        .context("insert Verifier Alliance file manifest row")?;
+    }
     Ok(())
 }
 
@@ -712,6 +1162,36 @@ fn import_counts(conn: &Connection) -> Result<()> {
 
 fn sql_path(path: &Path) -> String {
     path.display().to_string().replace('\'', "''")
+}
+
+fn sql_path_list<I, P>(paths: I) -> Result<String>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let mut out = Vec::new();
+    for path in paths {
+        let path = path.as_ref();
+        let canonical = std::fs::canonicalize(path)
+            .with_context(|| format!("canonicalize {}", path.display()))?;
+        out.push(format!("'{}'", sql_path(&canonical)));
+    }
+    if out.is_empty() {
+        return Err(anyhow!("empty parquet path list"));
+    }
+    Ok(format!("[{}]", out.join(", ")))
+}
+
+fn sql_string_values<I, S>(values: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    values
+        .into_iter()
+        .map(|value| format!("('{}')", value.as_ref().replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

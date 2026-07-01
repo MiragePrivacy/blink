@@ -133,6 +133,9 @@ pub struct LoadArgs {
     /// Rebuild existing CSV import tables or replace existing Parquet links
     #[arg(long)]
     pub overwrite: bool,
+    /// Rebuild all Verifier Alliance labels instead of importing changed VA files only
+    #[arg(long = "rebuild-va", alias = "rebuild")]
+    pub rebuild_va: bool,
     /// DuckDB memory limit for CSV and verification imports
     #[arg(long, default_value = "8GB")]
     pub memory_limit: String,
