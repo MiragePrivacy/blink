@@ -56,7 +56,8 @@ struct AppState {
     cache: Arc<ApiCache>,
 }
 
-const API_CACHE_TTL: Duration = Duration::from_secs(30);
+const API_CACHE_TTL: Duration = Duration::from_secs(600);
+const CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DEFAULT_COMPILER_LIMIT: u32 = 12;
 const DEFAULT_RECENT_LIMIT: u32 = 20;
 const INITIAL_DEPLOYS_RANGE: &str = "day";
@@ -277,15 +278,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         cache: cache.clone(),
     };
 
-    prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
-    {
-        let db_warm = db.clone();
-        let cache_warm = cache.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            prewarm_extended_dashboard_cache(db_warm, cache_warm).await;
-        });
-    }
+    spawn_dashboard_cache_warmer(db.clone(), cache.clone());
 
     if !args.read_only {
         for rpc in rpcs {
@@ -299,9 +292,8 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
                 data_dir: args.data_dir.clone(),
             };
             let runtime_bg = runtime.clone();
-            let cache_bg = cache.clone();
             tokio::spawn(async move {
-                background_tail_loop(db_bg, config, runtime_bg, cache_bg).await;
+                background_tail_loop(db_bg, config, runtime_bg).await;
             });
         }
     }
@@ -974,6 +966,18 @@ async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
     );
 }
 
+fn spawn_dashboard_cache_warmer(db: Db, cache: Arc<ApiCache>) {
+    tokio::spawn(async move {
+        prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
+        prewarm_extended_dashboard_cache(db.clone(), cache.clone()).await;
+
+        loop {
+            tokio::time::sleep(CACHE_REFRESH_INTERVAL).await;
+            prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
+        }
+    });
+}
+
 async fn prewarm_extended_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
     let started = Instant::now();
     for chain in chains::supported_chains() {
@@ -1128,12 +1132,7 @@ fn log_prewarm_error(chain_id: u64, label: &str, err: anyhow::Error) {
     );
 }
 
-async fn background_tail_loop(
-    db: Db,
-    config: TailLoopConfig,
-    runtime: Arc<RuntimeState>,
-    cache: Arc<ApiCache>,
-) {
+async fn background_tail_loop(db: Db, config: TailLoopConfig, runtime: Arc<RuntimeState>) {
     let chain_id = match crate::extract::tail::rpc_chain_id(&config.rpc).await {
         Ok(chain_id) => Some(chain_id),
         Err(err) => {
@@ -1170,20 +1169,6 @@ async fn background_tail_loop(
                 runtime
                     .mark_tail_ok(Some(report.end_block), report.rows as u64)
                     .await;
-                if let Some(chain_id) = chain_id {
-                    let db_refresh = db.clone();
-                    let cache_refresh = cache.clone();
-                    tokio::spawn(async move {
-                        prewarm_chain_dashboard_cache(
-                            &db_refresh,
-                            &cache_refresh,
-                            chain_id,
-                            PRESET_CHART_RANGES,
-                            true,
-                        )
-                        .await;
-                    });
-                }
                 tracing::info!(
                     "tail extracted blocks {}-{} ({} contracts)",
                     report.start_block,
