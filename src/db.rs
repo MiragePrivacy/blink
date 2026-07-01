@@ -2117,7 +2117,7 @@ impl Db {
                 ORDER BY bucket_id
                 "#,
             };
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = conn.prepare(sql)?;
             let rows = match block_range {
                 None => stmt.query_map(
                     params![bucket_blocks, chain_id],

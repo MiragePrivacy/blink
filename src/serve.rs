@@ -20,6 +20,7 @@ use std::{
     future::Future,
     hash::Hash,
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -213,7 +214,16 @@ struct TailLoopConfig {
     confirmations: u64,
     batch_size: usize,
     max_concurrent: usize,
-    data_dir: std::path::PathBuf,
+    data_dir: PathBuf,
+}
+
+struct TailLoopSettings {
+    rpcs: Vec<String>,
+    interval: Duration,
+    confirmations: u64,
+    batch_size: usize,
+    max_concurrent: usize,
+    data_dir: PathBuf,
 }
 
 impl RuntimeState {
@@ -406,12 +416,14 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         spawn_tail_loops(
             db.clone(),
             runtime.clone(),
-            rpcs,
-            Duration::from_secs(args.tail_interval_secs.max(15)),
-            args.tail_confirmations,
-            args.tail_batch_size,
-            args.tail_max_concurrent_requests,
-            args.data_dir.clone(),
+            TailLoopSettings {
+                rpcs,
+                interval: Duration::from_secs(args.tail_interval_secs.max(15)),
+                confirmations: args.tail_confirmations,
+                batch_size: args.tail_batch_size,
+                max_concurrent: args.tail_max_concurrent_requests,
+                data_dir: args.data_dir.clone(),
+            },
         );
     }
     axum::serve(listener, app)
@@ -1065,26 +1077,17 @@ async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
     );
 }
 
-fn spawn_tail_loops(
-    db: Db,
-    runtime: Arc<RuntimeState>,
-    rpcs: Vec<String>,
-    interval: Duration,
-    confirmations: u64,
-    batch_size: usize,
-    max_concurrent: usize,
-    data_dir: std::path::PathBuf,
-) {
-    for rpc in rpcs {
+fn spawn_tail_loops(db: Db, runtime: Arc<RuntimeState>, settings: TailLoopSettings) {
+    for rpc in settings.rpcs {
         let db_bg = db.clone();
         let runtime_bg = runtime.clone();
-        let data_dir = data_dir.clone();
+        let data_dir = settings.data_dir.clone();
         let config = TailLoopConfig {
             rpc,
-            interval,
-            confirmations,
-            batch_size,
-            max_concurrent,
+            interval: settings.interval,
+            confirmations: settings.confirmations,
+            batch_size: settings.batch_size,
+            max_concurrent: settings.max_concurrent,
             data_dir,
         };
         tokio::spawn(async move {
