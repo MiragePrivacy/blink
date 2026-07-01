@@ -57,15 +57,12 @@ struct AppState {
 }
 
 const API_CACHE_TTL: Duration = Duration::from_secs(600);
-const CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const CACHE_WARMER_START_DELAY: Duration = Duration::from_secs(20);
-const EXTENDED_CACHE_WARMER_DELAY: Duration = Duration::from_secs(120);
 const DEFAULT_COMPILER_LIMIT: u32 = 12;
 const DEFAULT_RECENT_LIMIT: u32 = 20;
 const INITIAL_DEPLOYS_RANGE: &str = "day";
 const INITIAL_VERIFIED_RANGE: &str = "week";
 const INITIAL_AGGREGATE_RANGE: &str = "month";
-const PRESET_CHART_RANGES: &[&str] = &["hour", "day", "week", "month", "year"];
 const API_TAG: &str = "Dashboard";
 
 #[derive(OpenApi)]
@@ -186,6 +183,19 @@ struct RuntimeSnapshot {
     tail_last_rows: Option<u64>,
     tail_last_error_at: Option<DateTime<Utc>>,
     tail_last_error: Option<String>,
+    tail_chains: Vec<ChainRuntimeSnapshot>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, ToSchema)]
+struct ChainRuntimeSnapshot {
+    chain_id: u64,
+    tail_running: bool,
+    tail_running_count: u64,
+    tail_last_ok_at: Option<DateTime<Utc>>,
+    tail_last_block: Option<u64>,
+    tail_last_rows: Option<u64>,
+    tail_last_error_at: Option<DateTime<Utc>>,
+    tail_last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -225,13 +235,18 @@ impl RuntimeState {
         }
     }
 
-    async fn mark_tail_start(&self) {
+    async fn mark_tail_start(&self, chain_id: Option<u64>) {
         let mut snapshot = self.snapshot.lock().await;
         snapshot.tail_running_count = snapshot.tail_running_count.saturating_add(1);
         snapshot.tail_running = true;
+        if let Some(chain_id) = chain_id {
+            let chain = chain_runtime_snapshot_mut(&mut snapshot, chain_id);
+            chain.tail_running_count = chain.tail_running_count.saturating_add(1);
+            chain.tail_running = true;
+        }
     }
 
-    async fn mark_tail_ok(&self, end_block: Option<u64>, rows: u64) {
+    async fn mark_tail_ok(&self, chain_id: Option<u64>, end_block: Option<u64>, rows: u64) {
         let mut snapshot = self.snapshot.lock().await;
         snapshot.tail_running_count = snapshot.tail_running_count.saturating_sub(1);
         snapshot.tail_running = snapshot.tail_running_count > 0;
@@ -242,15 +257,56 @@ impl RuntimeState {
         snapshot.tail_last_rows = Some(rows);
         snapshot.tail_last_error = None;
         snapshot.tail_last_error_at = None;
+        if let Some(chain_id) = chain_id {
+            let last_ok_at = snapshot.tail_last_ok_at;
+            let chain = chain_runtime_snapshot_mut(&mut snapshot, chain_id);
+            chain.tail_running_count = chain.tail_running_count.saturating_sub(1);
+            chain.tail_running = chain.tail_running_count > 0;
+            chain.tail_last_ok_at = last_ok_at;
+            if let Some(block) = end_block {
+                chain.tail_last_block = Some(block);
+            }
+            chain.tail_last_rows = Some(rows);
+            chain.tail_last_error = None;
+            chain.tail_last_error_at = None;
+        }
     }
 
-    async fn mark_tail_error(&self, message: String) {
+    async fn mark_tail_error(&self, chain_id: Option<u64>, message: String) {
         let mut snapshot = self.snapshot.lock().await;
         snapshot.tail_running_count = snapshot.tail_running_count.saturating_sub(1);
         snapshot.tail_running = snapshot.tail_running_count > 0;
         snapshot.tail_last_error_at = Some(Utc::now());
         snapshot.tail_last_error = Some(message);
+        if let Some(chain_id) = chain_id {
+            let last_error_at = snapshot.tail_last_error_at;
+            let last_error = snapshot.tail_last_error.clone();
+            let chain = chain_runtime_snapshot_mut(&mut snapshot, chain_id);
+            chain.tail_running_count = chain.tail_running_count.saturating_sub(1);
+            chain.tail_running = chain.tail_running_count > 0;
+            chain.tail_last_error_at = last_error_at;
+            chain.tail_last_error = last_error;
+        }
     }
+}
+
+fn chain_runtime_snapshot_mut(
+    snapshot: &mut RuntimeSnapshot,
+    chain_id: u64,
+) -> &mut ChainRuntimeSnapshot {
+    if let Some(index) = snapshot
+        .tail_chains
+        .iter()
+        .position(|chain| chain.chain_id == chain_id)
+    {
+        return &mut snapshot.tail_chains[index];
+    }
+    snapshot.tail_chains.push(ChainRuntimeSnapshot {
+        chain_id,
+        ..ChainRuntimeSnapshot::default()
+    });
+    let index = snapshot.tail_chains.len() - 1;
+    &mut snapshot.tail_chains[index]
 }
 
 pub async fn run_serve(args: ServeArgs) -> Result<()> {
@@ -558,6 +614,17 @@ fn parse_time_series_window(q: &BucketQuery, chain_id: u64, anchor_block: u64) -
     }
 }
 
+fn default_aggregate_window(q: &mut BucketQuery) {
+    if q.range.is_none()
+        && q.start_block.is_none()
+        && q.end_block.is_none()
+        && q.start_time.is_none()
+        && q.end_time.is_none()
+    {
+        q.range = Some(INITIAL_AGGREGATE_RANGE.to_string());
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/deploys-over-time",
@@ -664,9 +731,10 @@ async fn verified_handler(
 )]
 async fn bytecode_sizes_handler(
     State(state): State<AppState>,
-    Query(q): Query<BucketQuery>,
+    Query(mut q): Query<BucketQuery>,
 ) -> Result<Json<SizeResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
+    default_aggregate_window(&mut q);
     let highest = state
         .db
         .highest_contract_block(chain_id)
@@ -713,9 +781,10 @@ struct PageQuery {
 )]
 async fn compilers_handler(
     State(state): State<AppState>,
-    Query(q): Query<BucketQuery>,
+    Query(mut q): Query<BucketQuery>,
 ) -> Result<Json<CompilersResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
+    default_aggregate_window(&mut q);
     let limit = q.limit.unwrap_or(DEFAULT_COMPILER_LIMIT);
     let highest = state
         .db
@@ -887,9 +956,10 @@ async fn languages_handler(
 )]
 async fn standards_handler(
     State(state): State<AppState>,
-    Query(q): Query<BucketQuery>,
+    Query(mut q): Query<BucketQuery>,
 ) -> Result<Json<crate::db::StandardsBreakdown>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
+    default_aggregate_window(&mut q);
     let highest = state
         .db
         .highest_contract_block(chain_id)
@@ -959,7 +1029,7 @@ async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
             &cache,
             chain.chain_id,
             &[INITIAL_DEPLOYS_RANGE, INITIAL_VERIFIED_RANGE],
-            true,
+            false,
         )
         .await;
     }
@@ -973,28 +1043,7 @@ fn spawn_dashboard_cache_warmer(db: Db, cache: Arc<ApiCache>) {
     tokio::spawn(async move {
         tokio::time::sleep(CACHE_WARMER_START_DELAY).await;
         prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
-
-        tokio::time::sleep(EXTENDED_CACHE_WARMER_DELAY).await;
-        prewarm_extended_dashboard_cache(db.clone(), cache.clone()).await;
-
-        loop {
-            tokio::time::sleep(CACHE_REFRESH_INTERVAL).await;
-            prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
-        }
     });
-}
-
-async fn prewarm_extended_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
-    let started = Instant::now();
-    tracing::info!("warming extended chart cache");
-    for chain in chains::supported_chains() {
-        prewarm_chain_dashboard_cache(&db, &cache, chain.chain_id, PRESET_CHART_RANGES, false)
-            .await;
-    }
-    tracing::info!(
-        "extended chart cache warmed in {:.1}s",
-        started.elapsed().as_secs_f64()
-    );
 }
 
 async fn prewarm_chain_dashboard_cache(
@@ -1161,7 +1210,7 @@ async fn background_tail_loop(db: Db, config: TailLoopConfig, runtime: Arc<Runti
         config.confirmations
     );
     loop {
-        runtime.mark_tail_start().await;
+        runtime.mark_tail_start(chain_id).await;
         match crate::extract::tail::tail_once(
             &db,
             &config.rpc,
@@ -1174,7 +1223,7 @@ async fn background_tail_loop(db: Db, config: TailLoopConfig, runtime: Arc<Runti
         {
             Ok(Some(report)) => {
                 runtime
-                    .mark_tail_ok(Some(report.end_block), report.rows as u64)
+                    .mark_tail_ok(chain_id, Some(report.end_block), report.rows as u64)
                     .await;
                 tracing::info!(
                     "tail extracted blocks {}-{} ({} contracts)",
@@ -1184,12 +1233,12 @@ async fn background_tail_loop(db: Db, config: TailLoopConfig, runtime: Arc<Runti
                 );
             }
             Ok(None) => {
-                runtime.mark_tail_ok(None, 0).await;
+                runtime.mark_tail_ok(chain_id, None, 0).await;
                 tracing::debug!("tail: no new blocks");
             }
             Err(err) => {
                 let msg = format!("{:#}", err);
-                runtime.mark_tail_error(msg.clone()).await;
+                runtime.mark_tail_error(chain_id, msg.clone()).await;
                 tracing::warn!("tail failed: {}", msg);
             }
         }

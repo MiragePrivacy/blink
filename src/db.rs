@@ -422,8 +422,13 @@ fn contract_code_counts_sql(
     let has_zellic = chain_id == ETHEREUM_CHAIN_ID
         && table_exists(conn, "zellic_contracts")?
         && table_exists(conn, "zellic_bytecodes")?;
+    let use_zellic = has_zellic
+        && match block_range {
+            Some(range) => zellic_block_range_overlaps(conn, range)?,
+            None => true,
+        };
 
-    if has_zellic {
+    if use_zellic {
         if let Some((start, end)) = block_range {
             sources.push(format!(
                 r#"
@@ -512,6 +517,26 @@ fn contract_code_counts_sql(
         "#,
         sources.join("\nUNION ALL\n")
     ))
+}
+
+fn zellic_block_range_overlaps(conn: &Connection, range: (u64, u64)) -> Result<bool> {
+    if !table_exists(conn, "zellic_block_counts")? {
+        return Ok(true);
+    }
+    let (min_block, max_block): (Option<u32>, Option<u32>) = conn
+        .query_row(
+            "SELECT MIN(block_number), MAX(block_number) FROM zellic_block_counts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((None, None));
+    let Some(min_block) = min_block.map(u64::from) else {
+        return Ok(false);
+    };
+    let Some(max_block) = max_block.map(u64::from) else {
+        return Ok(false);
+    };
+    Ok(range.0 <= max_block && range.1 >= min_block)
 }
 
 fn ensure_parquet_block_counts(conn: &Connection, files: &[PathBuf]) -> Result<()> {
