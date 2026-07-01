@@ -58,6 +58,8 @@ struct AppState {
 
 const API_CACHE_TTL: Duration = Duration::from_secs(600);
 const CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const CACHE_WARMER_START_DELAY: Duration = Duration::from_secs(20);
+const EXTENDED_CACHE_WARMER_DELAY: Duration = Duration::from_secs(120);
 const DEFAULT_COMPILER_LIMIT: u32 = 12;
 const DEFAULT_RECENT_LIMIT: u32 = 20;
 const INITIAL_DEPLOYS_RANGE: &str = "day";
@@ -950,6 +952,7 @@ struct LanguagesResponse {
 
 async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
     let started = Instant::now();
+    tracing::info!("warming initial dashboard cache");
     for chain in chains::supported_chains() {
         prewarm_chain_dashboard_cache(
             &db,
@@ -968,7 +971,10 @@ async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
 
 fn spawn_dashboard_cache_warmer(db: Db, cache: Arc<ApiCache>) {
     tokio::spawn(async move {
+        tokio::time::sleep(CACHE_WARMER_START_DELAY).await;
         prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
+
+        tokio::time::sleep(EXTENDED_CACHE_WARMER_DELAY).await;
         prewarm_extended_dashboard_cache(db.clone(), cache.clone()).await;
 
         loop {
@@ -980,6 +986,7 @@ fn spawn_dashboard_cache_warmer(db: Db, cache: Arc<ApiCache>) {
 
 async fn prewarm_extended_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
     let started = Instant::now();
+    tracing::info!("warming extended chart cache");
     for chain in chains::supported_chains() {
         prewarm_chain_dashboard_cache(&db, &cache, chain.chain_id, PRESET_CHART_RANGES, false)
             .await;
@@ -1006,6 +1013,10 @@ async fn prewarm_chain_dashboard_cache(
             return;
         }
     };
+
+    for range in chart_ranges {
+        prewarm_chart_range(db, cache, chain_id, highest, range).await;
+    }
 
     if include_widgets {
         let aggregate_query = BucketQuery {
@@ -1079,10 +1090,6 @@ async fn prewarm_chain_dashboard_cache(
             Ok(recent) => cache.recent.insert(recent_key, recent).await,
             Err(err) => log_prewarm_error(chain_id, "recent deployments", err),
         }
-    }
-
-    for range in chart_ranges {
-        prewarm_chart_range(db, cache, chain_id, highest, range).await;
     }
 
     tracing::debug!(
