@@ -121,7 +121,6 @@ struct LoadInputs {
 
 #[derive(Debug)]
 struct VerifierAllianceInputs {
-    root: PathBuf,
     contract_deployments: Vec<PathBuf>,
     verified_contracts: Vec<PathBuf>,
 }
@@ -177,7 +176,6 @@ fn detect_verifier_alliance_inputs(root: Option<&Path>) -> Result<Option<Verifie
     }
 
     Ok(Some(VerifierAllianceInputs {
-        root: root.to_path_buf(),
         contract_deployments,
         verified_contracts,
     }))
@@ -1318,7 +1316,6 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(inputs.root, dir.path);
         assert_eq!(inputs.contract_deployments.len(), 1);
         assert_eq!(inputs.verified_contracts.len(), 1);
     }
