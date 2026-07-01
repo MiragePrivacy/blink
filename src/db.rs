@@ -1255,6 +1255,7 @@ impl Db {
             ALTER TABLE enrichment ADD COLUMN IF NOT EXISTS create_index UINTEGER;
             UPDATE enrichment SET chain_id = 1 WHERE chain_id IS NULL;
             CREATE INDEX IF NOT EXISTS enrichment_chain_addr_idx ON enrichment(chain_id, contract_address);
+            CREATE INDEX IF NOT EXISTS enrichment_chain_block_idx ON enrichment(chain_id, block_number);
             CREATE INDEX IF NOT EXISTS enrichment_verified_idx ON enrichment(is_verified);
             CREATE INDEX IF NOT EXISTS enrichment_source_idx    ON enrichment(verification_source);
 

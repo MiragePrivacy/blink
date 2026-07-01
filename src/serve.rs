@@ -57,7 +57,7 @@ struct AppState {
 }
 
 const API_CACHE_TTL: Duration = Duration::from_secs(600);
-const CACHE_WARMER_START_DELAY: Duration = Duration::from_secs(20);
+const TAIL_START_DELAY: Duration = Duration::from_secs(15);
 const DEFAULT_COMPILER_LIMIT: u32 = 12;
 const DEFAULT_RECENT_LIMIT: u32 = 20;
 const INITIAL_DEPLOYS_RANGE: &str = "day";
@@ -272,6 +272,25 @@ impl RuntimeState {
         }
     }
 
+    async fn mark_tail_ready(&self, chain_id: u64, block: Option<u64>) {
+        let mut snapshot = self.snapshot.lock().await;
+        let now = Some(Utc::now());
+        snapshot.tail_last_ok_at = now;
+        if let Some(block) = block {
+            snapshot.tail_last_block = Some(block);
+        }
+        snapshot.tail_last_rows = Some(0);
+        snapshot.tail_last_error = None;
+        snapshot.tail_last_error_at = None;
+
+        let chain = chain_runtime_snapshot_mut(&mut snapshot, chain_id);
+        chain.tail_last_ok_at = now;
+        chain.tail_last_block = block;
+        chain.tail_last_rows = Some(0);
+        chain.tail_last_error = None;
+        chain.tail_last_error_at = None;
+    }
+
     async fn mark_tail_error(&self, chain_id: Option<u64>, message: String) {
         let mut snapshot = self.snapshot.lock().await;
         snapshot.tail_running_count = snapshot.tail_running_count.saturating_sub(1);
@@ -309,6 +328,19 @@ fn chain_runtime_snapshot_mut(
     &mut snapshot.tail_chains[index]
 }
 
+async fn seed_runtime_snapshot(db: &Db, runtime: &RuntimeState) {
+    for chain in chains::supported_chains() {
+        match db.highest_contract_block(chain.chain_id).await {
+            Ok(block) => runtime.mark_tail_ready(chain.chain_id, block).await,
+            Err(err) => tracing::warn!(
+                "could not seed runtime state for chain_id={}: {:#}",
+                chain.chain_id,
+                err
+            ),
+        }
+    }
+}
+
 pub async fn run_serve(args: ServeArgs) -> Result<()> {
     if args.read_only && !args.rpc.is_empty() {
         tracing::warn!(
@@ -330,31 +362,13 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         args.tail_interval_secs.max(15),
     ));
     let cache = Arc::new(ApiCache::default());
+    prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
+    seed_runtime_snapshot(&db, &runtime).await;
     let state = AppState {
         db: db.clone(),
         runtime: runtime.clone(),
         cache: cache.clone(),
     };
-
-    spawn_dashboard_cache_warmer(db.clone(), cache.clone());
-
-    if !args.read_only {
-        for rpc in rpcs {
-            let db_bg = db.clone();
-            let config = TailLoopConfig {
-                rpc,
-                interval: Duration::from_secs(args.tail_interval_secs.max(15)),
-                confirmations: args.tail_confirmations,
-                batch_size: args.tail_batch_size,
-                max_concurrent: args.tail_max_concurrent_requests,
-                data_dir: args.data_dir.clone(),
-            };
-            let runtime_bg = runtime.clone();
-            tokio::spawn(async move {
-                background_tail_loop(db_bg, config, runtime_bg).await;
-            });
-        }
-    }
 
     let (api_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(stats_handler))
@@ -388,6 +402,18 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         .with_context(|| format!("bind {}", addr))?;
     tracing::info!("serving blink dashboard on http://{}", addr);
     tracing::info!(" data dir: {}", args.data_dir.display());
+    if !args.read_only {
+        spawn_tail_loops(
+            db.clone(),
+            runtime.clone(),
+            rpcs,
+            Duration::from_secs(args.tail_interval_secs.max(15)),
+            args.tail_confirmations,
+            args.tail_batch_size,
+            args.tail_max_concurrent_requests,
+            args.data_dir.clone(),
+        );
+    }
     axum::serve(listener, app)
         .await
         .context("axum server failed")
@@ -1039,11 +1065,33 @@ async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
     );
 }
 
-fn spawn_dashboard_cache_warmer(db: Db, cache: Arc<ApiCache>) {
-    tokio::spawn(async move {
-        tokio::time::sleep(CACHE_WARMER_START_DELAY).await;
-        prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
-    });
+fn spawn_tail_loops(
+    db: Db,
+    runtime: Arc<RuntimeState>,
+    rpcs: Vec<String>,
+    interval: Duration,
+    confirmations: u64,
+    batch_size: usize,
+    max_concurrent: usize,
+    data_dir: std::path::PathBuf,
+) {
+    for rpc in rpcs {
+        let db_bg = db.clone();
+        let runtime_bg = runtime.clone();
+        let data_dir = data_dir.clone();
+        let config = TailLoopConfig {
+            rpc,
+            interval,
+            confirmations,
+            batch_size,
+            max_concurrent,
+            data_dir,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(TAIL_START_DELAY).await;
+            background_tail_loop(db_bg, config, runtime_bg).await;
+        });
+    }
 }
 
 async fn prewarm_chain_dashboard_cache(
