@@ -151,7 +151,7 @@ pub async fn tail_once(
         })?;
     }
 
-    db.refresh_contracts_view().await?;
+    db.refresh().await?;
 
     let size_bytes = std::fs::metadata(&output_path).ok().map(|m| m.len());
     Ok(Some(ChunkReport {

@@ -193,4 +193,14 @@ pub struct ServeArgs {
     /// Background extraction max concurrent HTTP requests
     #[arg(long, default_value_t = 16)]
     pub tail_max_concurrent_requests: usize,
+    /// DuckDB memory limit for the dashboard database, e.g. "2GB".
+    /// Recommended on small hosts; DuckDB otherwise assumes 80% of RAM.
+    #[arg(long, env = "BLINK_DB_MEMORY_LIMIT")]
+    pub db_memory_limit: Option<String>,
+    /// DuckDB thread count for the dashboard database
+    #[arg(long, env = "BLINK_DB_THREADS")]
+    pub db_threads: Option<u64>,
+    /// Read connections serving dashboard queries (0 = auto-size from cores)
+    #[arg(long, env = "BLINK_DB_READERS", default_value_t = 0)]
+    pub db_readers: usize,
 }

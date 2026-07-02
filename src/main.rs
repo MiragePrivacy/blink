@@ -1,20 +1,9 @@
 //! `blink` binary entry point.
 
-mod blocks;
-mod chains;
-mod cli;
-mod db;
-mod decode;
-mod extract;
-mod load;
-mod serve;
-mod types;
-mod util;
-
 use anyhow::Result;
 use tracing_subscriber::{fmt::time::ChronoLocal, EnvFilter};
 
-use crate::extract::run_contracts;
+use blink::{cli, decode, extract::run_contracts, load, serve};
 
 #[tokio::main]
 async fn main() -> Result<()> {

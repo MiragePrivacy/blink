@@ -1,4 +1,4 @@
-mod batch;
+pub mod batch;
 mod parquet_io;
 pub(crate) mod tail;
 mod traces;

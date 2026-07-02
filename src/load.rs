@@ -112,17 +112,17 @@ fn run_load_blocking(args: LoadArgs) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct LoadInputs {
-    csv_contracts: PathBuf,
-    csv_bytecodes: PathBuf,
-    has_normalized_csv: bool,
-    parquet_files: Vec<PathBuf>,
+pub struct LoadInputs {
+    pub csv_contracts: PathBuf,
+    pub csv_bytecodes: PathBuf,
+    pub has_normalized_csv: bool,
+    pub parquet_files: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
-struct VerifierAllianceInputs {
-    contract_deployments: Vec<PathBuf>,
-    verified_contracts: Vec<PathBuf>,
+pub struct VerifierAllianceInputs {
+    pub contract_deployments: Vec<PathBuf>,
+    pub verified_contracts: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +134,7 @@ struct VaFileEntry {
     modified_unix_ns: i64,
 }
 
-fn detect_inputs(contracts_dir: &Path, contracts_glob: &str) -> Result<LoadInputs> {
+pub fn detect_inputs(contracts_dir: &Path, contracts_glob: &str) -> Result<LoadInputs> {
     let csv_contracts = contracts_dir.join("contracts.csv");
     let csv_bytecodes = contracts_dir.join("bytecodes.csv");
     let has_normalized_csv = csv_contracts.is_file() && csv_bytecodes.is_file();
@@ -148,7 +148,9 @@ fn detect_inputs(contracts_dir: &Path, contracts_glob: &str) -> Result<LoadInput
     })
 }
 
-fn detect_verifier_alliance_inputs(root: Option<&Path>) -> Result<Option<VerifierAllianceInputs>> {
+pub fn detect_verifier_alliance_inputs(
+    root: Option<&Path>,
+) -> Result<Option<VerifierAllianceInputs>> {
     let Some(root) = root else {
         return Ok(None);
     };
@@ -181,7 +183,7 @@ fn detect_verifier_alliance_inputs(root: Option<&Path>) -> Result<Option<Verifie
     }))
 }
 
-fn load_parquet_links(
+pub fn load_parquet_links(
     contracts_dir: &Path,
     data_dir: &Path,
     files: &[PathBuf],
@@ -272,7 +274,7 @@ fn same_canonical(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn list_parquet_files(dir: &Path, glob: &str) -> Result<Vec<PathBuf>> {
+pub fn list_parquet_files(dir: &Path, glob: &str) -> Result<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("read dir {}", dir.display()))?
         .filter_map(|e| e.ok())
@@ -313,6 +315,11 @@ fn load_normalized_csvs(
     }
 
     if overwrite {
+        // The snapshot is about to be rebuilt: subtract its rows from the
+        // deployment rollups so the next `blink serve` re-ingests the new
+        // data instead of trusting the stale `zellic://contracts` source.
+        crate::db::invalidate_zellic_rollups(&conn)
+            .context("invalidate zellic deployment rollups")?;
         conn.execute_batch(
             r#"
             DROP TABLE IF EXISTS zellic_bytecode_counts;
@@ -1191,150 +1198,4 @@ where
         .map(|value| format!("('{}')", value.as_ref().replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{
-        fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    struct TestDir {
-        path: PathBuf,
-    }
-
-    impl TestDir {
-        fn new(name: &str) -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "blink_load_test_{}_{}_{}",
-                std::process::id(),
-                name,
-                unique
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self { path }
-        }
-
-        fn touch(&self, name: &str) -> PathBuf {
-            let path = self.path.join(name);
-            fs::write(&path, []).unwrap();
-            path
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn names(paths: &[PathBuf]) -> Vec<String> {
-        paths
-            .iter()
-            .map(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap()
-                    .to_string()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn detect_inputs_requires_both_csv_files_for_csv_load() {
-        let dir = TestDir::new("csv_pair");
-        dir.touch("contracts.csv");
-
-        let inputs = detect_inputs(&dir.path, "*.parquet").unwrap();
-
-        assert!(!inputs.has_normalized_csv);
-        assert!(inputs.parquet_files.is_empty());
-
-        dir.touch("bytecodes.csv");
-        let inputs = detect_inputs(&dir.path, "*.parquet").unwrap();
-
-        assert!(inputs.has_normalized_csv);
-        assert_eq!(inputs.csv_contracts, dir.path.join("contracts.csv"));
-        assert_eq!(inputs.csv_bytecodes, dir.path.join("bytecodes.csv"));
-    }
-
-    #[test]
-    fn list_parquet_files_filters_hidden_and_non_matching_files() {
-        let dir = TestDir::new("parquet_filter");
-        dir.touch("b.parquet");
-        dir.touch("a.parquet");
-        dir.touch(".hidden.parquet");
-        dir.touch("contracts.csv");
-        dir.touch("notes.txt");
-
-        let files = list_parquet_files(&dir.path, "*.parquet").unwrap();
-
-        assert_eq!(names(&files), vec!["a.parquet", "b.parquet"]);
-    }
-
-    #[test]
-    fn detect_inputs_applies_parquet_glob() {
-        let dir = TestDir::new("parquet_glob");
-        dir.touch("ethereum__contracts__1_to_2.parquet");
-        dir.touch("other__contracts__1_to_2.parquet");
-
-        let inputs = detect_inputs(&dir.path, "ethereum__*.parquet").unwrap();
-
-        assert_eq!(
-            names(&inputs.parquet_files),
-            vec!["ethereum__contracts__1_to_2.parquet"]
-        );
-    }
-
-    #[test]
-    fn detect_verifier_alliance_inputs_requires_both_tables() {
-        let dir = TestDir::new("va_missing_table");
-        fs::create_dir_all(dir.path.join("contract_deployments")).unwrap();
-
-        let err = detect_verifier_alliance_inputs(Some(&dir.path)).unwrap_err();
-
-        assert!(err.to_string().contains("--va needs both"));
-    }
-
-    #[test]
-    fn detect_verifier_alliance_inputs_finds_required_parquet_files() {
-        let dir = TestDir::new("va_tables");
-        let deployments = dir.path.join("contract_deployments");
-        let verifications = dir.path.join("verified_contracts");
-        fs::create_dir_all(&deployments).unwrap();
-        fs::create_dir_all(&verifications).unwrap();
-        fs::write(deployments.join("contract_deployments_0_1.parquet"), []).unwrap();
-        fs::write(verifications.join("verified_contracts_0_1.parquet"), []).unwrap();
-
-        let inputs = detect_verifier_alliance_inputs(Some(&dir.path))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(inputs.contract_deployments.len(), 1);
-        assert_eq!(inputs.verified_contracts.len(), 1);
-    }
-
-    #[test]
-    fn load_parquet_links_creates_symlinks_without_copying() {
-        let src = TestDir::new("link_src");
-        let dst = TestDir::new("link_dst");
-        let parquet = src.touch("contracts__0000000001__0000000002.parquet");
-
-        load_parquet_links(&src.path, &dst.path, std::slice::from_ref(&parquet), false).unwrap();
-
-        let linked = dst.path.join("contracts__0000000001__0000000002.parquet");
-        let metadata = fs::symlink_metadata(&linked).unwrap();
-        assert!(metadata.file_type().is_symlink());
-        assert_eq!(
-            fs::canonicalize(linked).unwrap(),
-            fs::canonicalize(parquet).unwrap()
-        );
-    }
 }

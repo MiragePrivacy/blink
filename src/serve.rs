@@ -5,6 +5,12 @@
 //! - repeated `--rpc URL` flags poll one or more chain heads and extract
 //!   newly produced blocks into separate `tail__chain_*` parquet files.
 //!
+//! Serving model: every cacheable endpoint is stale-while-revalidate. A
+//! cached entry is returned immediately no matter its age; entries past
+//! their TTL trigger a background refresh (deduplicated per key). Combined
+//! with the rollup tables in `db`, cold misses are native-table queries, so
+//! the server starts serving instantly and warms itself in the background.
+//!
 //! Endpoints (all return JSON):
 //! - `GET /api/stats` — totals, verified pct, last block, verification coverage.
 //! - `GET /api/runtime` — serve-mode flags and background loop health.
@@ -16,26 +22,31 @@
 //! - `POST /api/query` — read-only SQL over dashboard query views.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     hash::Hash,
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Query, State},
+    extract::{Query, Request, State},
     http::{HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Json},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::get,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::Mutex};
 use tower_http::{
+    compression::CompressionLayer,
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
@@ -47,7 +58,7 @@ use crate::{
     blocks::blocks_per_day,
     chains::{self, ChainInfo},
     cli::ServeArgs,
-    db::{Db, RecentCursor},
+    db::{Db, DbOptions, RecentCursor},
 };
 
 #[derive(Clone)]
@@ -55,9 +66,111 @@ struct AppState {
     db: Db,
     runtime: Arc<RuntimeState>,
     cache: Arc<ApiCache>,
+    latency: Arc<LatencyStats>,
+}
+
+/// Upper bounds (ms) of the API latency histogram buckets; the last bucket is
+/// open-ended.
+const LATENCY_BUCKET_UPPER_MS: [u64; 11] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 5000];
+const SLOW_REQUEST_LOG_THRESHOLD: Duration = Duration::from_millis(1000);
+
+/// Lock-free rolling latency histogram over every `/api/*` response since
+/// startup. Answers "are we actually fast in production?" via `/api/runtime`.
+#[derive(Default)]
+struct LatencyStats {
+    buckets: [AtomicU64; LATENCY_BUCKET_UPPER_MS.len() + 1],
+    requests: AtomicU64,
+    total_micros: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, ToSchema)]
+struct LatencySnapshot {
+    requests: u64,
+    avg_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+}
+
+impl LatencyStats {
+    fn record(&self, elapsed: Duration) {
+        let ms = elapsed.as_millis() as u64;
+        let idx = LATENCY_BUCKET_UPPER_MS
+            .iter()
+            .position(|upper| ms <= *upper)
+            .unwrap_or(LATENCY_BUCKET_UPPER_MS.len());
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.total_micros
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    fn percentile(&self, counts: &[u64], total: u64, q: f64) -> f64 {
+        if total == 0 {
+            return 0.0;
+        }
+        let target = (total as f64 * q).ceil() as u64;
+        let mut cumulative = 0u64;
+        for (idx, count) in counts.iter().enumerate() {
+            cumulative += count;
+            if cumulative >= target {
+                return LATENCY_BUCKET_UPPER_MS
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(LATENCY_BUCKET_UPPER_MS[LATENCY_BUCKET_UPPER_MS.len() - 1] * 2)
+                    as f64;
+            }
+        }
+        0.0
+    }
+
+    fn snapshot(&self) -> LatencySnapshot {
+        let counts: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect();
+        let requests = self.requests.load(Ordering::Relaxed);
+        let avg_ms = if requests == 0 {
+            0.0
+        } else {
+            self.total_micros.load(Ordering::Relaxed) as f64 / requests as f64 / 1000.0
+        };
+        LatencySnapshot {
+            requests,
+            avg_ms,
+            p50_ms: self.percentile(&counts, requests, 0.50),
+            p95_ms: self.percentile(&counts, requests, 0.95),
+            p99_ms: self.percentile(&counts, requests, 0.99),
+        }
+    }
+}
+
+/// Record latency for every API request; anything past the slow threshold is
+/// logged so regressions surface in the journal, not just in percentiles.
+async fn track_latency(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let path_is_api = req.uri().path().starts_with("/api/");
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = Instant::now();
+    let response = next.run(req).await;
+    if path_is_api {
+        let elapsed = started.elapsed();
+        state.latency.record(elapsed);
+        if elapsed >= SLOW_REQUEST_LOG_THRESHOLD {
+            tracing::warn!(
+                "slow dashboard request: {} {} took {:.1}ms",
+                method,
+                path,
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+    }
+    response
 }
 
 const API_CACHE_TTL: Duration = Duration::from_secs(600);
+const HIGHEST_BLOCK_TTL: Duration = Duration::from_secs(5);
 const TAIL_START_DELAY: Duration = Duration::from_secs(15);
 const DEFAULT_COMPILER_LIMIT: u32 = 12;
 const DEFAULT_RECENT_LIMIT: u32 = 20;
@@ -82,10 +195,11 @@ struct ApiCache {
     recent: CacheMap<RecentCacheKey, crate::db::RecentPage>,
     languages: CacheMap<u64, Vec<crate::db::LanguageCount>>,
     standards: CacheMap<RangeCacheKey, crate::db::StandardsBreakdown>,
+    highest_blocks: CacheMap<u64, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct BucketCacheKey {
+pub struct BucketCacheKey {
     chain_id: u64,
     bucket: u64,
     start_block: Option<u64>,
@@ -93,7 +207,7 @@ struct BucketCacheKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct RangeCacheKey {
+pub struct RangeCacheKey {
     chain_id: u64,
     bucket: Option<u64>,
     start_block: Option<u64>,
@@ -117,60 +231,111 @@ struct RecentCacheKey {
     before_create_index: Option<u64>,
 }
 
+/// Stale-while-revalidate cache: reads never block on the database once a key
+/// has been populated. Expired entries are served as-is while a single
+/// background task (per key) refreshes them.
 struct CacheMap<K, V> {
-    values: Mutex<HashMap<K, (Instant, V)>>,
+    inner: Arc<CacheMapInner<K, V>>,
+}
+
+struct CacheMapInner<K, V> {
+    values: StdMutex<HashMap<K, (Instant, V)>>,
+    refreshing: StdMutex<HashSet<K>>,
+}
+
+impl<K, V> Clone for CacheMap<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<K, V> Default for CacheMap<K, V> {
     fn default() -> Self {
         Self {
-            values: Mutex::new(HashMap::new()),
+            inner: Arc::new(CacheMapInner {
+                values: StdMutex::new(HashMap::new()),
+                refreshing: StdMutex::new(HashSet::new()),
+            }),
         }
     }
 }
 
 impl<K, V> CacheMap<K, V>
 where
-    K: Copy + Eq + Hash,
-    V: Clone,
+    K: Copy + Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
 {
-    async fn get_or_try_update<F>(&self, key: K, ttl: Duration, future: F) -> Result<V>
+    async fn get_or_refresh<F, Fut>(&self, key: K, ttl: Duration, make: F) -> Result<V>
     where
-        F: Future<Output = Result<V>>,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<V>> + Send + 'static,
     {
-        {
-            let guard = self.values.lock().await;
-            if let Some((stored_at, value)) = guard.get(&key) {
-                if stored_at.elapsed() > ttl {
-                    tracing::debug!("serving stale dashboard cache entry");
-                }
-                return Ok(value.clone());
+        let cached = {
+            let values = self.inner.values.lock().expect("cache map poisoned");
+            values
+                .get(&key)
+                .map(|(at, value)| (at.elapsed(), value.clone()))
+        };
+        if let Some((age, value)) = cached {
+            if age > ttl && self.begin_refresh(key) {
+                let this = self.clone();
+                let refresh = make();
+                tokio::spawn(async move {
+                    match refresh.await {
+                        Ok(fresh) => this.insert(key, fresh),
+                        Err(err) => {
+                            tracing::warn!("background dashboard cache refresh failed: {:#}", err)
+                        }
+                    }
+                    this.end_refresh(&key);
+                });
             }
+            return Ok(value);
         }
 
-        let value = future.await?;
-        self.insert(key, value.clone()).await;
+        let value = make().await?;
+        self.insert(key, value.clone());
         Ok(value)
     }
 
-    async fn insert(&self, key: K, value: V) {
-        self.values
+    fn insert(&self, key: K, value: V) {
+        self.inner
+            .values
             .lock()
-            .await
+            .expect("cache map poisoned")
             .insert(key, (Instant::now(), value));
     }
 
-    async fn get(&self, key: K) -> Option<V> {
-        self.values
+    fn get(&self, key: &K) -> Option<V> {
+        self.inner
+            .values
             .lock()
-            .await
-            .get(&key)
+            .expect("cache map poisoned")
+            .get(key)
             .map(|(_, value)| value.clone())
+    }
+
+    fn begin_refresh(&self, key: K) -> bool {
+        self.inner
+            .refreshing
+            .lock()
+            .expect("cache map poisoned")
+            .insert(key)
+    }
+
+    fn end_refresh(&self, key: &K) {
+        self.inner
+            .refreshing
+            .lock()
+            .expect("cache map poisoned")
+            .remove(key);
     }
 }
 
 #[derive(Debug)]
-struct RuntimeState {
+pub struct RuntimeState {
     read_only: bool,
     tail_enabled: bool,
     tail_interval_secs: u64,
@@ -178,36 +343,36 @@ struct RuntimeState {
 }
 
 #[derive(Debug, Default, Clone, Serialize, ToSchema)]
-struct RuntimeSnapshot {
-    tail_running: bool,
-    tail_running_count: u64,
-    tail_last_ok_at: Option<DateTime<Utc>>,
-    tail_last_block: Option<u64>,
-    tail_last_rows: Option<u64>,
-    tail_last_error_at: Option<DateTime<Utc>>,
-    tail_last_error: Option<String>,
-    tail_chains: Vec<ChainRuntimeSnapshot>,
+pub struct RuntimeSnapshot {
+    pub tail_running: bool,
+    pub tail_running_count: u64,
+    pub tail_last_ok_at: Option<DateTime<Utc>>,
+    pub tail_last_block: Option<u64>,
+    pub tail_last_rows: Option<u64>,
+    pub tail_last_error_at: Option<DateTime<Utc>>,
+    pub tail_last_error: Option<String>,
+    pub tail_chains: Vec<ChainRuntimeSnapshot>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, ToSchema)]
-struct ChainRuntimeSnapshot {
-    chain_id: u64,
-    tail_running: bool,
-    tail_running_count: u64,
-    tail_last_ok_at: Option<DateTime<Utc>>,
-    tail_last_block: Option<u64>,
-    tail_last_rows: Option<u64>,
-    tail_last_error_at: Option<DateTime<Utc>>,
-    tail_last_error: Option<String>,
+pub struct ChainRuntimeSnapshot {
+    pub chain_id: u64,
+    pub tail_running: bool,
+    pub tail_running_count: u64,
+    pub tail_last_ok_at: Option<DateTime<Utc>>,
+    pub tail_last_block: Option<u64>,
+    pub tail_last_rows: Option<u64>,
+    pub tail_last_error_at: Option<DateTime<Utc>>,
+    pub tail_last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-struct RuntimeResponse {
-    read_only: bool,
-    tail_enabled: bool,
-    tail_interval_secs: u64,
+pub struct RuntimeResponse {
+    pub read_only: bool,
+    pub tail_enabled: bool,
+    pub tail_interval_secs: u64,
     #[serde(flatten)]
-    snapshot: RuntimeSnapshot,
+    pub snapshot: RuntimeSnapshot,
 }
 
 struct TailLoopConfig {
@@ -229,7 +394,7 @@ struct TailLoopSettings {
 }
 
 impl RuntimeState {
-    fn new(read_only: bool, tail_enabled: bool, tail_interval_secs: u64) -> Self {
+    pub fn new(read_only: bool, tail_enabled: bool, tail_interval_secs: u64) -> Self {
         Self {
             read_only,
             tail_enabled,
@@ -238,7 +403,7 @@ impl RuntimeState {
         }
     }
 
-    async fn response(&self) -> RuntimeResponse {
+    pub async fn response(&self) -> RuntimeResponse {
         RuntimeResponse {
             read_only: self.read_only,
             tail_enabled: self.tail_enabled,
@@ -247,7 +412,7 @@ impl RuntimeState {
         }
     }
 
-    async fn mark_tail_start(&self, chain_id: Option<u64>) {
+    pub async fn mark_tail_start(&self, chain_id: Option<u64>) {
         let mut snapshot = self.snapshot.lock().await;
         if updates_default_runtime(chain_id) && snapshot.tail_last_ok_at.is_none() {
             snapshot.tail_running_count = snapshot.tail_running_count.saturating_add(1);
@@ -262,7 +427,7 @@ impl RuntimeState {
         }
     }
 
-    async fn mark_tail_ok(&self, chain_id: Option<u64>, end_block: Option<u64>, rows: u64) {
+    pub async fn mark_tail_ok(&self, chain_id: Option<u64>, end_block: Option<u64>, rows: u64) {
         let mut snapshot = self.snapshot.lock().await;
         let now = Some(Utc::now());
         if updates_default_runtime(chain_id) {
@@ -290,7 +455,7 @@ impl RuntimeState {
         }
     }
 
-    async fn mark_tail_ready(&self, chain_id: u64, block: Option<u64>) {
+    pub async fn mark_tail_ready(&self, chain_id: u64, block: Option<u64>) {
         let mut snapshot = self.snapshot.lock().await;
         let now = Some(Utc::now());
         if updates_default_runtime(Some(chain_id)) {
@@ -311,7 +476,7 @@ impl RuntimeState {
         chain.tail_last_error_at = None;
     }
 
-    async fn mark_tail_error(&self, chain_id: Option<u64>, message: String) {
+    pub async fn mark_tail_error(&self, chain_id: Option<u64>, message: String) {
         let mut snapshot = self.snapshot.lock().await;
         let now = Some(Utc::now());
         if updates_default_runtime(chain_id) {
@@ -374,7 +539,16 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
             "--read-only is set; ignoring --rpc values (background extraction requires a write lock)"
         );
     }
-    let db = Db::open_with_mode(&args.data_dir, &args.contracts_glob, args.read_only)?;
+    let db = Db::open(
+        &args.data_dir,
+        &args.contracts_glob,
+        DbOptions {
+            read_only: args.read_only,
+            memory_limit: args.db_memory_limit.clone(),
+            threads: args.db_threads,
+            readers: args.db_readers,
+        },
+    )?;
     let rpcs = args
         .rpc
         .iter()
@@ -389,12 +563,15 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         args.tail_interval_secs.max(15),
     ));
     let cache = Arc::new(ApiCache::default());
-    prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
     seed_runtime_snapshot(&db, &runtime).await;
+    // Rollup-backed queries are fast enough to serve cold, so warming happens
+    // off the startup path — the listener binds immediately.
+    tokio::spawn(prewarm_initial_dashboard_cache(db.clone(), cache.clone()));
     let state = AppState {
         db: db.clone(),
         runtime: runtime.clone(),
         cache: cache.clone(),
+        latency: Arc::new(LatencyStats::default()),
     };
 
     let (api_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
@@ -416,8 +593,10 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     let app = api_router
         .route("/openapi.json", get(|| async { openapi_json }))
         .merge(Scalar::with_url("/scalar", api))
+        .layer(CompressionLayer::new())
         .layer(dashboard_cors_layer())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(state.clone(), track_latency))
         .with_state(state);
 
     let addr: SocketAddr = args
@@ -503,6 +682,17 @@ fn selected_chain_id(chain_id: Option<u64>) -> u64 {
     chain_id.unwrap_or_else(chains::default_chain_id)
 }
 
+async fn cached_highest_block(state: &AppState, chain_id: u64) -> Result<u64> {
+    let db = state.db.clone();
+    state
+        .cache
+        .highest_blocks
+        .get_or_refresh(chain_id, HIGHEST_BLOCK_TTL, move || async move {
+            Ok(db.highest_contract_block(chain_id).await?.unwrap_or(0))
+        })
+        .await
+}
+
 #[derive(Serialize, ToSchema)]
 struct ChainsResponse {
     chains: Vec<ChainInfo>,
@@ -537,50 +727,64 @@ async fn stats_handler(
     Query(q): Query<ChainQuery>,
 ) -> Result<Json<crate::db::Stats>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
+    let db = state.db.clone();
     let stats = state
         .cache
         .stats
-        .get_or_try_update(chain_id, API_CACHE_TTL, state.db.stats(chain_id))
+        .get_or_refresh(chain_id, API_CACHE_TTL, move || async move {
+            db.stats(chain_id).await
+        })
         .await?;
     Ok(Json(stats))
+}
+
+#[derive(Serialize, ToSchema)]
+struct RuntimeApiResponse {
+    #[serde(flatten)]
+    runtime: RuntimeResponse,
+    /// Rolling latency of every `/api/*` request since startup.
+    api_latency: LatencySnapshot,
 }
 
 #[utoipa::path(
     get,
     path = "/api/runtime",
     tag = API_TAG,
-    responses((status = OK, body = RuntimeResponse))
+    responses((status = OK, body = RuntimeApiResponse))
 )]
-async fn runtime_handler(State(state): State<AppState>) -> Json<RuntimeResponse> {
-    Json(state.runtime.response().await)
+async fn runtime_handler(State(state): State<AppState>) -> Json<RuntimeApiResponse> {
+    Json(RuntimeApiResponse {
+        runtime: state.runtime.response().await,
+        api_latency: state.latency.snapshot(),
+    })
 }
 
 #[derive(Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
-struct BucketQuery {
+pub struct BucketQuery {
     /// Chain ID to query. Defaults to Ethereum mainnet (1).
-    chain_id: Option<u64>,
+    pub chain_id: Option<u64>,
     /// Optional internal aggregation bucket: `hour`, `day`, `week`, `month`, `year`, or raw block count.
     #[serde(default)]
-    bucket: Option<String>,
+    pub bucket: Option<String>,
     /// Visible time range: `hour`, `day`, `week`, `month`, or `year`.
     #[serde(default)]
-    range: Option<String>,
+    pub range: Option<String>,
     /// Optional block number where the visible range should end. Defaults to the latest indexed block.
     #[serde(default)]
-    end_block: Option<u64>,
+    pub end_block: Option<u64>,
     /// Optional block number where the visible range should start.
     #[serde(default)]
-    start_block: Option<u64>,
+    pub start_block: Option<u64>,
     /// Optional ISO-8601 timestamp where the visible range should start.
     #[serde(default)]
-    start_time: Option<DateTime<Utc>>,
+    pub start_time: Option<DateTime<Utc>>,
     /// Optional ISO-8601 timestamp where the visible range should end.
     #[serde(default)]
-    end_time: Option<DateTime<Utc>>,
+    pub end_time: Option<DateTime<Utc>>,
     /// Maximum number of compiler versions to return.
     #[serde(default)]
-    limit: Option<u32>,
+    pub limit: Option<u32>,
 }
 
 fn relative_range_code(range: &str) -> u64 {
@@ -621,7 +825,11 @@ fn normalized_cache_range(
     )
 }
 
-fn bucket_cache_key(chain_id: u64, q: &BucketQuery, window: TimeSeriesWindow) -> BucketCacheKey {
+pub fn bucket_cache_key(
+    chain_id: u64,
+    q: &BucketQuery,
+    window: TimeSeriesWindow,
+) -> BucketCacheKey {
     let (_, start_block, end_block) = normalized_cache_range(q, window, window.bucket_blocks);
     BucketCacheKey {
         chain_id,
@@ -631,7 +839,7 @@ fn bucket_cache_key(chain_id: u64, q: &BucketQuery, window: TimeSeriesWindow) ->
     }
 }
 
-fn range_cache_key_for_query(
+pub fn range_cache_key_for_query(
     chain_id: u64,
     q: &BucketQuery,
     window: TimeSeriesWindow,
@@ -646,9 +854,9 @@ fn range_cache_key_for_query(
 }
 
 #[derive(Clone, Copy)]
-struct TimeSeriesWindow {
-    bucket_blocks: u64,
-    block_range: Option<(u64, u64)>,
+pub struct TimeSeriesWindow {
+    pub bucket_blocks: u64,
+    pub block_range: Option<(u64, u64)>,
 }
 
 fn parse_bucket_value(bucket: Option<&str>, chain_id: u64, anchor_block: u64) -> u64 {
@@ -664,7 +872,11 @@ fn parse_bucket_value(bucket: Option<&str>, chain_id: u64, anchor_block: u64) ->
     }
 }
 
-fn parse_time_series_window(q: &BucketQuery, chain_id: u64, anchor_block: u64) -> TimeSeriesWindow {
+pub fn parse_time_series_window(
+    q: &BucketQuery,
+    chain_id: u64,
+    anchor_block: u64,
+) -> TimeSeriesWindow {
     let blocks_per_day = blocks_per_day(chain_id, anchor_block).max(1);
     let explicit_end = q.end_block.or_else(|| {
         q.end_time
@@ -749,23 +961,17 @@ async fn deploys_handler(
     Query(q): Query<BucketQuery>,
 ) -> Result<Json<DeploysResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
-    let highest = state
-        .db
-        .highest_contract_block(chain_id)
-        .await?
-        .unwrap_or(0);
+    let highest = cached_highest_block(&state, chain_id).await?;
     let window = parse_time_series_window(&q, chain_id, highest);
     let cache_key = bucket_cache_key(chain_id, &q, window);
+    let db = state.db.clone();
     let buckets = state
         .cache
         .deploys
-        .get_or_try_update(
-            cache_key,
-            API_CACHE_TTL,
-            state
-                .db
-                .deploys_over_time(chain_id, window.bucket_blocks, window.block_range),
-        )
+        .get_or_refresh(cache_key, API_CACHE_TTL, move || async move {
+            db.deploys_over_time(chain_id, window.bucket_blocks, window.block_range)
+                .await
+        })
         .await?;
     Ok(Json(DeploysResponse {
         bucket_blocks: window.bucket_blocks,
@@ -791,23 +997,17 @@ async fn verified_handler(
     Query(q): Query<BucketQuery>,
 ) -> Result<Json<VerifiedResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
-    let highest = state
-        .db
-        .highest_contract_block(chain_id)
-        .await?
-        .unwrap_or(0);
+    let highest = cached_highest_block(&state, chain_id).await?;
     let window = parse_time_series_window(&q, chain_id, highest);
     let cache_key = bucket_cache_key(chain_id, &q, window);
+    let db = state.db.clone();
     let buckets = state
         .cache
         .verified
-        .get_or_try_update(
-            cache_key,
-            API_CACHE_TTL,
-            state
-                .db
-                .verified_ratio_over_time(chain_id, window.bucket_blocks, window.block_range),
-        )
+        .get_or_refresh(cache_key, API_CACHE_TTL, move || async move {
+            db.verified_ratio_over_time(chain_id, window.bucket_blocks, window.block_range)
+                .await
+        })
         .await?;
     Ok(Json(VerifiedResponse {
         bucket_blocks: window.bucket_blocks,
@@ -834,23 +1034,17 @@ async fn bytecode_sizes_handler(
 ) -> Result<Json<SizeResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
     default_aggregate_window(&mut q);
-    let highest = state
-        .db
-        .highest_contract_block(chain_id)
-        .await?
-        .unwrap_or(0);
+    let highest = cached_highest_block(&state, chain_id).await?;
     let window = parse_time_series_window(&q, chain_id, highest);
     let cache_key = range_cache_key_for_query(chain_id, &q, window);
+    let db = state.db.clone();
     let bins_out = state
         .cache
         .bytecode_sizes
-        .get_or_try_update(
-            cache_key,
-            API_CACHE_TTL,
-            state
-                .db
-                .bytecode_size_distribution(chain_id, window.block_range),
-        )
+        .get_or_refresh(cache_key, API_CACHE_TTL, move || async move {
+            db.bytecode_size_distribution(chain_id, window.block_range)
+                .await
+        })
         .await?;
     Ok(Json(SizeResponse { bins: bins_out }))
 }
@@ -885,11 +1079,7 @@ async fn compilers_handler(
     let chain_id = selected_chain_id(q.chain_id);
     default_aggregate_window(&mut q);
     let limit = q.limit.unwrap_or(DEFAULT_COMPILER_LIMIT);
-    let highest = state
-        .db
-        .highest_contract_block(chain_id)
-        .await?
-        .unwrap_or(0);
+    let highest = cached_highest_block(&state, chain_id).await?;
     let window = parse_time_series_window(&q, chain_id, highest);
     let (bucket, start_block, end_block) = normalized_cache_range(&q, window, window.bucket_blocks);
     let cache_key = LimitRangeCacheKey {
@@ -899,18 +1089,15 @@ async fn compilers_handler(
         start_block,
         end_block,
     };
+    let db = state.db.clone();
     let (compilers, total_known) = state
         .cache
         .compilers
-        .get_or_try_update(cache_key, API_CACHE_TTL, async {
+        .get_or_refresh(cache_key, API_CACHE_TTL, move || async move {
             Ok((
-                state
-                    .db
-                    .top_compilers(chain_id, limit, window.block_range)
+                db.top_compilers(chain_id, limit, window.block_range)
                     .await?,
-                state
-                    .db
-                    .compiler_version_total(chain_id, window.block_range)
+                db.compiler_version_total(chain_id, window.block_range)
                     .await?,
             ))
         })
@@ -950,14 +1137,13 @@ async fn recent_handler(
         }),
         _ => None,
     };
+    let db = state.db.clone();
     let page = match state
         .cache
         .recent
-        .get_or_try_update(
-            cache_key,
-            API_CACHE_TTL,
-            state.db.recent_contracts(chain_id, limit, cursor),
-        )
+        .get_or_refresh(cache_key, API_CACHE_TTL, move || async move {
+            db.recent_contracts(chain_id, limit, cursor).await
+        })
         .await
     {
         Ok(page) => page,
@@ -966,8 +1152,7 @@ async fn recent_handler(
             state
                 .cache
                 .recent
-                .get(cache_key)
-                .await
+                .get(&cache_key)
                 .unwrap_or(crate::db::RecentPage {
                     contracts: Vec::new(),
                     has_more: false,
@@ -1033,14 +1218,13 @@ async fn languages_handler(
     Query(q): Query<ChainQuery>,
 ) -> Result<Json<LanguagesResponse>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
+    let db = state.db.clone();
     let languages = state
         .cache
         .languages
-        .get_or_try_update(
-            chain_id,
-            API_CACHE_TTL,
-            state.db.language_distribution(chain_id),
-        )
+        .get_or_refresh(chain_id, API_CACHE_TTL, move || async move {
+            db.language_distribution(chain_id).await
+        })
         .await?;
     Ok(Json(LanguagesResponse { languages }))
 }
@@ -1061,21 +1245,16 @@ async fn standards_handler(
 ) -> Result<Json<crate::db::StandardsBreakdown>, AppError> {
     let chain_id = selected_chain_id(q.chain_id);
     default_aggregate_window(&mut q);
-    let highest = state
-        .db
-        .highest_contract_block(chain_id)
-        .await?
-        .unwrap_or(0);
+    let highest = cached_highest_block(&state, chain_id).await?;
     let window = parse_time_series_window(&q, chain_id, highest);
     let cache_key = range_cache_key_for_query(chain_id, &q, window);
+    let db = state.db.clone();
     let standards = state
         .cache
         .standards
-        .get_or_try_update(
-            cache_key,
-            API_CACHE_TTL,
-            state.db.standards_breakdown(chain_id, window.block_range),
-        )
+        .get_or_refresh(cache_key, API_CACHE_TTL, move || async move {
+            db.standards_breakdown(chain_id, window.block_range).await
+        })
         .await?;
     Ok(Json(standards))
 }
@@ -1123,7 +1302,7 @@ struct LanguagesResponse {
 
 async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
     let started = Instant::now();
-    tracing::info!("warming initial dashboard cache");
+    tracing::info!("warming dashboard cache in background");
     for chain in chains::supported_chains() {
         prewarm_chain_dashboard_cache(
             &db,
@@ -1135,7 +1314,7 @@ async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
         .await;
     }
     tracing::info!(
-        "initial dashboard cache warmed in {:.1}s",
+        "dashboard cache warmed in {:.1}s",
         started.elapsed().as_secs_f64()
     );
 }
@@ -1176,6 +1355,7 @@ async fn prewarm_chain_dashboard_cache(
             return;
         }
     };
+    cache.highest_blocks.insert(chain_id, highest);
 
     for range in chart_ranges {
         prewarm_chart_range(db, cache, chain_id, highest, range).await;
@@ -1191,7 +1371,7 @@ async fn prewarm_chain_dashboard_cache(
         let aggregate_key = range_cache_key_for_query(chain_id, &aggregate_query, aggregate_window);
 
         match db.stats(chain_id).await {
-            Ok(stats) => cache.stats.insert(chain_id, stats).await,
+            Ok(stats) => cache.stats.insert(chain_id, stats),
             Err(err) => log_prewarm_error(chain_id, "stats", err),
         }
 
@@ -1199,7 +1379,7 @@ async fn prewarm_chain_dashboard_cache(
             .bytecode_size_distribution(chain_id, aggregate_window.block_range)
             .await
         {
-            Ok(bins) => cache.bytecode_sizes.insert(aggregate_key, bins).await,
+            Ok(bins) => cache.bytecode_sizes.insert(aggregate_key, bins),
             Err(err) => log_prewarm_error(chain_id, "bytecode sizes", err),
         }
 
@@ -1229,12 +1409,12 @@ async fn prewarm_chain_dashboard_cache(
         }
         .await
         {
-            Ok(compilers) => cache.compilers.insert(compiler_key, compilers).await,
+            Ok(compilers) => cache.compilers.insert(compiler_key, compilers),
             Err(err) => log_prewarm_error(chain_id, "compilers", err),
         }
 
         match db.language_distribution(chain_id).await {
-            Ok(languages) => cache.languages.insert(chain_id, languages).await,
+            Ok(languages) => cache.languages.insert(chain_id, languages),
             Err(err) => log_prewarm_error(chain_id, "languages", err),
         }
 
@@ -1242,7 +1422,7 @@ async fn prewarm_chain_dashboard_cache(
             .standards_breakdown(chain_id, aggregate_window.block_range)
             .await
         {
-            Ok(standards) => cache.standards.insert(aggregate_key, standards).await,
+            Ok(standards) => cache.standards.insert(aggregate_key, standards),
             Err(err) => log_prewarm_error(chain_id, "standards", err),
         }
 
@@ -1256,7 +1436,7 @@ async fn prewarm_chain_dashboard_cache(
             .recent_contracts(chain_id, DEFAULT_RECENT_LIMIT, None)
             .await
         {
-            Ok(recent) => cache.recent.insert(recent_key, recent).await,
+            Ok(recent) => cache.recent.insert(recent_key, recent),
             Err(err) => log_prewarm_error(chain_id, "recent deployments", err),
         }
     }
@@ -1281,7 +1461,7 @@ async fn prewarm_chart_range(db: &Db, cache: &ApiCache, chain_id: u64, highest: 
         .deploys_over_time(chain_id, window.bucket_blocks, window.block_range)
         .await
     {
-        Ok(buckets) => cache.deploys.insert(cache_key, buckets).await,
+        Ok(buckets) => cache.deploys.insert(cache_key, buckets),
         Err(err) => log_prewarm_error(chain_id, &format!("deployments {range}"), err),
     }
 
@@ -1289,7 +1469,7 @@ async fn prewarm_chart_range(db: &Db, cache: &ApiCache, chain_id: u64, highest: 
         .verified_ratio_over_time(chain_id, window.bucket_blocks, window.block_range)
         .await
     {
-        Ok(buckets) => cache.verified.insert(cache_key, buckets).await,
+        Ok(buckets) => cache.verified.insert(cache_key, buckets),
         Err(err) => log_prewarm_error(chain_id, &format!("verification {range}"), err),
     }
 }
@@ -1358,197 +1538,5 @@ async fn background_tail_loop(db: Db, config: TailLoopConfig, runtime: Arc<Runti
             }
         }
         tokio::time::sleep(config.interval).await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::chains::{ETHEREUM_CHAIN_ID, GNOSIS_CHAIN_ID};
-
-    use super::{
-        bucket_cache_key, parse_time_series_window, range_cache_key_for_query, BucketQuery,
-        RuntimeState,
-    };
-
-    fn query(range: Option<&str>, bucket: Option<&str>) -> BucketQuery {
-        BucketQuery {
-            chain_id: None,
-            bucket: bucket.map(str::to_string),
-            range: range.map(str::to_string),
-            end_block: None,
-            start_block: None,
-            start_time: None,
-            end_time: None,
-            limit: None,
-        }
-    }
-
-    #[test]
-    fn day_range_limits_chart_to_last_day_with_hourly_buckets() {
-        let anchor_block = 20_000_000;
-        let window =
-            parse_time_series_window(&query(Some("day"), None), ETHEREUM_CHAIN_ID, anchor_block);
-
-        assert_eq!(window.block_range, Some((19_992_801, 20_000_000)));
-        assert_eq!(window.bucket_blocks, 300);
-    }
-
-    #[test]
-    fn week_range_limits_chart_to_last_week_with_daily_buckets() {
-        let anchor_block = 20_000_000;
-        let window =
-            parse_time_series_window(&query(Some("week"), None), ETHEREUM_CHAIN_ID, anchor_block);
-
-        assert_eq!(window.block_range, Some((19_949_601, 20_000_000)));
-        assert_eq!(window.bucket_blocks, 7_200);
-    }
-
-    #[test]
-    fn year_range_limits_chart_to_last_year_with_monthly_buckets() {
-        let anchor_block = 20_000_000;
-        let window =
-            parse_time_series_window(&query(Some("year"), None), ETHEREUM_CHAIN_ID, anchor_block);
-
-        assert_eq!(window.block_range, Some((17_372_001, 20_000_000)));
-        assert_eq!(window.bucket_blocks, 216_000);
-    }
-
-    #[test]
-    fn hour_range_uses_chain_specific_block_time() {
-        let anchor_block = 46_000_000;
-        let window =
-            parse_time_series_window(&query(Some("hour"), None), GNOSIS_CHAIN_ID, anchor_block);
-
-        assert_eq!(window.block_range, Some((45_999_281, 46_000_000)));
-        assert_eq!(window.bucket_blocks, 60);
-    }
-
-    #[test]
-    fn legacy_bucket_query_keeps_full_history_behavior() {
-        let anchor_block = 20_000_000;
-        let window =
-            parse_time_series_window(&query(None, Some("day")), ETHEREUM_CHAIN_ID, anchor_block);
-
-        assert_eq!(window.block_range, None);
-        assert_eq!(window.bucket_blocks, 7_200);
-    }
-
-    #[test]
-    fn range_end_block_moves_visible_window() {
-        let anchor_block = 20_000_000;
-        let mut q = query(Some("day"), None);
-        q.end_block = Some(19_000_000);
-        let window = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, anchor_block);
-
-        assert_eq!(window.block_range, Some((18_992_801, 19_000_000)));
-
-        q.end_block = Some(21_000_000);
-        let capped = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, anchor_block);
-        assert_eq!(capped.block_range, Some((19_992_801, 20_000_000)));
-    }
-
-    #[test]
-    fn relative_preset_cache_key_survives_tail_moves_inside_bucket() {
-        let q = query(Some("day"), None);
-        let first = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, 20_000_001);
-        let second = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, 20_000_099);
-
-        assert_ne!(first.block_range, second.block_range);
-        assert_eq!(
-            bucket_cache_key(ETHEREUM_CHAIN_ID, &q, first),
-            bucket_cache_key(ETHEREUM_CHAIN_ID, &q, second)
-        );
-        assert_eq!(
-            range_cache_key_for_query(ETHEREUM_CHAIN_ID, &q, first),
-            range_cache_key_for_query(ETHEREUM_CHAIN_ID, &q, second)
-        );
-    }
-
-    #[test]
-    fn explicit_block_range_cache_key_keeps_exact_window() {
-        let anchor_block = 20_000_100;
-        let mut first_query = query(Some("day"), None);
-        first_query.end_block = Some(20_000_001);
-        let first = parse_time_series_window(&first_query, ETHEREUM_CHAIN_ID, anchor_block);
-
-        let mut second_query = query(Some("day"), None);
-        second_query.end_block = Some(20_000_099);
-        let second = parse_time_series_window(&second_query, ETHEREUM_CHAIN_ID, anchor_block);
-
-        assert_ne!(first.block_range, second.block_range);
-        assert_ne!(
-            bucket_cache_key(ETHEREUM_CHAIN_ID, &first_query, first),
-            bucket_cache_key(ETHEREUM_CHAIN_ID, &second_query, second)
-        );
-    }
-
-    #[test]
-    fn explicit_start_block_creates_custom_window() {
-        let anchor_block = 20_000_000;
-        let mut q = query(None, None);
-        q.start_block = Some(19_900_000);
-        q.end_block = Some(19_950_000);
-        let window = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, anchor_block);
-
-        assert_eq!(window.block_range, Some((19_900_000, 19_950_000)));
-        assert_eq!(window.bucket_blocks, 520);
-    }
-
-    #[tokio::test]
-    async fn gnosis_tail_updates_do_not_overwrite_legacy_ethereum_runtime_block() {
-        let runtime = RuntimeState::new(false, true, 60);
-
-        runtime
-            .mark_tail_ready(ETHEREUM_CHAIN_ID, Some(25_438_551))
-            .await;
-        runtime
-            .mark_tail_ready(GNOSIS_CHAIN_ID, Some(46_981_003))
-            .await;
-
-        let response = runtime.response().await;
-        assert_eq!(response.snapshot.tail_last_block, Some(25_438_551));
-
-        let gnosis = response
-            .snapshot
-            .tail_chains
-            .iter()
-            .find(|chain| chain.chain_id == GNOSIS_CHAIN_ID)
-            .expect("gnosis runtime state");
-        assert_eq!(gnosis.tail_last_block, Some(46_981_003));
-
-        runtime
-            .mark_tail_ok(Some(GNOSIS_CHAIN_ID), Some(46_981_010), 8)
-            .await;
-        let response = runtime.response().await;
-        assert_eq!(response.snapshot.tail_last_block, Some(25_438_551));
-
-        runtime
-            .mark_tail_ok(Some(ETHEREUM_CHAIN_ID), Some(25_438_552), 13)
-            .await;
-        let response = runtime.response().await;
-        assert_eq!(response.snapshot.tail_last_block, Some(25_438_552));
-    }
-
-    #[tokio::test]
-    async fn ready_chain_does_not_flicker_to_tailing_during_background_scan() {
-        let runtime = RuntimeState::new(false, true, 60);
-
-        runtime
-            .mark_tail_ready(ETHEREUM_CHAIN_ID, Some(25_438_551))
-            .await;
-        runtime.mark_tail_start(Some(ETHEREUM_CHAIN_ID)).await;
-
-        let response = runtime.response().await;
-        assert!(!response.snapshot.tail_running);
-        assert_eq!(response.snapshot.tail_running_count, 0);
-
-        let ethereum = response
-            .snapshot
-            .tail_chains
-            .iter()
-            .find(|chain| chain.chain_id == ETHEREUM_CHAIN_ID)
-            .expect("ethereum runtime state");
-        assert!(!ethereum.tail_running);
-        assert_eq!(ethereum.tail_running_count, 0);
     }
 }
