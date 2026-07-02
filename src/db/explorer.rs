@@ -7,7 +7,7 @@ use super::{table_exists, views, Db};
 
 const EXPLORER_FINGERPRINT_KEY: &str = "explorer_fingerprint";
 /// Rows per build slice — bounds the join/sort working set per transaction.
-const EXPLORER_SLICE_TARGET_ROWS: u64 = 4_000_000;
+const EXPLORER_SLICE_TARGET_ROWS: u64 = 2_000_000;
 
 pub(crate) fn ensure_explorer_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -61,8 +61,10 @@ fn input_fingerprint(conn: &Connection) -> Result<String> {
     } else {
         0
     };
+    // Bump the version prefix when the table schema changes so upgraded
+    // servers rebuild instead of querying a stale shape.
     Ok(format!(
-        "v1|meta:{meta_rows}@{}|enr:{enrichment_rows}@{}|reg:{registry_rows}",
+        "v2|meta:{meta_rows}@{}|enr:{enrichment_rows}@{}|reg:{registry_rows}",
         meta_latest.unwrap_or_default(),
         enrichment_latest.unwrap_or_default()
     ))
@@ -202,14 +204,21 @@ impl Db {
 
             // One deduplicated copy of the decode metadata for the whole
             // build, so the per-slice joins don't re-run the window function.
+            // Only the columns the join needs — no hex strings — to keep the
+            // per-slice hash-build side small on 4GB hosts.
             let has_meta = table_exists(&conn, "bytecode_metadata_by_hash")?;
             let meta_source = if has_meta {
-                "SELECT * FROM decoded_bytecodes"
+                r#"
+                SELECT
+                    code_hash, language, compiler_version, has_source_hash,
+                    is_erc20, is_erc721, is_erc1155, is_proxy_eip1967,
+                    is_proxy_minimal, uses_push0, decoded_at
+                FROM decoded_bytecodes
+                "#
             } else {
                 r#"
                 SELECT
                     CAST(NULL AS BLOB) AS code_hash,
-                    CAST(NULL AS VARCHAR) AS code_hash_hex,
                     CAST(NULL AS VARCHAR) AS language,
                     CAST(NULL AS VARCHAR) AS compiler_version,
                     CAST(false AS BOOLEAN) AS has_source_hash,
@@ -249,7 +258,8 @@ impl Db {
                     contract_name VARCHAR,
                     verification_source VARCHAR,
                     match_type VARCHAR,
-                    verification_checked_at TIMESTAMP
+                    verification_checked_at TIMESTAMP,
+                    is_decoded BOOLEAN
                 );
                 "#
             ))
@@ -297,12 +307,20 @@ impl Db {
                     e.contract_name,
                     e.verification_source,
                     e.match_type,
-                    e.checked_at
+                    e.checked_at,
+                    m.code_hash IS NOT NULL
                 FROM contract_deployments_native c
                 LEFT JOIN explorer_meta_build m ON c.code_hash = m.code_hash
+                -- The block-range condition relies on
+                -- backfill_enrichment_blocks having run at open: every
+                -- enrichment row whose address exists in the deployments
+                -- table carries that deployment's block_number, so the join
+                -- hash-builds only this slice's enrichment rows instead of
+                -- the whole table.
                 LEFT JOIN enrichment_current e
                   ON c.contract_address = e.contract_address
                  AND c.chain_id = e.chain_id
+                 AND e.block_number BETWEEN {start_block} AND {end_block}
                 WHERE c.chain_id = {chain_id}
                   AND c.block_number BETWEEN {start_block} AND {end_block}
                 ORDER BY c.block_number, c.create_index;

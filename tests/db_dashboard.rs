@@ -619,11 +619,56 @@ async fn ranged_code_aggregates_are_exact_across_bucket_boundaries() {
         .await
         .unwrap();
     assert_eq!(standards.uses_push0, 12);
+    assert_eq!(standards.total_decoded, 12);
     let sizes = db
         .bytecode_size_distribution(1, Some((5_000, 25_000)))
         .await
         .unwrap();
     assert_eq!(sizes.iter().map(|bin| bin.count).sum::<u64>(), 12);
+
+    // Once the materialized explorer table exists, the same endpoints switch
+    // to denormalized per-deployment scans — results must be identical.
+    assert!(db.refresh_explorer().await.unwrap());
+    assert_eq!(
+        db.compiler_version_total(1, Some((5_000, 25_000)))
+            .await
+            .unwrap(),
+        12
+    );
+    assert_eq!(
+        db.compiler_version_total(1, Some((10_000, 19_999)))
+            .await
+            .unwrap(),
+        10
+    );
+    assert_eq!(
+        db.compiler_version_total(1, Some((5_000, 9_999)))
+            .await
+            .unwrap(),
+        1
+    );
+    let compilers = db
+        .top_compilers(1, 12, Some((5_000, 25_000)))
+        .await
+        .unwrap();
+    assert_eq!(compilers.len(), 1);
+    assert_eq!(compilers[0].count, 12);
+    let standards = db
+        .standards_breakdown(1, Some((5_000, 25_000)))
+        .await
+        .unwrap();
+    assert_eq!(standards.uses_push0, 12);
+    assert_eq!(standards.has_source_hash, 12);
+    assert_eq!(standards.total_decoded, 12);
+    let sizes = db
+        .bytecode_size_distribution(1, Some((5_000, 25_000)))
+        .await
+        .unwrap();
+    assert_eq!(sizes.iter().map(|bin| bin.count).sum::<u64>(), 12);
+    let languages = db.language_distribution(1).await.unwrap();
+    assert_eq!(languages.len(), 1);
+    assert_eq!(languages[0].language, "solidity");
+    assert_eq!(languages[0].count, 12);
 }
 
 /// `blink load --overwrite` re-imports the Zellic snapshot; the invalidation
