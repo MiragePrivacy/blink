@@ -484,10 +484,18 @@ fn contract_code_counts_sql(
                 code_hash,
                 any_value(n_code_bytes)::UINTEGER AS n_code_bytes,
                 COUNT(*)::UBIGINT AS contract_count
-            FROM {source}
-            WHERE code_hash IS NOT NULL
-              AND chain_id = {chain_id}
-              {range_filter}
+            FROM (
+                SELECT DISTINCT
+                    block_number,
+                    create_index,
+                    contract_address,
+                    code_hash,
+                    n_code_bytes
+                FROM {source}
+                WHERE code_hash IS NOT NULL
+                  AND chain_id = {chain_id}
+                  {range_filter}
+            ) deduped_contracts
             GROUP BY code_hash
             "#
         ));
@@ -1633,7 +1641,34 @@ impl Db {
             let range_filter = block_range
                 .map(|(start, end)| format!(" AND block_number BETWEEN {start} AND {end}"))
                 .unwrap_or_default();
-            let parquet_select = if table_exists(&conn, "parquet_block_counts")? {
+            let parquet_select = if block_range.is_some() {
+                let files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
+                let files = contract_parquet_files_for_block_range(&files, chain_id, block_range);
+                create_contract_parquet_view(
+                    &conn,
+                    "dashboard_range_parquet_contracts",
+                    &files,
+                    chain_id,
+                )?;
+                format!(
+                    r#"
+                    SELECT
+                        (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                        COUNT(*)::UBIGINT AS cnt
+                    FROM (
+                        SELECT DISTINCT
+                            block_number,
+                            create_index,
+                            contract_address
+                        FROM dashboard_range_parquet_contracts
+                        WHERE block_number IS NOT NULL
+                          AND chain_id = {chain_id}
+                          {range_filter}
+                    ) deduped_contracts
+                    GROUP BY bucket_id
+                    "#
+                )
+            } else if table_exists(&conn, "parquet_block_counts")? {
                 format!(
                     r#"
                     SELECT
@@ -1642,34 +1677,18 @@ impl Db {
                     FROM parquet_block_counts
                     WHERE block_number IS NOT NULL
                       AND chain_id = {chain_id}
-                      {range_filter}
                     GROUP BY bucket_id
                     "#
                 )
             } else {
-                let parquet_source = if block_range.is_some() {
-                    let files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
-                    let files =
-                        contract_parquet_files_for_block_range(&files, chain_id, block_range);
-                    create_contract_parquet_view(
-                        &conn,
-                        "dashboard_range_parquet_contracts",
-                        &files,
-                        chain_id,
-                    )?;
-                    "dashboard_range_parquet_contracts"
-                } else {
-                    "parquet_contracts"
-                };
                 format!(
                     r#"
                     SELECT
                         (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
                         COUNT(*)::UBIGINT AS cnt
-                    FROM {parquet_source}
+                    FROM parquet_contracts
                     WHERE block_number IS NOT NULL
                       AND chain_id = {chain_id}
-                      {range_filter}
                     GROUP BY bucket_id
                 "#
                 )
@@ -1753,42 +1772,32 @@ impl Db {
             let mut out = Vec::new();
             let registry_loaded = verification_registry_loaded(&conn, chain_id)?;
             if let Some((start, end)) = block_range {
-                let parquet_total_select = if table_exists(&conn, "parquet_block_counts")? {
-                    format!(
-                        r#"
-                        SELECT
-                            (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
-                            SUM(contract_count)::UBIGINT AS total
-                        FROM parquet_block_counts
-                        WHERE block_number IS NOT NULL
-                          AND chain_id = {chain_id}
-                          AND block_number BETWEEN {start} AND {end}
-                        GROUP BY bucket_id
-                        "#
-                    )
-                } else {
-                    let files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
-                    let files =
-                        contract_parquet_files_for_block_range(&files, chain_id, block_range);
-                    create_contract_parquet_view(
-                        &conn,
-                        "dashboard_range_parquet_contracts",
-                        &files,
-                        chain_id,
-                    )?;
-                    format!(
-                        r#"
-                        SELECT
-                            (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
-                            COUNT(*)::UBIGINT AS total
+                let files = list_contract_parquet_files(&data_dir, &contracts_glob)?;
+                let files = contract_parquet_files_for_block_range(&files, chain_id, block_range);
+                create_contract_parquet_view(
+                    &conn,
+                    "dashboard_range_parquet_contracts",
+                    &files,
+                    chain_id,
+                )?;
+                let parquet_total_select = format!(
+                    r#"
+                    SELECT
+                        (block_number / {bucket_blocks})::UBIGINT AS bucket_id,
+                        COUNT(*)::UBIGINT AS total
+                    FROM (
+                        SELECT DISTINCT
+                            block_number,
+                            create_index,
+                            contract_address
                         FROM dashboard_range_parquet_contracts
                         WHERE block_number IS NOT NULL
                           AND chain_id = {chain_id}
                           AND block_number BETWEEN {start} AND {end}
-                        GROUP BY bucket_id
-                        "#
-                    )
-                };
+                    ) deduped_contracts
+                    GROUP BY bucket_id
+                    "#
+                );
                 let zellic_total_select = if chain_id == ETHEREUM_CHAIN_ID
                     && table_exists(&conn, "zellic_block_counts")?
                 {
@@ -3110,6 +3119,38 @@ mod tests {
         .unwrap();
     }
 
+    fn write_overlapping_ethereum_parquet(data_dir: &Path) {
+        let first_path = data_dir.join("contracts__0000000250__0000000250.parquet");
+        let first_path_sql = first_path.display().to_string().replace('\'', "''");
+        let second_path = data_dir.join("tail__chain_0000000001__0000000250__0000000250.parquet");
+        let second_path_sql = second_path.display().to_string().replace('\'', "''");
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            r#"
+            CREATE TEMP TABLE duplicate_deployment AS
+            SELECT
+                250::UINTEGER AS block_number,
+                unhex(repeat('23', 32)) AS block_hash,
+                0::UINTEGER AS create_index,
+                unhex(repeat('24', 32)) AS transaction_hash,
+                unhex(repeat('25', 20)) AS contract_address,
+                unhex(repeat('26', 20)) AS deployer,
+                unhex(repeat('27', 20)) AS factory,
+                unhex('6000') AS init_code,
+                unhex('6001') AS code,
+                unhex(repeat('28', 32)) AS init_code_hash,
+                2::UINTEGER AS n_init_code_bytes,
+                2::UINTEGER AS n_code_bytes,
+                unhex(repeat('29', 32)) AS code_hash,
+                1::UBIGINT AS chain_id;
+
+            COPY duplicate_deployment TO '{first_path_sql}' (FORMAT PARQUET);
+            COPY duplicate_deployment TO '{second_path_sql}' (FORMAT PARQUET);
+            "#
+        ))
+        .unwrap();
+    }
+
     #[test]
     fn recent_parquet_selection_uses_filename_block_ranges() {
         let files = vec![
@@ -3189,6 +3230,89 @@ mod tests {
             recent.contracts[0].address,
             format!("0x{}", hex::encode(make_bytes(5, 20)))
         );
+    }
+
+    #[tokio::test]
+    async fn chart_queries_deduplicate_overlapping_parquet_deployments() {
+        let dir = TestDir::new("charts_deduplicate_overlapping_parquet");
+        write_overlapping_ethereum_parquet(&dir.path);
+
+        let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+
+        let deploys = db
+            .deploys_over_time(ETHEREUM_CHAIN_ID, 100, Some((250, 250)))
+            .await
+            .unwrap();
+        assert_eq!(deploys.len(), 1);
+        assert_eq!(deploys[0].count, 1);
+
+        let verified = db
+            .verified_ratio_over_time(ETHEREUM_CHAIN_ID, 100, Some((250, 250)))
+            .await
+            .unwrap();
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].verified, 0);
+        assert_eq!(verified[0].unverified, 0);
+        assert_eq!(verified[0].unknown, 1);
+
+        {
+            let conn = db.inner.lock().await;
+            conn.execute(
+                r#"
+                INSERT INTO bytecode_metadata_by_hash (
+                    code_hash,
+                    language,
+                    compiler_version,
+                    has_source_hash,
+                    is_erc20,
+                    is_erc721,
+                    is_erc1155,
+                    is_proxy_eip1967,
+                    is_proxy_minimal,
+                    uses_push0
+                ) VALUES (?, 'solidity', '0.8.20', true, true, false, false, false, false, true)
+                "#,
+                duckdb::params![make_bytes(0x29, 32)],
+            )
+            .unwrap();
+        }
+
+        let sizes = db
+            .bytecode_size_distribution(ETHEREUM_CHAIN_ID, Some((250, 250)))
+            .await
+            .unwrap();
+        assert_eq!(sizes.iter().map(|bin| bin.count).sum::<u64>(), 1);
+        assert_eq!(
+            sizes
+                .iter()
+                .find(|bin| bin.label == "1-32 B")
+                .map(|bin| bin.count),
+            Some(1)
+        );
+
+        let compilers = db
+            .top_compilers(ETHEREUM_CHAIN_ID, 12, Some((250, 250)))
+            .await
+            .unwrap();
+        assert_eq!(compilers.len(), 1);
+        assert_eq!(compilers[0].compiler_version, "0.8.20");
+        assert_eq!(compilers[0].count, 1);
+        assert_eq!(
+            db.compiler_version_total(ETHEREUM_CHAIN_ID, Some((250, 250)))
+                .await
+                .unwrap(),
+            1
+        );
+
+        let standards = db
+            .standards_breakdown(ETHEREUM_CHAIN_ID, Some((250, 250)))
+            .await
+            .unwrap();
+
+        assert_eq!(standards.total_decoded, 1);
+        assert_eq!(standards.erc20, 1);
+        assert_eq!(standards.uses_push0, 1);
+        assert_eq!(standards.has_source_hash, 1);
     }
 
     #[tokio::test]
