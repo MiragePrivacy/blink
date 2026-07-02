@@ -259,9 +259,19 @@ pub(crate) fn sync_rollups(
     }
     if has_zellic && !tracked.contains(ZELLIC_SOURCE_KEY) {
         tracing::info!("rolling up Zellic snapshot into native deployments (one-time)");
-        let rows = ingest_zellic(conn)?;
-        tracing::info!("zellic rollup complete ({} new deployments)", rows);
-        changed = true;
+        match ingest_zellic(conn) {
+            Ok(rows) => {
+                tracing::info!("zellic rollup complete ({} new deployments)", rows);
+                changed = true;
+            }
+            // Not fatal: the dashboard can serve the parquet-era data while
+            // the operator fixes this; the next start retries and already-
+            // committed slices are skipped by dedup.
+            Err(err) => tracing::error!(
+                "zellic rollup failed; serving without zellic history until the next successful sync: {:#}",
+                err
+            ),
+        }
     }
 
     Ok(changed)
@@ -339,8 +349,17 @@ fn ingest_parquet(conn: &Connection, path: &Path) -> Result<u64> {
           AND contract_address IS NOT NULL
         "#
     );
-    ingest_source(conn, &source_key, &select)
+    let (inserted, min_block, max_block) = ingest_rows(conn, &source_key, &select)?;
+    record_source(conn, &source_key, min_block, max_block, inserted)?;
+    Ok(inserted)
 }
+
+/// Rows per zellic ingest slice. The snapshot is tens of millions of rows;
+/// ingesting it in one transaction OOMs small hosts (join hash table +
+/// transaction state), so it is sliced by block range into transactions of
+/// roughly this size. Dedup makes re-running a slice a no-op, so a crash
+/// mid-snapshot resumes cleanly on the next start.
+const ZELLIC_SLICE_TARGET_ROWS: u64 = 1_000_000;
 
 fn ingest_zellic(conn: &Connection) -> Result<u64> {
     let chain_expr = if column_exists(conn, "zellic_contracts", "chain_id")? {
@@ -356,32 +375,116 @@ fn ingest_zellic(conn: &Connection) -> Result<u64> {
     } else {
         ("", "CAST(NULL AS UINTEGER)")
     };
-    let select = format!(
-        r#"
-        SELECT
-            {chain_expr}::UBIGINT AS chain_id,
-            z.block_number::UINTEGER AS block_number,
-            COALESCE(z.create_index, 0)::UINTEGER AS create_index,
-            z.contract_address,
-            CAST(NULL AS BLOB) AS deployer,
-            z.bytecode_hash AS code_hash,
-            {n_code_bytes_expr}::UINTEGER AS n_code_bytes
-        FROM zellic_contracts z
-        {bytecode_join}
-        WHERE z.block_number IS NOT NULL
-          AND z.contract_address IS NOT NULL
-        "#
-    );
-    ingest_source(conn, ZELLIC_SOURCE_KEY, &select)
+
+    let (min_block, max_block, total_rows): (Option<u32>, Option<u32>, i64) = conn
+        .query_row(
+            r#"
+            SELECT MIN(block_number), MAX(block_number), COUNT(*)
+            FROM zellic_contracts
+            WHERE block_number IS NOT NULL AND contract_address IS NOT NULL
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .context("measure zellic snapshot")?;
+    let (Some(min_block), Some(max_block)) = (min_block, max_block) else {
+        record_source(conn, ZELLIC_SOURCE_KEY, None, None, 0)?;
+        return Ok(0);
+    };
+    let (min_block, max_block) = (u64::from(min_block), u64::from(max_block));
+
+    let span = max_block - min_block + 1;
+    let slice_count = (total_rows.max(0) as u64)
+        .div_ceil(ZELLIC_SLICE_TARGET_ROWS)
+        .max(1);
+    let slice_blocks = span.div_ceil(slice_count).max(1);
+    let total_slices = span.div_ceil(slice_blocks);
+
+    let mut inserted = 0u64;
+    let mut slice_start = min_block;
+    let mut slice_index = 0u64;
+    while slice_start <= max_block {
+        let slice_end = (slice_start + slice_blocks - 1).min(max_block);
+        slice_index += 1;
+        let select = format!(
+            r#"
+            SELECT
+                {chain_expr}::UBIGINT AS chain_id,
+                z.block_number::UINTEGER AS block_number,
+                COALESCE(z.create_index, 0)::UINTEGER AS create_index,
+                z.contract_address,
+                CAST(NULL AS BLOB) AS deployer,
+                z.bytecode_hash AS code_hash,
+                {n_code_bytes_expr}::UINTEGER AS n_code_bytes
+            FROM zellic_contracts z
+            {bytecode_join}
+            WHERE z.block_number IS NOT NULL
+              AND z.contract_address IS NOT NULL
+              AND z.block_number BETWEEN {slice_start} AND {slice_end}
+            "#
+        );
+        let (slice_rows, _, _) = ingest_rows(conn, ZELLIC_SOURCE_KEY, &select)
+            .with_context(|| format!("zellic slice blocks {slice_start}-{slice_end}"))?;
+        inserted += slice_rows;
+        if total_slices > 1 {
+            tracing::info!(
+                "zellic rollup progress: slice {}/{} (blocks {}-{}, {} deployments so far)",
+                slice_index,
+                total_slices,
+                slice_start,
+                slice_end,
+                inserted
+            );
+        }
+        slice_start = slice_end + 1;
+    }
+
+    record_source(
+        conn,
+        ZELLIC_SOURCE_KEY,
+        Some(min_block as u32),
+        Some(max_block as u32),
+        inserted,
+    )?;
+    Ok(inserted)
 }
 
-/// Ingest one source inside a transaction: dedup the incoming rows within the
-/// source and against everything already indexed for the affected block
-/// window, append the survivors, and fold the same delta into the summary
-/// tables so they can never drift from the deployments table.
-fn ingest_source(conn: &Connection, source_key: &str, select: &str) -> Result<u64> {
+/// Mark a source as ingested. Separate from [`ingest_rows`] so a source can
+/// be ingested in several slice transactions and recorded only once at the
+/// end — a crash in between just means the committed rows get re-offered and
+/// deduplicated away on the next start.
+fn record_source(
+    conn: &Connection,
+    source_key: &str,
+    min_block: Option<u32>,
+    max_block: Option<u32>,
+    inserted: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO rollup_sources (source_path, start_block, end_block, row_count) VALUES (?, ?, ?, ?)",
+        params![
+            source_key,
+            min_block.map(u64::from),
+            max_block.map(u64::from),
+            inserted
+        ],
+    )
+    .with_context(|| format!("record rollup source {source_key}"))?;
+    Ok(())
+}
+
+/// Ingest one batch of rows inside a transaction: dedup the incoming rows
+/// within the batch and against everything already indexed for the affected
+/// block window, append the survivors, and fold the same delta into the
+/// summary tables so they can never drift from the deployments table.
+/// Returns (inserted, min_block, max_block) of the batch.
+fn ingest_rows(
+    conn: &Connection,
+    source_key: &str,
+    select: &str,
+) -> Result<(u64, Option<u32>, Option<u32>)> {
     let source_sql = source_key.replace('\'', "''");
-    let result = (|| -> Result<u64> {
+    let result = (|| -> Result<(u64, Option<u32>, Option<u32>)> {
         conn.execute_batch("BEGIN;")?;
         conn.execute_batch(&format!(
             r#"
@@ -458,17 +561,8 @@ fn ingest_source(conn: &Connection, source_key: &str, select: &str) -> Result<u6
             })? as u64;
         }
 
-        conn.execute(
-            "INSERT INTO rollup_sources (source_path, start_block, end_block, row_count) VALUES (?, ?, ?, ?)",
-            params![
-                source_key,
-                min_block.map(u64::from),
-                max_block.map(u64::from),
-                inserted
-            ],
-        )?;
         conn.execute_batch("DROP TABLE IF EXISTS rollup_ingest; COMMIT;")?;
-        Ok(inserted)
+        Ok((inserted, min_block, max_block))
     })();
     if result.is_err() {
         let _ = conn.execute_batch("ROLLBACK;");

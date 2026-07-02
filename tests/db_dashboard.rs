@@ -422,6 +422,61 @@ fn hex_string(byte: u8, len: usize) -> String {
     hex::encode(vec![byte; len])
 }
 
+/// The Zellic snapshot is ingested in ~1M-row block-range slices (one
+/// transaction each) so it cannot OOM small hosts. 2.5M rows forces three
+/// slices; totals must come out exact.
+#[tokio::test]
+async fn large_zellic_snapshot_ingests_in_slices() {
+    let dir = TestDir::new("zellic_sliced_ingest");
+    {
+        let conn = Connection::open(dir.path.join("blink.duckdb")).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE zellic_bytecodes (
+                code_hash BLOB,
+                code BLOB,
+                n_code_bytes UINTEGER
+            );
+            CREATE TABLE zellic_contracts AS
+            SELECT
+                substr(md5(('a' || i)::VARCHAR), 1, 20)::BLOB AS contract_address,
+                md5(('h' || i % 1000)::VARCHAR)::BLOB AS bytecode_hash,
+                (i % 500000)::UINTEGER AS block_number,
+                (i // 500000)::UINTEGER AS create_index,
+                1::UBIGINT AS chain_id
+            FROM range(2500000) t(i);
+            INSERT INTO zellic_bytecodes
+            SELECT DISTINCT bytecode_hash, unhex('60'), 1::UINTEGER FROM zellic_contracts;
+            "#,
+        )
+        .unwrap();
+    }
+
+    // A tight memory limit mirrors the production 4GB host where a
+    // single-transaction zellic ingest OOMed; sliced ingest must fit.
+    let db = Db::open(
+        &dir.path,
+        "*.parquet",
+        blink::db::DbOptions {
+            memory_limit: Some("500MB".to_string()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let stats = db.stats(ETHEREUM_CHAIN_ID).await.unwrap();
+    assert_eq!(stats.total_contracts, 2_500_000);
+    assert_eq!(stats.first_block, 0);
+    assert_eq!(stats.last_block, 499_999);
+
+    // Reopening must not re-ingest (source recorded once after all slices).
+    drop(db);
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    assert_eq!(
+        db.stats(ETHEREUM_CHAIN_ID).await.unwrap().total_contracts,
+        2_500_000
+    );
+}
+
 /// Ranged code aggregates read fully-covered 10k-block buckets from the
 /// bucketed rollup and only scan the deployments table for partial edges —
 /// results must be exact across all bucket-alignment cases.
