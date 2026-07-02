@@ -499,6 +499,44 @@ async fn explorer_materialization_stays_correct_and_fresh() {
     );
 }
 
+/// While a schema-upgrading explorer rebuild runs (or after a failed one),
+/// the on-disk table is the previous generation without newer columns —
+/// aggregates must fall back to the join path instead of binder-erroring.
+#[tokio::test]
+async fn aggregates_fall_back_when_explorer_table_has_old_schema() {
+    let dir = TestDir::new("explorer_old_schema_fallback");
+    write_backfill_parquet(&dir.path);
+
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    // Simulate a previous-generation materialized table: right names, no
+    // is_decoded column.
+    db.execute_batch(
+        r#"
+        CREATE TABLE contract_metadata_native (
+            chain_id UBIGINT, block_number UINTEGER, is_erc20 BOOLEAN
+        );
+        CREATE TABLE IF NOT EXISTS contract_metadata_bounds (
+            chain_id UBIGINT PRIMARY KEY, max_block UBIGINT NOT NULL
+        );
+        "#
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let sizes = db
+        .bytecode_size_distribution(ETHEREUM_CHAIN_ID, Some((0, 1000)))
+        .await
+        .unwrap();
+    assert_eq!(sizes.iter().map(|bin| bin.count).sum::<u64>(), 1);
+    let standards = db
+        .standards_breakdown(ETHEREUM_CHAIN_ID, Some((0, 1000)))
+        .await
+        .unwrap();
+    assert_eq!(standards.total_decoded, 0);
+    assert!(db.language_distribution(ETHEREUM_CHAIN_ID).await.is_ok());
+}
+
 /// The Zellic snapshot is ingested in ~1M-row block-range slices (one
 /// transaction each) so it cannot OOM small hosts. 2.5M rows forces three
 /// slices; totals must come out exact.

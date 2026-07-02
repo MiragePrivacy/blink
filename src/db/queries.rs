@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Row};
 
-use super::{rollups, sql, table_exists, Db};
+use super::{column_exists, rollups, sql, table_exists, Db};
 
 /// Fast path for the "recent deployments" page: scan only this many blocks
 /// below the cursor/head first, and fall back to an unbounded scan when the
@@ -201,9 +201,14 @@ fn code_counts_source(chain_id: u64, block_range: Option<(u64, u64)>) -> String 
 /// (compilers/standards/sizes/languages). It denormalizes decode metadata per
 /// deployment, sorted by (chain, block), so ranged aggregates are pruned
 /// scans with no join against the multi-million-row metadata table.
+///
+/// The column check matters: while a schema-upgrading rebuild runs (or if one
+/// failed), the previous-generation table is still what's on disk — fall back
+/// to the join path rather than referencing columns it doesn't have yet.
 fn explorer_backed(conn: &Connection) -> Result<bool> {
     Ok(table_exists(conn, "contract_metadata_native")?
-        && table_exists(conn, "contract_metadata_bounds")?)
+        && table_exists(conn, "contract_metadata_bounds")?
+        && column_exists(conn, "contract_metadata_native", "is_decoded")?)
 }
 
 /// Per-deployment metadata rows for aggregate endpoints: the materialized
