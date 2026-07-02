@@ -1,4 +1,7 @@
-use std::time::Instant;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -98,28 +101,14 @@ pub struct RecentPage {
     pub has_more: bool,
 }
 
-type RecentRowData = (
-    Vec<u8>,
-    u32,
-    u32,
-    Option<Vec<u8>>,
-    Option<u32>,
-    Option<bool>,
-    Option<String>,
-    Option<String>,
-);
-
-fn read_recent_row(row: &Row<'_>) -> duckdb::Result<RecentRowData> {
-    Ok((
-        row.get::<_, Vec<u8>>(0)?,
-        row.get::<_, u32>(1)?,
-        row.get::<_, u32>(2)?,
-        row.get::<_, Option<Vec<u8>>>(3)?,
-        row.get::<_, Option<u32>>(4)?,
-        row.get::<_, Option<bool>>(5)?,
-        row.get::<_, Option<String>>(6)?,
-        row.get::<_, Option<String>>(7)?,
-    ))
+/// One row of the recent-deployments page before decoration.
+struct RecentPageRow {
+    address: Vec<u8>,
+    block_number: u32,
+    create_index: u32,
+    deployer: Option<Vec<u8>>,
+    n_code_bytes: Option<u32>,
+    code_hash: Option<Vec<u8>>,
 }
 
 fn read_u64_pair(row: &Row<'_>) -> duckdb::Result<(u64, u64)> {
@@ -701,7 +690,6 @@ impl Db {
         self.run_read(move |conn| {
             let page_limit = limit as usize + 1;
             let registry_loaded = verification_registry_loaded(conn, chain_id)?;
-            let has_hash_metadata = table_exists(conn, "bytecode_metadata_by_hash")?;
 
             // Recent pages live near the head of the chain: try a bounded
             // window first so the top-N scan prunes to a handful of row
@@ -711,44 +699,51 @@ impl Db {
                 None => max_indexed_block(conn, chain_id)?,
             };
             let floor = upper.map(|top| top.saturating_sub(RECENT_SCAN_WINDOW_BLOCKS));
-            let mut rows = recent_page_rows(
-                conn,
-                chain_id,
-                cursor,
-                page_limit,
-                floor.filter(|f| *f > 0),
-                has_hash_metadata,
-            )?;
+            let mut rows =
+                recent_page_rows(conn, chain_id, cursor, page_limit, floor.filter(|f| *f > 0))?;
             if rows.len() < page_limit && floor.map(|f| f > 0).unwrap_or(false) {
-                rows =
-                    recent_page_rows(conn, chain_id, cursor, page_limit, None, has_hash_metadata)?;
+                rows = recent_page_rows(conn, chain_id, cursor, page_limit, None)?;
             }
 
             let has_more = rows.len() > limit as usize;
             rows.truncate(limit as usize);
+
+            // Decorate the page with indexed point lookups instead of hash
+            // joins — a join rescans the multi-million-row enrichment and
+            // metadata tables for a 20-row page.
+            let enrichment = recent_enrichment_by_address(conn, chain_id, &rows)?;
+            let compilers = recent_compilers_by_hash(conn, &rows)?;
+
             let contracts = rows
                 .into_iter()
-                .map(
-                    |(addr, block, create_index, deployer, n_code, verified, name, compiler)| {
-                        let block_u64 = u64::from(block);
-                        let is_verified = if registry_loaded {
-                            Some(verified.unwrap_or(false))
-                        } else {
-                            verified
-                        };
-                        RecentContract {
-                            address: format!("0x{}", hex::encode(&addr)),
-                            block_number: block_u64,
-                            create_index: u64::from(create_index),
-                            timestamp: crate::blocks::block_timestamp(chain_id, block_u64),
-                            deployer: format!("0x{}", hex::encode(deployer.unwrap_or_default())),
-                            n_code_bytes: n_code.map(u64::from).unwrap_or(0),
-                            is_verified,
-                            contract_name: name,
-                            compiler_version: compiler,
-                        }
-                    },
-                )
+                .map(|row| {
+                    let block_u64 = u64::from(row.block_number);
+                    let (verified, contract_name) = enrichment
+                        .get(&row.address)
+                        .cloned()
+                        .unwrap_or((None, None));
+                    let is_verified = if registry_loaded {
+                        Some(verified.unwrap_or(false))
+                    } else {
+                        verified
+                    };
+                    let compiler_version = row
+                        .code_hash
+                        .as_ref()
+                        .and_then(|hash| compilers.get(hash).cloned())
+                        .flatten();
+                    RecentContract {
+                        address: format!("0x{}", hex::encode(&row.address)),
+                        block_number: block_u64,
+                        create_index: u64::from(row.create_index),
+                        timestamp: crate::blocks::block_timestamp(chain_id, block_u64),
+                        deployer: format!("0x{}", hex::encode(row.deployer.unwrap_or_default())),
+                        n_code_bytes: row.n_code_bytes.map(u64::from).unwrap_or(0),
+                        is_verified,
+                        contract_name,
+                        compiler_version,
+                    }
+                })
                 .collect();
             Ok(RecentPage {
                 contracts,
@@ -780,15 +775,13 @@ impl Db {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn recent_page_rows(
     conn: &Connection,
     chain_id: u64,
     cursor: Option<RecentCursor>,
     page_limit: usize,
     floor: Option<u64>,
-    has_hash_metadata: bool,
-) -> Result<Vec<RecentRowData>> {
+) -> Result<Vec<RecentPageRow>> {
     let cursor_filter = cursor
         .map(|c| {
             format!(
@@ -801,46 +794,112 @@ fn recent_page_rows(
     let floor_filter = floor
         .map(|f| format!("AND block_number >= {f}"))
         .unwrap_or_default();
-    let compiler_join = if has_hash_metadata {
-        "LEFT JOIN bytecode_metadata_by_hash m ON p.code_hash = m.code_hash"
-    } else {
-        ""
-    };
-    let compiler_expr = if has_hash_metadata {
-        "m.compiler_version"
-    } else {
-        "CAST(NULL AS VARCHAR)"
-    };
     let sql = format!(
         r#"
-        WITH page AS (
-            SELECT contract_address, block_number, create_index, deployer, n_code_bytes, code_hash
-            FROM contract_deployments_native
-            WHERE chain_id = {chain_id}
-              {floor_filter}
-              {cursor_filter}
-            ORDER BY block_number DESC, create_index DESC
-            LIMIT {page_limit}
-        )
-        SELECT
-            p.contract_address,
-            p.block_number,
-            p.create_index,
-            p.deployer,
-            p.n_code_bytes,
-            e.is_verified,
-            e.contract_name,
-            {compiler_expr} AS compiler_version
-        FROM page p
-        LEFT JOIN enrichment_current e
-          ON p.contract_address = e.contract_address
-         AND e.chain_id = {chain_id}
-        {compiler_join}
-        ORDER BY p.block_number DESC, p.create_index DESC
+        SELECT contract_address, block_number, create_index, deployer, n_code_bytes, code_hash
+        FROM contract_deployments_native
+        WHERE chain_id = {chain_id}
+          {floor_filter}
+          {cursor_filter}
+        ORDER BY block_number DESC, create_index DESC
+        LIMIT {page_limit}
         "#
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], read_recent_row)?;
+    let rows = stmt.query_map([], |row| {
+        Ok(RecentPageRow {
+            address: row.get(0)?,
+            block_number: row.get(1)?,
+            create_index: row.get(2)?,
+            deployer: row.get(3)?,
+            n_code_bytes: row.get(4)?,
+            code_hash: row.get(5)?,
+        })
+    })?;
     rows.collect::<Result<Vec<_>, _>>()
         .context("read recent contracts page")
+}
+
+fn blob_literal(bytes: &[u8]) -> String {
+    format!("unhex('{}')", hex::encode(bytes))
+}
+
+/// `(is_verified, contract_name)` per address.
+type EnrichmentByAddress = HashMap<Vec<u8>, (Option<bool>, Option<String>)>;
+
+/// Verification status per address for one page: a UNION ALL of indexed
+/// point probes (`enrichment_addr_idx`), ~ms even against millions of rows.
+fn recent_enrichment_by_address(
+    conn: &Connection,
+    chain_id: u64,
+    rows: &[RecentPageRow],
+) -> Result<EnrichmentByAddress> {
+    let addresses: HashSet<&Vec<u8>> = rows.iter().map(|row| &row.address).collect();
+    if addresses.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let probes = addresses
+        .iter()
+        .map(|address| {
+            format!(
+                "SELECT contract_address, is_verified, contract_name FROM enrichment_current \
+                 WHERE contract_address = {} AND chain_id = {chain_id}",
+                blob_literal(address)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\nUNION ALL\n");
+    let mut stmt = conn.prepare(&probes)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Option<bool>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (address, is_verified, contract_name) = row?;
+        out.insert(address, (is_verified, contract_name));
+    }
+    Ok(out)
+}
+
+/// Compiler version per code hash for one page, via
+/// `bytecode_metadata_hash_idx` point probes.
+fn recent_compilers_by_hash(
+    conn: &Connection,
+    rows: &[RecentPageRow],
+) -> Result<HashMap<Vec<u8>, Option<String>>> {
+    if !table_exists(conn, "bytecode_metadata_by_hash")? {
+        return Ok(HashMap::new());
+    }
+    let hashes: HashSet<&Vec<u8>> = rows
+        .iter()
+        .filter_map(|row| row.code_hash.as_ref())
+        .collect();
+    if hashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let probes = hashes
+        .iter()
+        .map(|hash| {
+            format!(
+                "SELECT code_hash, compiler_version FROM bytecode_metadata_by_hash \
+                 WHERE code_hash = {}",
+                blob_literal(hash)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\nUNION ALL\n");
+    let mut stmt = conn.prepare(&probes)?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (hash, compiler_version) = row?;
+        out.insert(hash, compiler_version);
+    }
+    Ok(out)
 }

@@ -28,6 +28,7 @@ use anyhow::{anyhow, Context, Result};
 use duckdb::{params, AccessMode, Config, Connection};
 use tokio::sync::Mutex;
 
+mod explorer;
 mod queries;
 mod rollups;
 mod sql;
@@ -167,6 +168,18 @@ impl Db {
             views::rebuild_parquet_views(&conn, &files)?;
         }
         Ok(())
+    }
+
+    /// Bring the materialized SQL-explorer table (`contract_metadata_native`)
+    /// up to date if its inputs changed. Safe to run while serving: queries
+    /// use the previous copy (or the live-join fallback) until the swap, and
+    /// the writer lock is released between build slices. Returns whether a
+    /// rebuild ran.
+    pub async fn refresh_explorer(&self) -> Result<bool> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.refresh_explorer_blocking())
+            .await
+            .map_err(|e| anyhow!("join error: {}", e))?
     }
 
     /// Run raw SQL on the writer connection. Intended for tests and admin

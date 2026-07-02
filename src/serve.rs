@@ -22,7 +22,7 @@
 //! - `POST /api/query` — read-only SQL over dashboard query views.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     future::Future,
     hash::Hash,
     net::SocketAddr,
@@ -44,7 +44,10 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{
+    net::TcpListener,
+    sync::{watch, Mutex},
+};
 use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
@@ -231,16 +234,22 @@ struct RecentCacheKey {
     before_create_index: Option<u64>,
 }
 
-/// Stale-while-revalidate cache: reads never block on the database once a key
-/// has been populated. Expired entries are served as-is while a single
-/// background task (per key) refreshes them.
+/// Stale-while-revalidate, single-flight cache.
+///
+/// Reads never block on the database once a key has been populated: expired
+/// entries are served as-is while one background task per key refreshes them.
+/// Cold misses are single-flight too — concurrent requests for the same key
+/// (e.g. a dashboard fanning out while the boot prewarm runs) wait for the
+/// one in-flight computation instead of duplicating it on a small host.
 struct CacheMap<K, V> {
     inner: Arc<CacheMapInner<K, V>>,
 }
 
 struct CacheMapInner<K, V> {
     values: StdMutex<HashMap<K, (Instant, V)>>,
-    refreshing: StdMutex<HashSet<K>>,
+    /// Keys currently being computed; waiters subscribe to the receiver and
+    /// wake when the compute holder drops its sender.
+    inflight: StdMutex<HashMap<K, watch::Receiver<()>>>,
 }
 
 impl<K, V> Clone for CacheMap<K, V> {
@@ -256,7 +265,7 @@ impl<K, V> Default for CacheMap<K, V> {
         Self {
             inner: Arc::new(CacheMapInner {
                 values: StdMutex::new(HashMap::new()),
-                refreshing: StdMutex::new(HashSet::new()),
+                inflight: StdMutex::new(HashMap::new()),
             }),
         }
     }
@@ -272,32 +281,53 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V>> + Send + 'static,
     {
-        let cached = {
-            let values = self.inner.values.lock().expect("cache map poisoned");
-            values
-                .get(&key)
-                .map(|(at, value)| (at.elapsed(), value.clone()))
-        };
-        if let Some((age, value)) = cached {
-            if age > ttl && self.begin_refresh(key) {
-                let this = self.clone();
-                let refresh = make();
-                tokio::spawn(async move {
-                    match refresh.await {
-                        Ok(fresh) => this.insert(key, fresh),
-                        Err(err) => {
-                            tracing::warn!("background dashboard cache refresh failed: {:#}", err)
-                        }
+        let mut make = Some(make);
+        loop {
+            if let Some((age, value)) = self.lookup(&key) {
+                if age > ttl {
+                    if let Ok(slot) = self.claim(key) {
+                        let this = self.clone();
+                        let refresh = (make.take().expect("make consumed once"))();
+                        tokio::spawn(async move {
+                            match refresh.await {
+                                Ok(fresh) => this.insert(key, fresh),
+                                Err(err) => tracing::warn!(
+                                    "background dashboard cache refresh failed: {:#}",
+                                    err
+                                ),
+                            }
+                            this.release(&key);
+                            drop(slot);
+                        });
                     }
-                    this.end_refresh(&key);
-                });
+                }
+                return Ok(value);
             }
-            return Ok(value);
-        }
 
-        let value = make().await?;
-        self.insert(key, value.clone());
-        Ok(value)
+            match self.claim(key) {
+                Ok(slot) => {
+                    let result = (make.take().expect("make consumed once"))().await;
+                    if let Ok(value) = &result {
+                        self.insert(key, value.clone());
+                    }
+                    self.release(&key);
+                    drop(slot);
+                    return result;
+                }
+                Err(mut waiter) => {
+                    let _ = waiter.changed().await;
+                }
+            }
+        }
+    }
+
+    fn lookup(&self, key: &K) -> Option<(Duration, V)> {
+        self.inner
+            .values
+            .lock()
+            .expect("cache map poisoned")
+            .get(key)
+            .map(|(at, value)| (at.elapsed(), value.clone()))
     }
 
     fn insert(&self, key: K, value: V) {
@@ -309,25 +339,24 @@ where
     }
 
     fn get(&self, key: &K) -> Option<V> {
-        self.inner
-            .values
-            .lock()
-            .expect("cache map poisoned")
-            .get(key)
-            .map(|(_, value)| value.clone())
+        self.lookup(key).map(|(_, value)| value)
     }
 
-    fn begin_refresh(&self, key: K) -> bool {
-        self.inner
-            .refreshing
-            .lock()
-            .expect("cache map poisoned")
-            .insert(key)
+    /// Claim the compute slot for `key`: the holder gets the sender (waiters
+    /// wake when it drops); if already claimed, the receiver to wait on.
+    fn claim(&self, key: K) -> Result<watch::Sender<()>, watch::Receiver<()>> {
+        let mut inflight = self.inner.inflight.lock().expect("cache map poisoned");
+        if let Some(receiver) = inflight.get(&key) {
+            return Err(receiver.clone());
+        }
+        let (sender, receiver) = watch::channel(());
+        inflight.insert(key, receiver);
+        Ok(sender)
     }
 
-    fn end_refresh(&self, key: &K) {
+    fn release(&self, key: &K) {
         self.inner
-            .refreshing
+            .inflight
             .lock()
             .expect("cache map poisoned")
             .remove(key);
@@ -567,6 +596,18 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     // Rollup-backed queries are fast enough to serve cold, so warming happens
     // off the startup path — the listener binds immediately.
     tokio::spawn(prewarm_initial_dashboard_cache(db.clone(), cache.clone()));
+    if !args.read_only {
+        // Materialized SQL-explorer table; queries fall back to a live join
+        // until it's ready.
+        let db_explorer = db.clone();
+        tokio::spawn(async move {
+            match db_explorer.refresh_explorer().await {
+                Ok(true) => tracing::info!("sql explorer table ready"),
+                Ok(false) => {}
+                Err(err) => tracing::warn!("sql explorer table rebuild failed: {:#}", err),
+            }
+        });
+    }
     let state = AppState {
         db: db.clone(),
         runtime: runtime.clone(),
@@ -612,6 +653,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         spawn_tail_loops(
             db.clone(),
             runtime.clone(),
+            cache.clone(),
             TailLoopSettings {
                 rpcs,
                 interval: Duration::from_secs(args.tail_interval_secs.max(15)),
@@ -1319,10 +1361,16 @@ async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
     );
 }
 
-fn spawn_tail_loops(db: Db, runtime: Arc<RuntimeState>, settings: TailLoopSettings) {
+fn spawn_tail_loops(
+    db: Db,
+    runtime: Arc<RuntimeState>,
+    cache: Arc<ApiCache>,
+    settings: TailLoopSettings,
+) {
     for rpc in settings.rpcs {
         let db_bg = db.clone();
         let runtime_bg = runtime.clone();
+        let cache_bg = cache.clone();
         let data_dir = settings.data_dir.clone();
         let config = TailLoopConfig {
             rpc,
@@ -1334,7 +1382,7 @@ fn spawn_tail_loops(db: Db, runtime: Arc<RuntimeState>, settings: TailLoopSettin
         };
         tokio::spawn(async move {
             tokio::time::sleep(TAIL_START_DELAY).await;
-            background_tail_loop(db_bg, config, runtime_bg).await;
+            background_tail_loop(db_bg, config, runtime_bg, cache_bg).await;
         });
     }
 }
@@ -1483,7 +1531,12 @@ fn log_prewarm_error(chain_id: u64, label: &str, err: anyhow::Error) {
     );
 }
 
-async fn background_tail_loop(db: Db, config: TailLoopConfig, runtime: Arc<RuntimeState>) {
+async fn background_tail_loop(
+    db: Db,
+    config: TailLoopConfig,
+    runtime: Arc<RuntimeState>,
+    cache: Arc<ApiCache>,
+) {
     let chain_id = match crate::extract::tail::rpc_chain_id(&config.rpc).await {
         Ok(chain_id) => Some(chain_id),
         Err(err) => {
@@ -1526,6 +1579,23 @@ async fn background_tail_loop(db: Db, config: TailLoopConfig, runtime: Arc<Runti
                     report.end_block,
                     report.rows
                 );
+                // New blocks just landed in the rollups: overwrite this
+                // chain's cached dashboard entries right away instead of
+                // letting the top-right block number and the recent table
+                // trail by up to a cache TTL. These are rollup queries —
+                // milliseconds — so doing it every tick is cheap.
+                if let Some(chain_id) = chain_id {
+                    if report.rows > 0 {
+                        prewarm_chain_dashboard_cache(
+                            &db,
+                            &cache,
+                            chain_id,
+                            &[INITIAL_DEPLOYS_RANGE, INITIAL_VERIFIED_RANGE],
+                            true,
+                        )
+                        .await;
+                    }
+                }
             }
             Ok(None) => {
                 runtime.mark_tail_ok(chain_id, None, 0).await;

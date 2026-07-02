@@ -422,6 +422,83 @@ fn hex_string(byte: u8, len: usize) -> String {
     hex::encode(vec![byte; len])
 }
 
+/// The SQL explorer's `contract_metadata` view must return identical data
+/// before materialization (live-join fallback), after the background build,
+/// and for fresh blocks beyond the materialized bounds (live union) — and a
+/// backfill below the bounds must trigger a rebuild.
+#[tokio::test]
+async fn explorer_materialization_stays_correct_and_fresh() {
+    let dir = TestDir::new("explorer_materialization");
+    write_backfill_parquet(&dir.path);
+
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    let explorer_query = "SELECT chain_id, block_number, address, compiler_version, is_verified \
+                          FROM contract_metadata ORDER BY block_number DESC, create_index DESC LIMIT 10";
+
+    // Fallback live-join view, pre-materialization.
+    let before = db
+        .query_sql(explorer_query.to_string(), 10, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(before.row_count, 1);
+    assert_eq!(before.rows[0][1], serde_json::json!(200));
+
+    // Build the materialized table; a second refresh is a no-op.
+    assert!(db.refresh_explorer().await.unwrap());
+    assert!(!db.refresh_explorer().await.unwrap());
+    let after = db
+        .query_sql(explorer_query.to_string(), 10, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(after.rows, before.rows);
+
+    // New tail blocks beyond the bounds appear live without a rebuild.
+    write_contract_parquet(
+        &dir.path
+            .join("tail__chain_0000000001__0000000400__0000000400.parquet"),
+        400,
+        0x33,
+        1,
+    );
+    db.refresh().await.unwrap();
+    let live = db
+        .query_sql(explorer_query.to_string(), 10, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(live.row_count, 2);
+    assert_eq!(live.rows[0][1], serde_json::json!(400));
+    assert!(!db.refresh_explorer().await.unwrap());
+
+    // A backfill below the materialized head forces a rebuild and the row
+    // shows up decorated.
+    write_contract_parquet(
+        &dir.path
+            .join("contracts__chain_0000000001__0000000150__0000000150.parquet"),
+        150,
+        0x43,
+        1,
+    );
+    db.refresh().await.unwrap();
+    assert!(db.refresh_explorer().await.unwrap());
+    let rebuilt = db
+        .query_sql(explorer_query.to_string(), 10, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.row_count, 3);
+    assert_eq!(
+        rebuilt
+            .rows
+            .iter()
+            .map(|row| row[1].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            serde_json::json!(400),
+            serde_json::json!(200),
+            serde_json::json!(150)
+        ]
+    );
+}
+
 /// The Zellic snapshot is ingested in ~1M-row block-range slices (one
 /// transaction each) so it cannot OOM small hosts. 2.5M rows forces three
 /// slices; totals must come out exact.

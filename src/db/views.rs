@@ -32,6 +32,10 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS enrichment_chain_block_idx ON enrichment(chain_id, block_number);
         CREATE INDEX IF NOT EXISTS enrichment_verified_idx ON enrichment(is_verified);
         CREATE INDEX IF NOT EXISTS enrichment_source_idx    ON enrichment(verification_source);
+        -- Single-column index: DuckDB uses this for the per-address point
+        -- lookups decorating /api/recent pages (the composite index above is
+        -- not chosen for them).
+        CREATE INDEX IF NOT EXISTS enrichment_addr_idx ON enrichment(contract_address);
 
         CREATE TABLE IF NOT EXISTS bytecode_metadata_v2 (
             contract_address  BLOB NOT NULL,
@@ -63,6 +67,9 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
         );
         ALTER TABLE bytecode_metadata_by_hash
             ADD COLUMN IF NOT EXISTS decoded_at TIMESTAMP;
+        -- Point lookups for /api/recent page decoration.
+        CREATE INDEX IF NOT EXISTS bytecode_metadata_hash_idx
+            ON bytecode_metadata_by_hash(code_hash);
         -- EIP-1167 minimal proxy detection added later; backfill the column
         -- with `false` on existing rows. DuckDB cannot add constrained
         -- columns to an existing table.
@@ -461,33 +468,124 @@ fn create_standard_query_views(conn: &Connection) -> Result<()> {
     conn.execute_batch(&decoded_sql)
         .context("create decoded bytecodes query view")?;
 
-    let metadata_join = if has_hash {
-        "LEFT JOIN decoded_bytecodes m ON c.code_hash = m.code_hash"
-    } else {
-        "LEFT JOIN bytecode_metadata_current m ON c.contract_address = m.contract_address"
-    };
-    let is_verified_expr = if table_exists(conn, "verification_registry_imports")? {
-        "COALESCE(e.is_verified, false) AS is_verified"
-    } else {
-        "e.is_verified"
-    };
-    conn.execute_batch(&format!(
-        r#"
-        CREATE OR REPLACE TEMP VIEW contract_metadata_all AS
+    create_contract_metadata_view(conn)
+}
+
+/// The SQL-explorer surface: `contract_metadata_all` / `contract_metadata`.
+///
+/// Prefers the materialized `contract_metadata_native` table (see
+/// `db::explorer`) with deployments newer than its bounds unioned in live and
+/// undecorated; falls back to a live join over the native tables until the
+/// materialization has been built. `transaction_hash` / `block_hash` /
+/// `factory` are always NULL here — query the raw `contracts` view when
+/// those are needed.
+pub(crate) fn create_contract_metadata_view(conn: &Connection) -> Result<()> {
+    // Columns not carried by the native deployments table.
+    const NULL_RAW_COLS: &str = r#"
+            CAST(NULL AS BLOB) AS transaction_hash,
+            CAST(NULL AS VARCHAR) AS tx_hash,
+            CAST(NULL AS BLOB) AS block_hash,
+            CAST(NULL AS VARCHAR) AS block_hash_hex,
+    "#;
+    const NULL_FACTORY_COLS: &str = r#"
+            CAST(NULL AS BLOB) AS factory,
+            CAST(NULL AS VARCHAR) AS factory_address,
+    "#;
+
+    let registry_loaded = table_exists(conn, "verification_registry_imports")?;
+    let has_materialized = table_exists(conn, "contract_metadata_native")?
+        && table_exists(conn, "contract_metadata_bounds")?;
+    let has_deployments = table_exists(conn, "contract_deployments_native")?;
+
+    let body = if has_materialized {
+        let live_verified = if registry_loaded {
+            "CAST(false AS BOOLEAN)"
+        } else {
+            "CAST(NULL AS BOOLEAN)"
+        };
+        format!(
+            r#"
+        SELECT
+            chain_id,
+            block_number,
+            create_index,
+            contract_address,
+            lower('0x' || hex(contract_address)) AS address,
+            {NULL_RAW_COLS}
+            deployer,
+            lower('0x' || hex(deployer)) AS deployer_address,
+            {NULL_FACTORY_COLS}
+            code_hash,
+            lower('0x' || hex(code_hash)) AS code_hash_hex,
+            n_code_bytes,
+            language,
+            compiler_version,
+            has_source_hash,
+            is_erc20,
+            is_erc721,
+            is_erc1155,
+            is_proxy_eip1967,
+            is_proxy_minimal,
+            uses_push0,
+            decoded_at,
+            is_verified,
+            contract_name,
+            verification_source,
+            match_type,
+            verification_checked_at
+        FROM contract_metadata_native
+        UNION ALL
         SELECT
             c.chain_id,
             c.block_number,
             c.create_index,
             c.contract_address,
             lower('0x' || hex(c.contract_address)) AS address,
-            c.transaction_hash,
-            lower('0x' || hex(c.transaction_hash)) AS tx_hash,
-            c.block_hash,
-            lower('0x' || hex(c.block_hash)) AS block_hash_hex,
+            {NULL_RAW_COLS}
             c.deployer,
             lower('0x' || hex(c.deployer)) AS deployer_address,
-            c.factory,
-            lower('0x' || hex(c.factory)) AS factory_address,
+            {NULL_FACTORY_COLS}
+            c.code_hash,
+            lower('0x' || hex(c.code_hash)) AS code_hash_hex,
+            c.n_code_bytes,
+            CAST(NULL AS VARCHAR) AS language,
+            CAST(NULL AS VARCHAR) AS compiler_version,
+            CAST(false AS BOOLEAN) AS has_source_hash,
+            CAST(false AS BOOLEAN) AS is_erc20,
+            CAST(false AS BOOLEAN) AS is_erc721,
+            CAST(false AS BOOLEAN) AS is_erc1155,
+            CAST(false AS BOOLEAN) AS is_proxy_eip1967,
+            CAST(false AS BOOLEAN) AS is_proxy_minimal,
+            CAST(false AS BOOLEAN) AS uses_push0,
+            CAST(NULL AS TIMESTAMP) AS decoded_at,
+            {live_verified} AS is_verified,
+            CAST(NULL AS VARCHAR) AS contract_name,
+            CAST(NULL AS VARCHAR) AS verification_source,
+            CAST(NULL AS VARCHAR) AS match_type,
+            CAST(NULL AS TIMESTAMP) AS verification_checked_at
+        FROM contract_deployments_native c
+        LEFT JOIN contract_metadata_bounds b ON c.chain_id = b.chain_id
+        WHERE b.chain_id IS NULL OR c.block_number > b.max_block
+        "#
+        )
+    } else if has_deployments {
+        let is_verified_expr = if registry_loaded {
+            "COALESCE(e.is_verified, false) AS is_verified"
+        } else {
+            "e.is_verified"
+        };
+        format!(
+            r#"
+        SELECT
+            c.chain_id,
+            c.block_number,
+            c.create_index,
+            c.contract_address,
+            lower('0x' || hex(c.contract_address)) AS address,
+            {NULL_RAW_COLS}
+            c.deployer,
+            lower('0x' || hex(c.deployer)) AS deployer_address,
+            {NULL_FACTORY_COLS}
             c.code_hash,
             lower('0x' || hex(c.code_hash)) AS code_hash_hex,
             c.n_code_bytes,
@@ -506,11 +604,53 @@ fn create_standard_query_views(conn: &Connection) -> Result<()> {
             e.verification_source,
             e.match_type,
             e.checked_at AS verification_checked_at
-        FROM contracts c
-        {metadata_join}
+        FROM contract_deployments_native c
+        LEFT JOIN decoded_bytecodes m ON c.code_hash = m.code_hash
         LEFT JOIN enrichment_current e
           ON c.contract_address = e.contract_address
-         AND c.chain_id = e.chain_id;
+         AND c.chain_id = e.chain_id
+        "#
+        )
+    } else {
+        format!(
+            r#"
+        SELECT
+            CAST(NULL AS UBIGINT) AS chain_id,
+            CAST(NULL AS UINTEGER) AS block_number,
+            CAST(NULL AS UINTEGER) AS create_index,
+            CAST(NULL AS BLOB) AS contract_address,
+            CAST(NULL AS VARCHAR) AS address,
+            {NULL_RAW_COLS}
+            CAST(NULL AS BLOB) AS deployer,
+            CAST(NULL AS VARCHAR) AS deployer_address,
+            {NULL_FACTORY_COLS}
+            CAST(NULL AS BLOB) AS code_hash,
+            CAST(NULL AS VARCHAR) AS code_hash_hex,
+            CAST(NULL AS UINTEGER) AS n_code_bytes,
+            CAST(NULL AS VARCHAR) AS language,
+            CAST(NULL AS VARCHAR) AS compiler_version,
+            CAST(false AS BOOLEAN) AS has_source_hash,
+            CAST(false AS BOOLEAN) AS is_erc20,
+            CAST(false AS BOOLEAN) AS is_erc721,
+            CAST(false AS BOOLEAN) AS is_erc1155,
+            CAST(false AS BOOLEAN) AS is_proxy_eip1967,
+            CAST(false AS BOOLEAN) AS is_proxy_minimal,
+            CAST(false AS BOOLEAN) AS uses_push0,
+            CAST(NULL AS TIMESTAMP) AS decoded_at,
+            CAST(NULL AS BOOLEAN) AS is_verified,
+            CAST(NULL AS VARCHAR) AS contract_name,
+            CAST(NULL AS VARCHAR) AS verification_source,
+            CAST(NULL AS VARCHAR) AS match_type,
+            CAST(NULL AS TIMESTAMP) AS verification_checked_at
+        WHERE FALSE
+        "#
+        )
+    };
+
+    conn.execute_batch(&format!(
+        r#"
+        CREATE OR REPLACE TEMP VIEW contract_metadata_all AS
+        {body};
 
         CREATE OR REPLACE TEMP VIEW contract_metadata AS
         SELECT * FROM contract_metadata_all;
