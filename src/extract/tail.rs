@@ -13,7 +13,7 @@ use futures::{stream, StreamExt};
 use super::{batch::BatchClient, parquet_io, traces::extract_contracts};
 use crate::{db::Db, types::ChunkReport};
 
-const TAIL_BATCH_BLOCK_LIMIT: u64 = 5_000;
+const TAIL_BATCH_BLOCK_LIMIT: u64 = 1_000;
 
 pub async fn rpc_chain_id(rpc_url: &str) -> Result<u64> {
     let provider =
@@ -51,6 +51,12 @@ pub async fn tail_once(
         return Ok(None);
     }
     let end_block = (start_block + TAIL_BATCH_BLOCK_LIMIT - 1).min(target);
+    tracing::info!(
+        "tail scanning chain_id={} blocks {}-{}",
+        chain_id,
+        start_block,
+        end_block
+    );
 
     let started_at = Utc::now();
     let output_path = data_dir.join(format!(
@@ -145,7 +151,7 @@ pub async fn tail_once(
         })?;
     }
 
-    db.refresh_contracts_view().await?;
+    db.refresh().await?;
 
     let size_bytes = std::fs::metadata(&output_path).ok().map(|m| m.len());
     Ok(Some(ChunkReport {

@@ -17,7 +17,7 @@ alloy = { version = "1.4", features = ["full", "rpc-types-trace"] }
 indicatif = "0.18"
 reqwest = { version = "0.12", features = ["json", "gzip"] }
 axum = "0.8.9"
-tower-http = { version = "0.6.10", features = ["fs", "cors", "trace"] }
+tower-http = { version = "0.6.10", features = ["fs", "cors", "trace", "compression-gzip"] }
 duckdb = { version = "1.10", features = ["bundled"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }

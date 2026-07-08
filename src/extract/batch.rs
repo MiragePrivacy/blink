@@ -169,7 +169,7 @@ fn is_rate_limited(err: &JsonRpcError) -> bool {
     err.code == 429 || err.message.to_ascii_lowercase().contains("compute units")
 }
 
-fn decode_trace_block_value(
+pub fn decode_trace_block_value(
     block: u64,
     value: serde_json::Value,
 ) -> Result<Vec<LocalizedTransactionTrace>> {
@@ -196,33 +196,4 @@ fn is_reward_trace(item: &serde_json::Value) -> bool {
             .get("action")
             .and_then(|action| action.get("rewardType"))
             .is_some()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::decode_trace_block_value;
-
-    #[test]
-    fn trace_decode_ignores_gnosis_external_reward_traces() {
-        let value = serde_json::json!([
-            {
-                "action": {
-                    "author": "0x0000000000000000000000000000000000000000",
-                    "rewardType": "external",
-                    "value": "0x0"
-                },
-                "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                "blockNumber": 46630628,
-                "result": null,
-                "subtraces": 0,
-                "traceAddress": [],
-                "transactionHash": null,
-                "transactionPosition": null,
-                "type": "reward"
-            }
-        ]);
-
-        let traces = decode_trace_block_value(46630628, value).unwrap();
-        assert!(traces.is_empty());
-    }
 }

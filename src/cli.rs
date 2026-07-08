@@ -133,6 +133,9 @@ pub struct LoadArgs {
     /// Rebuild existing CSV import tables or replace existing Parquet links
     #[arg(long)]
     pub overwrite: bool,
+    /// Rebuild all Verifier Alliance labels instead of importing changed VA files only
+    #[arg(long = "rebuild-va", alias = "rebuild")]
+    pub rebuild_va: bool,
     /// DuckDB memory limit for CSV and verification imports
     #[arg(long, default_value = "8GB")]
     pub memory_limit: String,
@@ -190,4 +193,14 @@ pub struct ServeArgs {
     /// Background extraction max concurrent HTTP requests
     #[arg(long, default_value_t = 16)]
     pub tail_max_concurrent_requests: usize,
+    /// DuckDB memory limit for the dashboard database, e.g. "2GB".
+    /// Recommended on small hosts; DuckDB otherwise assumes 80% of RAM.
+    #[arg(long, env = "BLINK_DB_MEMORY_LIMIT")]
+    pub db_memory_limit: Option<String>,
+    /// DuckDB thread count for the dashboard database
+    #[arg(long, env = "BLINK_DB_THREADS")]
+    pub db_threads: Option<u64>,
+    /// Read connections serving dashboard queries (0 = auto-size from cores)
+    #[arg(long, env = "BLINK_DB_READERS", default_value_t = 0)]
+    pub db_readers: usize,
 }

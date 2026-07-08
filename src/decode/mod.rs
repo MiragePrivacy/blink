@@ -6,7 +6,7 @@
 //! Resumable: re-running is a no-op for files already marked complete
 //! (unless `--overwrite`).
 //!
-mod bytecode_meta;
+pub mod bytecode_meta;
 
 use std::{
     fs::File,
