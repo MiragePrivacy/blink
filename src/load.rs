@@ -990,11 +990,40 @@ fn replace_va_file_manifest(
     chain_id: u64,
     entries: &[VaFileEntry],
 ) -> Result<()> {
+    // Deleting a key and re-inserting it inside the same transaction trips
+    // DuckDB's ART unique-index check, so remove only paths that vanished
+    // from the export and upsert the rest in place.
+    if entries.is_empty() {
+        conn.execute(
+            "DELETE FROM verification_registry_files WHERE source = 'verifier_alliance' AND chain_id = ?",
+            params![chain_id],
+        )
+        .context("clear Verifier Alliance file manifest")?;
+        return Ok(());
+    }
+    let keep = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "('{}', '{}')",
+                entry.table_name.replace('\'', "''"),
+                entry.path_key.replace('\'', "''")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     conn.execute(
-        "DELETE FROM verification_registry_files WHERE source = 'verifier_alliance' AND chain_id = ?",
+        &format!(
+            r#"
+            DELETE FROM verification_registry_files
+            WHERE source = 'verifier_alliance'
+              AND chain_id = ?
+              AND (table_name, path) NOT IN (VALUES {keep})
+            "#
+        ),
         params![chain_id],
     )
-    .context("clear Verifier Alliance file manifest")?;
+    .context("prune Verifier Alliance file manifest")?;
     upsert_va_file_manifest_entries(conn, chain_id, entries)
 }
 
@@ -1003,18 +1032,11 @@ fn upsert_va_file_manifest_entries(
     chain_id: u64,
     entries: &[VaFileEntry],
 ) -> Result<()> {
+    let mut entries = entries.to_vec();
+    entries.sort_by_key(|entry| (entry.table_name, entry.path_key.clone()));
+    entries.dedup_by(|a, b| a.table_name == b.table_name && a.path_key == b.path_key);
+
     for entry in entries {
-        conn.execute(
-            r#"
-            DELETE FROM verification_registry_files
-            WHERE source = 'verifier_alliance'
-              AND chain_id = ?
-              AND table_name = ?
-              AND path = ?
-            "#,
-            params![chain_id, entry.table_name, entry.path_key],
-        )
-        .context("delete Verifier Alliance file manifest row")?;
         conn.execute(
             r#"
             INSERT INTO verification_registry_files (
@@ -1027,6 +1049,10 @@ fn upsert_va_file_manifest_entries(
                 imported_at
             )
             VALUES ('verifier_alliance', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (source, chain_id, table_name, path) DO UPDATE SET
+                size_bytes = excluded.size_bytes,
+                modified_unix_ns = excluded.modified_unix_ns,
+                imported_at = excluded.imported_at
             "#,
             params![
                 chain_id,
@@ -1036,7 +1062,7 @@ fn upsert_va_file_manifest_entries(
                 entry.modified_unix_ns
             ],
         )
-        .context("insert Verifier Alliance file manifest row")?;
+        .context("upsert Verifier Alliance file manifest row")?;
     }
     Ok(())
 }
