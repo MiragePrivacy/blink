@@ -1,17 +1,28 @@
 //! Approximate block-number → wall-clock-time conversion for supported chains.
 //!
 //! The contract Parquet schema does not store block timestamps, so the
-//! dashboard derives them from `block_number`. Ethereum uses piecewise-linear
-//! interpolation before the Merge and exact slots after. Gnosis uses calibrated
-//! checkpoints because its long-run average block cadence has drifted enough
-//! that a plain 5-second-from-genesis estimate mislabels recent blocks by months.
+//! dashboard derives them from `block_number` via hardcoded checkpoints of
+//! real `(block_number, unix_timestamp)` pairs. Between checkpoints we
+//! interpolate; beyond the newest checkpoint we extrapolate at the average
+//! rate of the final checkpoint span.
+//!
+//! Extrapolating at the *ideal* slot time is not good enough: chains miss
+//! slots, so real average block time runs slightly long (Ethereum ~12.09s
+//! rather than 12s, Gnosis ~5.15s rather than 5s). At 12.0s flat, Ethereum's
+//! merge-anchored clock had drifted ten days behind reality by mid-2026 —
+//! the dashboard labeled today's deployments "June 29". Refresh the newest
+//! checkpoint of each chain every few months to keep drift to minutes:
+//!
+//! ```sh
+//! curl -s <rpc> -X POST -H 'content-type: application/json' \
+//!   -d '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}'
+//! ```
 
 use chrono::{DateTime, TimeZone, Utc};
 
 use crate::chains::GNOSIS_CHAIN_ID;
 
-/// Hardcoded (block_number, unix_timestamp) checkpoints for Ethereum mainnet.
-/// Used to interpolate timestamps without an extra timestamp lookup table.
+/// Real (block_number, unix_timestamp) checkpoints for Ethereum mainnet.
 const CHECKPOINTS: &[(u64, i64)] = &[
     (0, 1_438_269_988),          // 2015-07-30 genesis
     (200_000, 1_443_534_600),    // 2015-09-29
@@ -35,70 +46,76 @@ const CHECKPOINTS: &[(u64, i64)] = &[
     (14_000_000, 1_642_114_795), // 2022-01-13
     (15_000_000, 1_656_586_444), // 2022-06-30
     (15_537_393, 1_663_224_162), // 2022-09-15 merge
+    (18_000_000, 1_693_066_895), // 2023-08-26
+    (20_000_000, 1_717_281_407), // 2024-06-01
+    (22_000_000, 1_741_410_875), // 2025-03-08
+    (24_000_000, 1_765_584_371), // 2025-12-13
+    (25_497_188, 1_783_626_143), // 2026-07-09
 ];
 
-const POST_MERGE_BLOCK: u64 = 15_537_393;
-const POST_MERGE_TIMESTAMP: i64 = 1_663_224_162;
-const SECS_PER_BLOCK_POST_MERGE: i64 = 12;
-
-const GNOSIS_GENESIS_TIMESTAMP: i64 = 1_539_024_180;
-const GNOSIS_SECS_PER_BLOCK: i64 = 5;
-
+/// Real (block_number, unix_timestamp) checkpoints for Gnosis Chain.
 const GNOSIS_CHECKPOINTS: &[(u64, i64)] = &[
-    (0, GNOSIS_GENESIS_TIMESTAMP), // 2018-10-08 xDai/Gnosis genesis
-    (44_212_810, 1_768_666_350),   // 2026-01-17 16:12:30
-    (46_762_380, 1_781_798_438),   // 2026-06-18 16:00:38
+    (0, 1_539_024_180),          // 2018-10-08 xDai/Gnosis genesis
+    (10_000_000, 1_589_952_315), // 2020-05-20
+    (20_000_000, 1_641_651_650), // 2022-01-08
+    (30_000_000, 1_694_855_615), // 2023-09-16
+    (40_000_000, 1_746_925_820), // 2025-05-11
+    (44_212_810, 1_768_666_350), // 2026-01-17
+    (46_762_380, 1_781_798_438), // 2026-06-18
+    (47_119_233, 1_783_626_150), // 2026-07-09
 ];
+
+/// Ideal slot times, used only to size chart buckets — the timestamp math
+/// uses measured checkpoint rates instead.
+const SECS_PER_BLOCK_POST_MERGE: i64 = 12;
+const POST_MERGE_BLOCK: u64 = 15_537_393;
+const GNOSIS_SECS_PER_BLOCK: i64 = 5;
 
 /// Approximate the block timestamp for a given chain and block number.
 pub fn block_timestamp(chain_id: u64, block_number: u64) -> DateTime<Utc> {
-    let secs = match chain_id {
-        GNOSIS_CHAIN_ID => gnosis_block_timestamp_secs(block_number),
-        _ => ethereum_block_timestamp_secs(block_number),
-    };
+    let checkpoints = chain_checkpoints(chain_id);
+    let secs = checkpoint_timestamp_secs(checkpoints, block_number);
     Utc.timestamp_opt(secs, 0).single().unwrap_or_else(Utc::now)
 }
 
 /// Approximate the block number for a given chain and timestamp.
 pub fn block_number_at_time(chain_id: u64, timestamp: DateTime<Utc>) -> u64 {
+    let checkpoints = chain_checkpoints(chain_id);
+    checkpoint_block_at_time(checkpoints, timestamp.timestamp())
+}
+
+fn chain_checkpoints(chain_id: u64) -> &'static [(u64, i64)] {
     match chain_id {
-        GNOSIS_CHAIN_ID => gnosis_block_number_at_time(timestamp.timestamp()),
-        _ => ethereum_block_number_at_time(timestamp.timestamp()),
+        GNOSIS_CHAIN_ID => GNOSIS_CHECKPOINTS,
+        _ => CHECKPOINTS,
     }
 }
 
-fn gnosis_block_timestamp_secs(block_number: u64) -> i64 {
-    let (last_block, last_timestamp) = GNOSIS_CHECKPOINTS[GNOSIS_CHECKPOINTS.len() - 1];
+/// Milliseconds per block over the final checkpoint span — the measured
+/// recent rate, used to extrapolate past the newest checkpoint.
+fn trailing_ms_per_block(checkpoints: &[(u64, i64)]) -> i128 {
+    let (b1, t1) = checkpoints[checkpoints.len() - 1];
+    let (b0, t0) = checkpoints[checkpoints.len() - 2];
+    ((t1 - t0) as i128 * 1000) / (b1 - b0) as i128
+}
+
+fn checkpoint_timestamp_secs(checkpoints: &[(u64, i64)], block_number: u64) -> i64 {
+    let (last_block, last_timestamp) = checkpoints[checkpoints.len() - 1];
     if block_number >= last_block {
-        return last_timestamp + (block_number - last_block) as i64 * GNOSIS_SECS_PER_BLOCK;
+        let ms = (block_number - last_block) as i128 * trailing_ms_per_block(checkpoints);
+        return last_timestamp + (ms / 1000) as i64;
     }
-    interpolate_checkpoint_timestamp(GNOSIS_CHECKPOINTS, block_number)
+    interpolate_checkpoint_timestamp(checkpoints, block_number)
 }
 
-fn gnosis_block_number_at_time(timestamp: i64) -> u64 {
-    let (last_block, last_timestamp) = GNOSIS_CHECKPOINTS[GNOSIS_CHECKPOINTS.len() - 1];
+fn checkpoint_block_at_time(checkpoints: &[(u64, i64)], timestamp: i64) -> u64 {
+    let (last_block, last_timestamp) = checkpoints[checkpoints.len() - 1];
     if timestamp >= last_timestamp {
-        let blocks = (timestamp - last_timestamp) / GNOSIS_SECS_PER_BLOCK;
+        let blocks =
+            (timestamp - last_timestamp) as i128 * 1000 / trailing_ms_per_block(checkpoints);
         return last_block + blocks.max(0) as u64;
     }
-    interpolate_checkpoint_block(GNOSIS_CHECKPOINTS, timestamp)
-}
-
-fn ethereum_block_timestamp_secs(block_number: u64) -> i64 {
-    if block_number >= POST_MERGE_BLOCK {
-        POST_MERGE_TIMESTAMP + (block_number - POST_MERGE_BLOCK) as i64 * SECS_PER_BLOCK_POST_MERGE
-    } else {
-        interpolate_checkpoint_timestamp(CHECKPOINTS, block_number)
-    }
-}
-
-fn ethereum_block_number_at_time(timestamp: i64) -> u64 {
-    if timestamp >= POST_MERGE_TIMESTAMP {
-        let blocks = (timestamp - POST_MERGE_TIMESTAMP) / SECS_PER_BLOCK_POST_MERGE;
-        return POST_MERGE_BLOCK + blocks.max(0) as u64;
-    }
-
-    interpolate_checkpoint_block(CHECKPOINTS, timestamp)
+    interpolate_checkpoint_block(checkpoints, timestamp)
 }
 
 fn interpolate_checkpoint_timestamp(checkpoints: &[(u64, i64)], block_number: u64) -> i64 {
