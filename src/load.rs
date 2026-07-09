@@ -523,25 +523,16 @@ fn rebuild_verifier_alliance_registry(
 ) -> Result<()> {
     let deployments_list = sql_path_list(&inputs.contract_deployments)?;
     let verifications_list = sql_path_list(&inputs.verified_contracts)?;
-    conn.execute_batch("BEGIN TRANSACTION;")
-        .context("begin Verifier Alliance import")?;
 
-    let result = (|| -> Result<()> {
-        conn.execute_batch(&format!(
-            r#"
-            DELETE FROM verification_registry_imports
-            WHERE source = 'verifier_alliance'
-              AND chain_id = {chain_id};
-            DELETE FROM enrichment
-            WHERE verification_source = 'verifier_alliance'
-              AND chain_id = {chain_id};
-            "#,
-        ))
-        .context("prepare verification registry import")?;
-
-        let sql = format!(
-            r#"
-            CREATE OR REPLACE TEMP TABLE va_verified_contracts AS
+    // Stage the joined result sets in temp tables (spillable, no write
+    // transaction held), then write to the indexed base tables in bounded
+    // transactions — one giant transaction OOMs a 4GB host at COMMIT from
+    // buffered ART index maintenance.
+    conn.execute_batch(&format!(
+        r#"
+        CREATE OR REPLACE TEMP TABLE va_verified_contracts AS
+        SELECT *, row_number() OVER () AS rn
+        FROM (
             SELECT
                 cd.address AS contract_address,
                 (max(cd.block_number) FILTER (WHERE cd.block_number >= 0))::UINTEGER
@@ -558,77 +549,120 @@ fn rebuild_verifier_alliance_registry(
               ON cd.id = vc.deployment_id
             WHERE cd.chain_id = {chain_id}
               AND cd.address IS NOT NULL
-            GROUP BY cd.address;
+            GROUP BY cd.address
+        );
 
-            CREATE OR REPLACE TEMP TABLE enrichment_next AS
-            SELECT
-                contract_address,
-                {chain_id}::UBIGINT AS chain_id,
-                true AS is_verified,
-                CAST(NULL AS VARCHAR) AS contract_name,
-                COALESCE(checked_at, CURRENT_TIMESTAMP) AS checked_at,
-                'verifier_alliance' AS verification_source,
-                CASE
-                    WHEN runtime_match AND creation_match THEN 'runtime+creation'
-                    WHEN runtime_match THEN 'runtime'
-                    WHEN creation_match THEN 'creation'
-                    WHEN runtime_metadata_match OR creation_metadata_match THEN 'metadata'
-                    ELSE 'verified'
-                END AS match_type,
-                block_number,
-                create_index
-            FROM va_verified_contracts;
+        CREATE OR REPLACE TEMP TABLE va_file_addresses_stage AS
+        SELECT path, contract_address, row_number() OVER () AS rn
+        FROM (
+            SELECT DISTINCT
+                vc.filename AS path,
+                cd.address AS contract_address
+            FROM read_parquet({verifications_list}, filename=true) vc
+            JOIN read_parquet({deployments_list}) cd
+              ON cd.id = vc.deployment_id
+            WHERE cd.chain_id = {chain_id}
+              AND cd.address IS NOT NULL
+        );
+        "#
+    ))
+    .context("stage Verifier Alliance rebuild")?;
 
-            INSERT INTO enrichment (
-                contract_address,
-                chain_id,
-                is_verified,
-                contract_name,
-                checked_at,
-                verification_source,
-                match_type,
-                block_number,
-                create_index
+    run_in_txn(
+        conn,
+        &format!(
+            "DELETE FROM verification_registry_imports \
+             WHERE source = 'verifier_alliance' AND chain_id = {chain_id};"
+        ),
+        "clear Verifier Alliance import record",
+    )?;
+    delete_in_slices(
+        conn,
+        "enrichment",
+        &format!("verification_source = 'verifier_alliance' AND chain_id = {chain_id}"),
+        "clear Verifier Alliance enrichment rows",
+    )?;
+    delete_in_slices(
+        conn,
+        "verification_registry_file_addresses",
+        &format!("source = 'verifier_alliance' AND chain_id = {chain_id}"),
+        "clear Verifier Alliance file addresses",
+    )?;
+
+    insert_in_slices(
+        conn,
+        "va_verified_contracts",
+        "insert Verifier Alliance enrichment rows",
+        |lo, hi| {
+            format!(
+                r#"
+                INSERT INTO enrichment (
+                    contract_address, chain_id, is_verified, contract_name,
+                    checked_at, verification_source, match_type,
+                    block_number, create_index
+                )
+                SELECT
+                    contract_address,
+                    {chain_id}::UBIGINT,
+                    true,
+                    CAST(NULL AS VARCHAR),
+                    COALESCE(checked_at, CURRENT_TIMESTAMP),
+                    'verifier_alliance',
+                    CASE
+                        WHEN runtime_match AND creation_match THEN 'runtime+creation'
+                        WHEN runtime_match THEN 'runtime'
+                        WHEN creation_match THEN 'creation'
+                        WHEN runtime_metadata_match OR creation_metadata_match THEN 'metadata'
+                        ELSE 'verified'
+                    END,
+                    block_number,
+                    create_index
+                FROM va_verified_contracts
+                WHERE rn > {lo} AND rn <= {hi};
+                "#
             )
-            SELECT
-                contract_address,
-                chain_id,
-                is_verified,
-                contract_name,
-                checked_at,
-                verification_source,
-                match_type,
-                block_number,
-                create_index
-            FROM enrichment_next;
+        },
+    )?;
+    insert_in_slices(
+        conn,
+        "va_file_addresses_stage",
+        "insert Verifier Alliance file addresses",
+        |lo, hi| {
+            format!(
+                r#"
+                INSERT INTO verification_registry_file_addresses (
+                    source, chain_id, table_name, path, contract_address
+                )
+                SELECT 'verifier_alliance', {chain_id}, 'verified_contracts', path, contract_address
+                FROM va_file_addresses_stage
+                WHERE rn > {lo} AND rn <= {hi};
+                "#
+            )
+        },
+    )?;
 
+    // Bookkeeping last, so an interrupted rebuild re-runs in full.
+    run_in_txn(
+        conn,
+        &format!(
+            r#"
             INSERT INTO verification_registry_imports (
-                source,
-                chain_id,
-                imported_at,
-                verified_count
+                source, chain_id, imported_at, verified_count
             )
-            SELECT
-                'verifier_alliance',
-                {chain_id},
-                CURRENT_TIMESTAMP,
-                COUNT(*)::UBIGINT
+            SELECT 'verifier_alliance', {chain_id}, CURRENT_TIMESTAMP, COUNT(*)::UBIGINT
             FROM va_verified_contracts;
             "#
-        );
-        conn.execute_batch(&sql)
-            .context("import Verifier Alliance verified addresses")?;
-        rebuild_va_file_addresses(conn, inputs, chain_id)?;
-        replace_va_file_manifest(conn, chain_id, entries)?;
-        Ok(())
-    })();
-
-    if let Err(err) = result {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(err);
-    }
-    conn.execute_batch("COMMIT;")
-        .context("commit Verifier Alliance import")?;
+        ),
+        "record Verifier Alliance import",
+    )?;
+    replace_va_file_manifest(conn, chain_id, entries)?;
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS va_verified_contracts;
+        DROP TABLE IF EXISTS va_file_addresses_stage;
+        "#,
+    )
+    .context("drop Verifier Alliance staging tables")?;
 
     let verified = va_verified_count(conn, chain_id)?;
     print_kv_accent(
@@ -705,25 +739,25 @@ fn import_verifier_alliance_registry_incremental(
     let changed_file_values =
         sql_string_values(changed_verified.iter().map(|entry| entry.path_key.as_str()));
 
-    conn.execute_batch("BEGIN TRANSACTION;")
-        .context("begin incremental Verifier Alliance import")?;
+    // Stage every derived row set in temp tables first — the heavy parquet
+    // joins can spill to disk without holding a write transaction open.
+    conn.execute_batch(&format!(
+        r#"
+        CREATE OR REPLACE TEMP TABLE va_changed_files AS
+        SELECT col0 AS path
+        FROM (VALUES {changed_file_values});
 
-    let result = (|| -> Result<()> {
-        let sql = format!(
-            r#"
-            CREATE OR REPLACE TEMP TABLE va_changed_files AS
-            SELECT col0 AS path
-            FROM (VALUES {changed_file_values});
+        CREATE OR REPLACE TEMP TABLE va_previous_affected_addresses AS
+        SELECT DISTINCT contract_address
+        FROM verification_registry_file_addresses
+        WHERE source = 'verifier_alliance'
+          AND chain_id = {chain_id}
+          AND table_name = 'verified_contracts'
+          AND path IN (SELECT path FROM va_changed_files);
 
-            CREATE OR REPLACE TEMP TABLE va_previous_affected_addresses AS
-            SELECT DISTINCT contract_address
-            FROM verification_registry_file_addresses
-            WHERE source = 'verifier_alliance'
-              AND chain_id = {chain_id}
-              AND table_name = 'verified_contracts'
-              AND path IN (SELECT path FROM va_changed_files);
-
-            CREATE OR REPLACE TEMP TABLE va_changed_file_addresses AS
+        CREATE OR REPLACE TEMP TABLE va_changed_file_addresses AS
+        SELECT path, contract_address, row_number() OVER () AS rn
+        FROM (
             SELECT DISTINCT
                 vc.filename AS path,
                 cd.address AS contract_address
@@ -731,42 +765,17 @@ fn import_verifier_alliance_registry_incremental(
             JOIN read_parquet({deployments_list}) cd
               ON cd.id = vc.deployment_id
             WHERE cd.chain_id = {chain_id}
-              AND cd.address IS NOT NULL;
+              AND cd.address IS NOT NULL
+        );
 
-            CREATE OR REPLACE TEMP TABLE va_affected_addresses AS
-            SELECT contract_address FROM va_previous_affected_addresses
-            UNION
-            SELECT contract_address FROM va_changed_file_addresses;
+        CREATE OR REPLACE TEMP TABLE va_affected_addresses AS
+        SELECT contract_address FROM va_previous_affected_addresses
+        UNION
+        SELECT contract_address FROM va_changed_file_addresses;
 
-            DELETE FROM enrichment
-            WHERE verification_source = 'verifier_alliance'
-              AND chain_id = {chain_id}
-              AND contract_address IN (
-                  SELECT contract_address FROM va_affected_addresses
-              );
-
-            DELETE FROM verification_registry_file_addresses
-            WHERE source = 'verifier_alliance'
-              AND chain_id = {chain_id}
-              AND table_name = 'verified_contracts'
-              AND path IN (SELECT path FROM va_changed_files);
-
-            INSERT INTO verification_registry_file_addresses (
-                source,
-                chain_id,
-                table_name,
-                path,
-                contract_address
-            )
-            SELECT
-                'verifier_alliance',
-                {chain_id},
-                'verified_contracts',
-                path,
-                contract_address
-            FROM va_changed_file_addresses;
-
-            CREATE OR REPLACE TEMP TABLE va_verified_contracts AS
+        CREATE OR REPLACE TEMP TABLE va_verified_contracts AS
+        SELECT *, row_number() OVER () AS rn
+        FROM (
             SELECT
                 cd.address AS contract_address,
                 (max(cd.block_number) FILTER (WHERE cd.block_number >= 0))::UINTEGER
@@ -785,69 +794,120 @@ fn import_verifier_alliance_registry_incremental(
               ON affected.contract_address = cd.address
             WHERE cd.chain_id = {chain_id}
               AND cd.address IS NOT NULL
-            GROUP BY cd.address;
+            GROUP BY cd.address
+        );
+        "#
+    ))
+    .context("stage incremental Verifier Alliance import")?;
 
-            INSERT INTO enrichment (
-                contract_address,
-                chain_id,
-                is_verified,
-                contract_name,
-                checked_at,
-                verification_source,
-                match_type,
-                block_number,
-                create_index
+    // From here every base-table write runs in a bounded transaction: the
+    // enrichment and file-address tables carry ART indexes whose maintenance
+    // buffers in memory until COMMIT, and a single multi-million-row
+    // transaction OOMs a 4GB host. A crash between transactions is safe —
+    // the manifest only advances at the very end, so a re-run redoes the
+    // same files (deletes recompute, inserts follow deletes).
+    delete_in_slices(
+        conn,
+        "enrichment",
+        &format!(
+            "verification_source = 'verifier_alliance' AND chain_id = {chain_id} \
+             AND contract_address IN (SELECT contract_address FROM va_affected_addresses)"
+        ),
+        "clear affected Verifier Alliance enrichment rows",
+    )?;
+    delete_in_slices(
+        conn,
+        "verification_registry_file_addresses",
+        &format!(
+            "source = 'verifier_alliance' AND chain_id = {chain_id} \
+             AND table_name = 'verified_contracts' \
+             AND path IN (SELECT path FROM va_changed_files)"
+        ),
+        "clear changed Verifier Alliance file addresses",
+    )?;
+
+    insert_in_slices(
+        conn,
+        "va_changed_file_addresses",
+        "insert Verifier Alliance file addresses",
+        |lo, hi| {
+            format!(
+                r#"
+                INSERT INTO verification_registry_file_addresses (
+                    source, chain_id, table_name, path, contract_address
+                )
+                SELECT 'verifier_alliance', {chain_id}, 'verified_contracts', path, contract_address
+                FROM va_changed_file_addresses
+                WHERE rn > {lo} AND rn <= {hi};
+                "#
             )
-            SELECT
-                contract_address,
-                {chain_id}::UBIGINT AS chain_id,
-                true AS is_verified,
-                CAST(NULL AS VARCHAR) AS contract_name,
-                COALESCE(checked_at, CURRENT_TIMESTAMP) AS checked_at,
-                'verifier_alliance' AS verification_source,
-                CASE
-                    WHEN runtime_match AND creation_match THEN 'runtime+creation'
-                    WHEN runtime_match THEN 'runtime'
-                    WHEN creation_match THEN 'creation'
-                    WHEN runtime_metadata_match OR creation_metadata_match THEN 'metadata'
-                    ELSE 'verified'
-                END AS match_type,
-                block_number,
-                create_index
-            FROM va_verified_contracts;
+        },
+    )?;
+    insert_in_slices(
+        conn,
+        "va_verified_contracts",
+        "insert Verifier Alliance enrichment rows",
+        |lo, hi| {
+            format!(
+                r#"
+                INSERT INTO enrichment (
+                    contract_address, chain_id, is_verified, contract_name,
+                    checked_at, verification_source, match_type,
+                    block_number, create_index
+                )
+                SELECT
+                    contract_address,
+                    {chain_id}::UBIGINT,
+                    true,
+                    CAST(NULL AS VARCHAR),
+                    COALESCE(checked_at, CURRENT_TIMESTAMP),
+                    'verifier_alliance',
+                    CASE
+                        WHEN runtime_match AND creation_match THEN 'runtime+creation'
+                        WHEN runtime_match THEN 'runtime'
+                        WHEN creation_match THEN 'creation'
+                        WHEN runtime_metadata_match OR creation_metadata_match THEN 'metadata'
+                        ELSE 'verified'
+                    END,
+                    block_number,
+                    create_index
+                FROM va_verified_contracts
+                WHERE rn > {lo} AND rn <= {hi};
+                "#
+            )
+        },
+    )?;
 
+    // Bookkeeping last, so an interrupted import re-runs in full.
+    run_in_txn(
+        conn,
+        &format!(
+            r#"
             DELETE FROM verification_registry_imports
             WHERE source = 'verifier_alliance'
               AND chain_id = {chain_id};
-
             INSERT INTO verification_registry_imports (
-                source,
-                chain_id,
-                imported_at,
-                verified_count
+                source, chain_id, imported_at, verified_count
             )
-            SELECT
-                'verifier_alliance',
-                {chain_id},
-                CURRENT_TIMESTAMP,
-                COUNT(*)::UBIGINT
+            SELECT 'verifier_alliance', {chain_id}, CURRENT_TIMESTAMP, COUNT(*)::UBIGINT
             FROM enrichment
             WHERE verification_source = 'verifier_alliance'
               AND chain_id = {chain_id};
             "#
-        );
-        conn.execute_batch(&sql)
-            .context("import changed Verifier Alliance verified addresses")?;
-        upsert_va_file_manifest_entries(conn, chain_id, &changed_entries)?;
-        Ok(())
-    })();
-
-    if let Err(err) = result {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(err);
-    }
-    conn.execute_batch("COMMIT;")
-        .context("commit incremental Verifier Alliance import")?;
+        ),
+        "record Verifier Alliance import",
+    )?;
+    upsert_va_file_manifest_entries(conn, chain_id, &changed_entries)?;
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS va_changed_files;
+        DROP TABLE IF EXISTS va_previous_affected_addresses;
+        DROP TABLE IF EXISTS va_changed_file_addresses;
+        DROP TABLE IF EXISTS va_affected_addresses;
+        DROP TABLE IF EXISTS va_verified_contracts;
+        "#,
+    )
+    .context("drop Verifier Alliance staging tables")?;
 
     let verified = va_verified_count(conn, chain_id)?;
     print_kv_accent(
@@ -860,43 +920,6 @@ fn import_verifier_alliance_registry_incremental(
         ),
     );
     Ok(())
-}
-
-fn rebuild_va_file_addresses(
-    conn: &Connection,
-    inputs: &VerifierAllianceInputs,
-    chain_id: u64,
-) -> Result<()> {
-    let deployments_list = sql_path_list(&inputs.contract_deployments)?;
-    let verifications_list = sql_path_list(&inputs.verified_contracts)?;
-    let sql = format!(
-        r#"
-        DELETE FROM verification_registry_file_addresses
-        WHERE source = 'verifier_alliance'
-          AND chain_id = {chain_id};
-
-        INSERT INTO verification_registry_file_addresses (
-            source,
-            chain_id,
-            table_name,
-            path,
-            contract_address
-        )
-        SELECT DISTINCT
-            'verifier_alliance',
-            {chain_id},
-            'verified_contracts',
-            vc.filename,
-            cd.address
-        FROM read_parquet({verifications_list}, filename=true) vc
-        JOIN read_parquet({deployments_list}) cd
-          ON cd.id = vc.deployment_id
-        WHERE cd.chain_id = {chain_id}
-          AND cd.address IS NOT NULL;
-        "#
-    );
-    conn.execute_batch(&sql)
-        .context("rebuild Verifier Alliance file address map")
 }
 
 fn verification_registry_import_exists(conn: &Connection, chain_id: u64) -> Result<bool> {
@@ -983,6 +1006,64 @@ fn changed_va_file_entries(
         }
     }
     Ok(changed)
+}
+
+/// Rows per bounded write transaction against the enrichment/file-address
+/// tables. They carry several ART indexes whose maintenance is buffered in
+/// memory until COMMIT — landing millions of rows in one transaction OOMs a
+/// 4GB host at the finish line, so writes are sliced.
+const VA_WRITE_SLICE_ROWS: usize = 250_000;
+
+fn run_in_txn(conn: &Connection, sql: &str, what: &str) -> Result<()> {
+    let result = conn
+        .execute_batch(&format!("BEGIN;\n{sql}\nCOMMIT;"))
+        .with_context(|| what.to_string());
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    result
+}
+
+fn staged_row_count(conn: &Connection, table: &str) -> Result<i64> {
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .with_context(|| format!("count staged rows in {table}"))
+}
+
+/// Run `make_sql(lo, hi)` (an INSERT selecting staging rows with
+/// `rn > lo AND rn <= hi`) once per slice, each in its own transaction.
+fn insert_in_slices<F>(conn: &Connection, staging: &str, what: &str, make_sql: F) -> Result<()>
+where
+    F: Fn(i64, i64) -> String,
+{
+    let total = staged_row_count(conn, staging)?;
+    let mut lo = 0i64;
+    while lo < total {
+        let hi = (lo + VA_WRITE_SLICE_ROWS as i64).min(total);
+        run_in_txn(conn, &make_sql(lo, hi), what)?;
+        lo = hi;
+    }
+    Ok(())
+}
+
+/// Delete rows matching `predicate` from `table` in bounded batches, one
+/// autocommitted transaction each.
+fn delete_in_slices(conn: &Connection, table: &str, predicate: &str, what: &str) -> Result<()> {
+    loop {
+        let deleted = conn
+            .execute(
+                &format!(
+                    "DELETE FROM {table} WHERE rowid IN \
+                     (SELECT rowid FROM {table} WHERE {predicate} LIMIT {VA_WRITE_SLICE_ROWS})"
+                ),
+                [],
+            )
+            .with_context(|| what.to_string())?;
+        if deleted == 0 {
+            return Ok(());
+        }
+    }
 }
 
 fn replace_va_file_manifest(
