@@ -114,6 +114,13 @@ impl Db {
             rollups::backfill_enrichment_blocks(&writer)?;
         }
 
+        let checkpoint_count = crate::checkpoints::load_runtime(&writer)?;
+        if checkpoint_count == 0 {
+            tracing::warn!(
+                "no block-time checkpoints loaded; run `blink checkpoints` for accurate chart dates"
+            );
+        }
+
         let files = rollups::list_contract_parquet_files(data_dir, contracts_glob)?;
         views::rebuild_query_views(&writer, &files)?;
 
@@ -194,6 +201,44 @@ impl Db {
         })
         .await
         .map_err(|e| anyhow!("join error: {}", e))?
+    }
+
+    pub async fn record_block_checkpoint(
+        &self,
+        chain_id: u64,
+        block_number: u64,
+        timestamp: i64,
+    ) -> Result<()> {
+        if self.read_only {
+            return Err(anyhow!("cannot record block checkpoint in read-only mode"));
+        }
+        let writer = self.writer.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = writer.blocking_lock();
+            crate::checkpoints::ensure_schema(&conn)?;
+            crate::checkpoints::upsert(&conn, chain_id, block_number, timestamp)?;
+            crate::blocks::upsert_runtime_checkpoint(chain_id, block_number, timestamp);
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow!("join error: {}", e))?
+    }
+
+    pub async fn latest_checkpoint_block(&self, chain_id: u64) -> Result<Option<u64>> {
+        self.run_read(move |conn| {
+            if !table_exists(conn, "chain_block_checkpoints")? {
+                return Ok(None);
+            }
+            let block = conn
+                .query_row(
+                    "SELECT MAX(block_number) FROM chain_block_checkpoints WHERE chain_id = ?",
+                    params![chain_id],
+                    |row| row.get::<_, Option<u64>>(0),
+                )
+                .unwrap_or(None);
+            Ok(block)
+        })
+        .await
     }
 
     fn reader(&self) -> Arc<Mutex<Connection>> {

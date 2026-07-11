@@ -61,10 +61,10 @@ fn input_fingerprint(conn: &Connection) -> Result<String> {
     } else {
         0
     };
-    // Bump the version prefix when the table schema changes so upgraded
-    // servers rebuild instead of querying a stale shape.
+    // Bump the version prefix when the table schema or physical layout
+    // changes so upgraded servers rebuild instead of querying a stale copy.
     Ok(format!(
-        "v2|meta:{meta_rows}@{}|enr:{enrichment_rows}@{}|reg:{registry_rows}",
+        "v3|meta:{meta_rows}@{}|enr:{enrichment_rows}@{}|reg:{registry_rows}",
         meta_latest.unwrap_or_default(),
         enrichment_latest.unwrap_or_default()
     ))
@@ -168,15 +168,23 @@ fn build_slices(conn: &Connection) -> Result<Vec<ChainSlice>> {
             .div_ceil(EXPLORER_SLICE_TARGET_ROWS)
             .max(1);
         let slice_blocks = span.div_ceil(slice_count).max(1);
-        let mut start = min_block;
-        while start <= max_block {
-            let end = (start + slice_blocks - 1).min(max_block);
+        // Append each chain newest-first. DuckDB's Top-N operator can then
+        // use row-group min/max metadata to skip historical rows for the SQL
+        // explorer's common ORDER BY block_number DESC LIMIT queries.
+        let mut end = max_block;
+        loop {
+            let start = end
+                .saturating_sub(slice_blocks.saturating_sub(1))
+                .max(min_block);
             slices.push(ChainSlice {
                 chain_id,
                 start_block: start,
                 end_block: end,
             });
-            start = end + 1;
+            if start == min_block {
+                break;
+            }
+            end = start - 1;
         }
     }
     Ok(slices)
@@ -323,7 +331,7 @@ impl Db {
                  AND e.block_number BETWEEN {start_block} AND {end_block}
                 WHERE c.chain_id = {chain_id}
                   AND c.block_number BETWEEN {start_block} AND {end_block}
-                ORDER BY c.block_number, c.create_index;
+                ORDER BY c.block_number DESC, c.create_index DESC;
                 "#
             ))
             .with_context(|| {

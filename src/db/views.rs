@@ -85,7 +85,8 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
             WHERE is_proxy_minimal IS NULL;
         "#,
     )
-    .context("create blink schema")
+    .context("create blink schema")?;
+    crate::checkpoints::ensure_schema(conn)
 }
 
 /// Rebuild every temp view on this connection: the parquet-backed raw views

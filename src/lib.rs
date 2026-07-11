@@ -1,5 +1,6 @@
 pub mod blocks;
 pub mod chains;
+pub mod checkpoints;
 pub mod cli;
 pub mod db;
 pub mod decode;

@@ -499,6 +499,43 @@ async fn explorer_materialization_stays_correct_and_fresh() {
     );
 }
 
+/// The default explorer query asks for newest deployments first. Keep the
+/// materialized table in that physical order so DuckDB's Top-N scan can prune
+/// old row groups instead of walking the chain's full history.
+#[tokio::test]
+async fn explorer_materialization_is_clustered_newest_first() {
+    let dir = TestDir::new("explorer_newest_first");
+    write_multi_block_parquet(
+        &dir.path
+            .join("contracts__chain_0000000001__0000000100__0000000300.parquet"),
+        &[100, 300, 200],
+        ETHEREUM_CHAIN_ID,
+    );
+
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    assert!(db.refresh_explorer().await.unwrap());
+
+    let rows = db
+        .query_sql(
+            "SELECT block_number FROM contract_metadata_native WHERE chain_id = 1".to_string(),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            serde_json::json!(300),
+            serde_json::json!(200),
+            serde_json::json!(100),
+        ]
+    );
+}
+
 /// While a schema-upgrading explorer rebuild runs (or after a failed one),
 /// the on-disk table is the previous generation without newer columns —
 /// aggregates must fall back to the join path instead of binder-erroring.

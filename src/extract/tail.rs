@@ -41,6 +41,8 @@ pub async fn tail_once(
         .context("tail: get head block")?;
     let target = head.saturating_sub(confirmations);
 
+    sync_block_time_checkpoint(db, rpc_url, chain_id, target).await?;
+
     let highest_indexed = db.highest_block(chain_id).await?.unwrap_or(0);
     let start_block = if highest_indexed == 0 {
         target
@@ -165,4 +167,38 @@ pub async fn tail_once(
         finished_at: Utc::now(),
         skipped: false,
     }))
+}
+
+async fn sync_block_time_checkpoint(
+    db: &Db,
+    rpc_url: &str,
+    chain_id: u64,
+    target: u64,
+) -> Result<()> {
+    let latest = db.latest_checkpoint_block(chain_id).await?;
+    let interval = crate::blocks::blocks_per_day(chain_id, target).max(1);
+    if latest.is_some_and(|block| target.saturating_sub(block) < interval) {
+        return Ok(());
+    }
+
+    let client = BatchClient::new(rpc_url.to_string(), 1)?;
+    let checkpoint = client
+        .block_timestamps_batch(
+            &[target],
+            5,
+            Duration::from_millis(500),
+            Duration::from_secs(15),
+        )
+        .await?
+        .into_iter()
+        .next()
+        .context("tail: missing checkpoint block response")?;
+    db.record_block_checkpoint(chain_id, checkpoint.0, checkpoint.1)
+        .await?;
+    tracing::info!(
+        "recorded block-time checkpoint chain_id={} block={}",
+        chain_id,
+        checkpoint.0
+    );
+    Ok(())
 }

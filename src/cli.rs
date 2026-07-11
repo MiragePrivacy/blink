@@ -41,6 +41,8 @@ pub enum Commands {
     Load(LoadArgs),
     /// Decode bytecode locally: compiler version, language, ERC standards, proxy detection
     Decode(DecodeArgs),
+    /// Build persistent block-time checkpoints from configured RPCs
+    Checkpoints(CheckpointsArgs),
     /// Serve the public monitoring dashboard
     Serve(ServeArgs),
 }
@@ -57,6 +59,7 @@ fn command() -> Command {
             "contracts" => Some("blink contracts"),
             "load" => Some("blink load"),
             "decode" => Some("blink decode"),
+            "checkpoints" => Some("blink checkpoints"),
             "serve" => Some("blink serve"),
             _ => None,
         };
@@ -159,6 +162,23 @@ pub struct DecodeArgs {
     /// Re-decode every contract even if it's already in the metadata table
     #[arg(long)]
     pub overwrite: bool,
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct CheckpointsArgs {
+    /// RPC URLs to sample. Repeat for multiple chains.
+    /// BLINK_SERVE_RPCS accepts a comma-separated list.
+    #[arg(long, env = "BLINK_SERVE_RPCS", value_delimiter = ',')]
+    pub rpc: Vec<String>,
+    /// Blink data directory containing blink.duckdb (env: BLINK_DATA_DIR)
+    #[arg(long, env = "BLINK_DATA_DIR", default_value = "./data/blink")]
+    pub data_dir: PathBuf,
+    /// Distance between persistent historical checkpoints
+    #[arg(long, default_value_t = 100_000)]
+    pub interval_blocks: u64,
+    /// Block headers per JSON-RPC batch request
+    #[arg(long, default_value_t = 50)]
+    pub batch_size: usize,
 }
 
 #[derive(Parser, Debug, Clone)]
