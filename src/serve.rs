@@ -4,6 +4,8 @@
 //! Optional background tasks:
 //! - repeated `--rpc URL` flags poll one or more chain heads and extract
 //!   newly produced blocks into separate `tail__chain_*` parquet files.
+//! - `--verifier-alliance-dir` periodically downloads and incrementally
+//!   imports Verifier Alliance labels without restarting the server.
 //!
 //! Serving model: every cacheable endpoint is stale-while-revalidate. A
 //! cached entry is returned immediately no matter its age; entries past
@@ -175,6 +177,8 @@ async fn track_latency(State(state): State<AppState>, req: Request, next: Next) 
 const API_CACHE_TTL: Duration = Duration::from_secs(600);
 const HIGHEST_BLOCK_TTL: Duration = Duration::from_secs(5);
 const TAIL_START_DELAY: Duration = Duration::from_secs(15);
+const VA_SYNC_START_DELAY: Duration = Duration::from_secs(30);
+const VA_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(900);
 const DEFAULT_COMPILER_LIMIT: u32 = 12;
 const DEFAULT_RECENT_LIMIT: u32 = 20;
 const INITIAL_DEPLOYS_RANGE: &str = "day";
@@ -340,6 +344,29 @@ where
 
     fn get(&self, key: &K) -> Option<V> {
         self.lookup(key).map(|(_, value)| value)
+    }
+
+    fn remove_where(&self, predicate: impl Fn(K) -> bool) {
+        self.inner
+            .values
+            .lock()
+            .expect("cache map poisoned")
+            .retain(|key, _| !predicate(*key));
+    }
+
+    fn touch_where(&self, predicate: impl Fn(K) -> bool) {
+        let now = Instant::now();
+        for (key, (stored_at, _)) in self
+            .inner
+            .values
+            .lock()
+            .expect("cache map poisoned")
+            .iter_mut()
+        {
+            if predicate(*key) {
+                *stored_at = now;
+            }
+        }
     }
 
     /// Claim the compute slot for `key`: the holder gets the sender (waiters
@@ -586,6 +613,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     let tail_enabled = !rpcs.is_empty() && !args.read_only;
+    let verifier_alliance_dir = args.verifier_alliance_dir.clone();
     let runtime = Arc::new(RuntimeState::new(
         args.read_only,
         tail_enabled,
@@ -663,10 +691,80 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
                 data_dir: args.data_dir.clone(),
             },
         );
+        if let Some(verifier_alliance_dir) = verifier_alliance_dir {
+            spawn_verifier_alliance_sync_loop(
+                db.clone(),
+                cache.clone(),
+                verifier_alliance_dir,
+                Duration::from_secs(args.verifier_alliance_sync_interval_secs),
+            );
+        }
+    } else if verifier_alliance_dir.is_some() {
+        tracing::warn!("--read-only is set; automatic Verifier Alliance sync is disabled");
     }
     axum::serve(listener, app)
         .await
         .context("axum server failed")
+}
+
+fn spawn_verifier_alliance_sync_loop(
+    db: Db,
+    cache: Arc<ApiCache>,
+    verifier_alliance_dir: PathBuf,
+    interval: Duration,
+) {
+    let interval = interval.max(VA_SYNC_MIN_INTERVAL);
+    tracing::info!(
+        "automatic Verifier Alliance sync enabled (dir={}, interval={}s)",
+        verifier_alliance_dir.display(),
+        interval.as_secs()
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(VA_SYNC_START_DELAY).await;
+        loop {
+            let started = Instant::now();
+            tracing::info!("syncing Verifier Alliance dataset from object storage");
+            match crate::va_sync::sync_verifier_alliance_files(&verifier_alliance_dir).await {
+                Ok(()) => {
+                    for chain in chains::supported_chains() {
+                        defer_verification_cache_refreshes(&cache, chain.chain_id);
+                        match db
+                            .import_verifier_alliance(verifier_alliance_dir.clone(), chain.chain_id)
+                            .await
+                        {
+                            Ok(changed) => {
+                                if changed {
+                                    refresh_verification_cache(&db, &cache, chain.chain_id).await;
+                                }
+                                tracing::info!(
+                                    "Verifier Alliance data current for chain_id={}{}",
+                                    chain.chain_id,
+                                    if changed { " (updated)" } else { "" }
+                                );
+                            }
+                            Err(error) => tracing::warn!(
+                                "Verifier Alliance import failed for chain_id={}: {:#}",
+                                chain.chain_id,
+                                error
+                            ),
+                        }
+                    }
+                    tracing::info!(
+                        "Verifier Alliance sync completed in {:.1}s",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                Err(error) => tracing::warn!("Verifier Alliance download failed: {:#}", error),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+fn defer_verification_cache_refreshes(cache: &ApiCache, chain_id: u64) {
+    cache.stats.touch_where(|key| key == chain_id);
+    cache.verified.touch_where(|key| key.chain_id == chain_id);
+    cache.recent.touch_where(|key| key.chain_id == chain_id);
 }
 
 fn dashboard_cors_layer() -> CorsLayer {
@@ -1519,6 +1617,54 @@ async fn prewarm_chart_range(db: &Db, cache: &ApiCache, chain_id: u64, highest: 
     {
         Ok(buckets) => cache.verified.insert(cache_key, buckets),
         Err(err) => log_prewarm_error(chain_id, &format!("verification {range}"), err),
+    }
+}
+
+async fn refresh_verification_cache(db: &Db, cache: &ApiCache, chain_id: u64) {
+    cache.stats.remove_where(|key| key == chain_id);
+    cache.verified.remove_where(|key| key.chain_id == chain_id);
+    cache.recent.remove_where(|key| key.chain_id == chain_id);
+
+    match db.stats(chain_id).await {
+        Ok(stats) => cache.stats.insert(chain_id, stats),
+        Err(error) => log_prewarm_error(chain_id, "stats after VA sync", error),
+    }
+
+    let highest = match db.highest_contract_block(chain_id).await {
+        Ok(Some(block)) => block,
+        Ok(None) => 0,
+        Err(error) => {
+            log_prewarm_error(chain_id, "highest block after VA sync", error);
+            return;
+        }
+    };
+    let query = BucketQuery {
+        chain_id: Some(chain_id),
+        range: Some(INITIAL_VERIFIED_RANGE.to_string()),
+        ..BucketQuery::default()
+    };
+    let window = parse_time_series_window(&query, chain_id, highest);
+    let cache_key = bucket_cache_key(chain_id, &query, window);
+    match db
+        .verified_ratio_over_time(chain_id, window.bucket_blocks, window.block_range)
+        .await
+    {
+        Ok(buckets) => cache.verified.insert(cache_key, buckets),
+        Err(error) => log_prewarm_error(chain_id, "verification after VA sync", error),
+    }
+
+    let recent_key = RecentCacheKey {
+        chain_id,
+        limit: DEFAULT_RECENT_LIMIT,
+        before_block: None,
+        before_create_index: None,
+    };
+    match db
+        .recent_contracts(chain_id, DEFAULT_RECENT_LIMIT, None)
+        .await
+    {
+        Ok(recent) => cache.recent.insert(recent_key, recent),
+        Err(error) => log_prewarm_error(chain_id, "recent deployments after VA sync", error),
     }
 }
 

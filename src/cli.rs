@@ -223,4 +223,11 @@ pub struct ServeArgs {
     /// Read connections serving dashboard queries (0 = auto-size from cores)
     #[arg(long, env = "BLINK_DB_READERS", default_value_t = 0)]
     pub db_readers: usize,
+    /// Enable automatic Verifier Alliance download/import from this directory.
+    /// The AWS CLI must be installed and available on PATH.
+    #[arg(long, env = "BLINK_VA_DIR")]
+    pub verifier_alliance_dir: Option<PathBuf>,
+    /// Seconds between automatic Verifier Alliance sync attempts
+    #[arg(long, env = "BLINK_VA_SYNC_INTERVAL_SECS", default_value_t = 3_600)]
+    pub verifier_alliance_sync_interval_secs: u64,
 }

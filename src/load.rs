@@ -490,6 +490,29 @@ fn load_verifier_alliance_registry(
     chain_id: u64,
     rebuild_va: bool,
 ) -> Result<()> {
+    let db_path = data_dir.join("blink.duckdb");
+    let conn =
+        Connection::open(&db_path).with_context(|| format!("open duckdb {}", db_path.display()))?;
+    configure_duckdb(&conn, memory_limit, threads)?;
+    import_verifier_alliance_with_connection(&conn, inputs, chain_id, rebuild_va).map(|_| ())
+}
+
+pub(crate) fn import_verifier_alliance_from_dir(
+    conn: &Connection,
+    verifier_alliance_dir: &Path,
+    chain_id: u64,
+) -> Result<bool> {
+    let inputs = detect_verifier_alliance_inputs(Some(verifier_alliance_dir))?
+        .ok_or_else(|| anyhow!("Verifier Alliance directory is required"))?;
+    import_verifier_alliance_with_connection(conn, &inputs, chain_id, false)
+}
+
+fn import_verifier_alliance_with_connection(
+    conn: &Connection,
+    inputs: &VerifierAllianceInputs,
+    chain_id: u64,
+    rebuild_va: bool,
+) -> Result<bool> {
     let started = Instant::now();
     print_kv(
         "step",
@@ -499,18 +522,13 @@ fn load_verifier_alliance_registry(
             "import Verifier Alliance registry incrementally"
         },
     );
-
-    let db_path = data_dir.join("blink.duckdb");
-    let conn =
-        Connection::open(&db_path).with_context(|| format!("open duckdb {}", db_path.display()))?;
-    configure_duckdb(&conn, memory_limit, threads)?;
-    ensure_verification_schema(&conn)?;
+    ensure_verification_schema(conn)?;
 
     let entries = verifier_alliance_file_entries(inputs)?;
     if rebuild_va {
-        rebuild_verifier_alliance_registry(&conn, inputs, &entries, chain_id, started)
+        rebuild_verifier_alliance_registry(conn, inputs, &entries, chain_id, started)
     } else {
-        import_verifier_alliance_registry_incremental(&conn, inputs, &entries, chain_id, started)
+        import_verifier_alliance_registry_incremental(conn, inputs, &entries, chain_id, started)
     }
 }
 
@@ -520,7 +538,7 @@ fn rebuild_verifier_alliance_registry(
     entries: &[VaFileEntry],
     chain_id: u64,
     started: Instant,
-) -> Result<()> {
+) -> Result<bool> {
     let deployments_list = sql_path_list(&inputs.contract_deployments)?;
     let verifications_list = sql_path_list(&inputs.verified_contracts)?;
 
@@ -673,7 +691,7 @@ fn rebuild_verifier_alliance_registry(
             started.elapsed().as_secs_f64()
         ),
     );
-    Ok(())
+    Ok(true)
 }
 
 fn import_verifier_alliance_registry_incremental(
@@ -682,7 +700,7 @@ fn import_verifier_alliance_registry_incremental(
     entries: &[VaFileEntry],
     chain_id: u64,
     started: Instant,
-) -> Result<()> {
+) -> Result<bool> {
     let changed_entries = changed_va_file_entries(conn, chain_id, entries)?;
     let import_exists = verification_registry_import_exists(conn, chain_id)?;
     let deployment_changed = changed_entries
@@ -715,7 +733,7 @@ fn import_verifier_alliance_registry_incremental(
                 started.elapsed().as_secs_f64()
             ),
         );
-        return Ok(());
+        return Ok(false);
     }
 
     if changed_verified.is_empty() {
@@ -729,7 +747,7 @@ fn import_verifier_alliance_registry_incremental(
                 started.elapsed().as_secs_f64()
             ),
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let deployments_list = sql_path_list(&inputs.contract_deployments)?;
@@ -919,7 +937,7 @@ fn import_verifier_alliance_registry_incremental(
             started.elapsed().as_secs_f64()
         ),
     );
-    Ok(())
+    Ok(true)
 }
 
 fn verification_registry_import_exists(conn: &Connection, chain_id: u64) -> Result<bool> {

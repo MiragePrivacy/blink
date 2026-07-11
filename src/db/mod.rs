@@ -241,6 +241,25 @@ impl Db {
         .await
     }
 
+    pub async fn import_verifier_alliance(
+        &self,
+        verifier_alliance_dir: PathBuf,
+        chain_id: u64,
+    ) -> Result<bool> {
+        if self.read_only {
+            return Err(anyhow!(
+                "cannot import Verifier Alliance data in read-only mode"
+            ));
+        }
+        let writer = self.writer.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = writer.blocking_lock();
+            crate::load::import_verifier_alliance_from_dir(&conn, &verifier_alliance_dir, chain_id)
+        })
+        .await
+        .map_err(|error| anyhow!("join error: {error}"))?
+    }
+
     fn reader(&self) -> Arc<Mutex<Connection>> {
         if self.readers.is_empty() {
             return self.writer.clone();

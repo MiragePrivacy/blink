@@ -10,7 +10,7 @@ use duckdb::{params, Connection, Row};
 use super::{column_exists, rollups, sql, table_exists, Db};
 
 /// Fast path for the "recent deployments" page: scan only this many blocks
-/// below the cursor/head first, and fall back to an unbounded scan when the
+/// below the curso``r/head first, and fall back to an unbounded scan when the
 /// window doesn't fill the page (tiny datasets, sparse chains).
 const RECENT_SCAN_WINDOW_BLOCKS: u64 = 100_000;
 
