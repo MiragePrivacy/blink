@@ -26,6 +26,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use duckdb::{params, AccessMode, Config, Connection};
+use rayon::prelude::*;
 use tokio::sync::Mutex;
 
 mod explorer;
@@ -255,6 +256,33 @@ impl Db {
         tokio::task::spawn_blocking(move || -> Result<bool> {
             let conn = writer.blocking_lock();
             crate::load::import_verifier_alliance_from_dir(&conn, &verifier_alliance_dir, chain_id)
+        })
+        .await
+        .map_err(|error| anyhow!("join error: {error}"))?
+    }
+
+    /// Analyze bytecodes captured by the live tail and persist metadata by
+    /// runtime-code hash. Tail batches are small, so this keeps today's
+    /// compiler and standards widgets current without a separate decoder
+    /// process competing for the DuckDB write lock.
+    pub async fn decode_live_bytecodes(&self, bytecodes: Vec<(Vec<u8>, Vec<u8>)>) -> Result<u64> {
+        if self.read_only || bytecodes.is_empty() {
+            return Ok(0);
+        }
+        let writer = self.writer.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let analyzed = bytecodes
+                .into_par_iter()
+                .filter(|(code_hash, code)| {
+                    code_hash.len() == 32 && !code.is_empty() && code.len() <= 65_536
+                })
+                .map(|(code_hash, code)| {
+                    let metadata = crate::decode::bytecode_meta::analyze(&code);
+                    (code_hash, metadata)
+                })
+                .collect::<Vec<_>>();
+            let mut conn = writer.blocking_lock();
+            crate::decode::flush_hash_batch(&mut conn, &analyzed)
         })
         .await
         .map_err(|error| anyhow!("join error: {error}"))?

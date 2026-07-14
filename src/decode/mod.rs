@@ -298,9 +298,12 @@ fn run_decode_blocking(args: DecodeArgs, data_dir: PathBuf) -> Result<()> {
             in_file += 1;
 
             if raw.len() >= raw_batch {
-                let analyzed: Vec<(Vec<u8>, BytecodeMetadata)> = std::mem::take(&mut raw)
+                let analyzed: Vec<(Vec<u8>, Vec<u8>, BytecodeMetadata)> = std::mem::take(&mut raw)
                     .into_par_iter()
-                    .map(|(a, c)| (a, analyze(&c)))
+                    .map(|(address, code)| {
+                        let code_hash = alloy::primitives::keccak256(&code).to_vec();
+                        (address, code_hash, analyze(&code))
+                    })
                     .collect();
                 written += flush_batch(&mut write_conn, &file_path_str, &analyzed)?;
                 raw = Vec::with_capacity(raw_batch);
@@ -320,9 +323,12 @@ fn run_decode_blocking(args: DecodeArgs, data_dir: PathBuf) -> Result<()> {
         }
         let _ = std::fs::remove_file(&temp_path);
         if !raw.is_empty() {
-            let analyzed: Vec<(Vec<u8>, BytecodeMetadata)> = std::mem::take(&mut raw)
+            let analyzed: Vec<(Vec<u8>, Vec<u8>, BytecodeMetadata)> = std::mem::take(&mut raw)
                 .into_par_iter()
-                .map(|(a, c)| (a, analyze(&c)))
+                .map(|(address, code)| {
+                    let code_hash = alloy::primitives::keccak256(&code).to_vec();
+                    (address, code_hash, analyze(&code))
+                })
                 .collect();
             written += flush_batch(&mut write_conn, &file_path_str, &analyzed)?;
         }
@@ -648,7 +654,7 @@ fn temp_zellic_decode_path(db_path: &Path) -> PathBuf {
 fn flush_batch(
     conn: &mut Connection,
     source_file: &str,
-    buffer: &[(Vec<u8>, BytecodeMetadata)],
+    buffer: &[(Vec<u8>, Vec<u8>, BytecodeMetadata)],
 ) -> Result<u64> {
     if buffer.is_empty() {
         return Ok(0);
@@ -678,7 +684,7 @@ fn flush_batch(
 
     {
         let mut app = conn.appender("_bm_stage_v2").context("open v2 appender")?;
-        for (addr, meta) in buffer {
+        for (addr, _, meta) in buffer {
             app.append_row(params![
                 addr,
                 meta.language.map(|l| l.as_str()),
@@ -712,10 +718,22 @@ fn flush_batch(
         "#,
     )
     .context("insert staged metadata v2 rows")?;
+
+    let mut seen_hashes = std::collections::HashSet::with_capacity(buffer.len());
+    let hash_metadata = buffer
+        .iter()
+        .filter(|(_, code_hash, _)| seen_hashes.insert(code_hash.as_slice()))
+        .map(|(_, code_hash, metadata)| (code_hash.clone(), metadata.clone()))
+        .collect::<Vec<_>>();
+    flush_hash_batch(conn, &hash_metadata).context("insert hash metadata for parquet decode")?;
+
     Ok(buffer.len() as u64)
 }
 
-fn flush_hash_batch(conn: &mut Connection, buffer: &[(Vec<u8>, BytecodeMetadata)]) -> Result<u64> {
+pub(crate) fn flush_hash_batch(
+    conn: &mut Connection,
+    buffer: &[(Vec<u8>, BytecodeMetadata)],
+) -> Result<u64> {
     if buffer.is_empty() {
         return Ok(0);
     }
@@ -723,7 +741,8 @@ fn flush_hash_batch(conn: &mut Connection, buffer: &[(Vec<u8>, BytecodeMetadata)
     let tx = conn
         .transaction()
         .context("open hash metadata transaction")?;
-    {
+    let inserted = {
+        let mut inserted = 0u64;
         let mut stmt = tx
             .prepare(
                 r#"
@@ -732,29 +751,35 @@ fn flush_hash_batch(conn: &mut Connection, buffer: &[(Vec<u8>, BytecodeMetadata)
                     is_erc20, is_erc721, is_erc1155, is_proxy_eip1967,
                     is_proxy_minimal, uses_push0, decoded_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM bytecode_metadata_by_hash WHERE code_hash = ?
+                )
                 "#,
             )
             .context("prepare hash metadata insert")?;
         for (code_hash, meta) in buffer {
-            stmt.execute(params![
-                code_hash,
-                meta.language.map(|l| l.as_str()),
-                meta.compiler_version.as_deref(),
-                meta.has_source_hash,
-                meta.is_erc20,
-                meta.is_erc721,
-                meta.is_erc1155,
-                meta.is_proxy_eip1967,
-                meta.is_proxy_minimal,
-                meta.uses_push0,
-            ])
-            .context("insert hash metadata row")?;
+            inserted += stmt
+                .execute(params![
+                    code_hash,
+                    meta.language.map(|l| l.as_str()),
+                    meta.compiler_version.as_deref(),
+                    meta.has_source_hash,
+                    meta.is_erc20,
+                    meta.is_erc721,
+                    meta.is_erc1155,
+                    meta.is_proxy_eip1967,
+                    meta.is_proxy_minimal,
+                    meta.uses_push0,
+                    code_hash,
+                ])
+                .context("insert hash metadata row")? as u64;
         }
-    }
+        inserted
+    };
     tx.commit().context("commit hash metadata batch")?;
 
-    Ok(buffer.len() as u64)
+    Ok(inserted)
 }
 
 fn list_parquet_files(data_dir: &std::path::Path, pattern: &str) -> Result<Vec<PathBuf>> {

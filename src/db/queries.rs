@@ -212,9 +212,9 @@ fn explorer_backed(conn: &Connection) -> Result<bool> {
 }
 
 /// Per-deployment metadata rows for aggregate endpoints: the materialized
-/// table for everything up to its bounds, plus live (undecorated) rows for
-/// newer blocks — fresh contracts have rarely been decoded yet, matching the
-/// join-based semantics.
+/// table for everything up to its bounds, plus live rows joined to the small
+/// hash-keyed decode table. The tail writes that metadata before dashboard
+/// caches refresh, so current-day compiler and standards ranges stay useful.
 fn explorer_code_rows_source(chain_id: u64, block_range: Option<(u64, u64)>) -> String {
     let filter = range_filter(block_range);
     format!(
@@ -229,11 +229,14 @@ fn explorer_code_rows_source(chain_id: u64, block_range: Option<(u64, u64)>) -> 
         UNION ALL
         SELECT
             c.n_code_bytes,
-            CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), false,
-            false, false, false, false,
-            false, false, false
+            m.language, m.compiler_version, COALESCE(m.has_source_hash, false),
+            COALESCE(m.is_erc20, false), COALESCE(m.is_erc721, false),
+            COALESCE(m.is_erc1155, false), COALESCE(m.is_proxy_eip1967, false),
+            COALESCE(m.is_proxy_minimal, false), COALESCE(m.uses_push0, false),
+            m.code_hash IS NOT NULL
         FROM contract_deployments_native c
         LEFT JOIN contract_metadata_bounds b ON c.chain_id = b.chain_id
+        LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
         WHERE c.chain_id = {chain_id}
           AND (b.chain_id IS NULL OR c.block_number > b.max_block)
           {live_filter}

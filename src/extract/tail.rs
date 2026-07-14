@@ -1,6 +1,11 @@
 //! Continuous tail extraction for the dashboard's `serve` mode.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy::{
     providers::{Provider, ProviderBuilder},
@@ -87,6 +92,7 @@ pub async fn tail_once(
     let schema = parquet_io::schema();
     let mut writer = None;
     let mut rows_written = 0usize;
+    let mut live_bytecodes = HashMap::<Vec<u8>, Vec<u8>>::new();
 
     let mut pending: BTreeMap<usize, Vec<(u64, Vec<LocalizedTransactionTrace>)>> = BTreeMap::new();
     let mut next_index = 0usize;
@@ -121,6 +127,11 @@ pub async fn tail_once(
                 batch_rows.append(&mut block_rows);
             }
             if !batch_rows.is_empty() {
+                for row in &batch_rows {
+                    live_bytecodes
+                        .entry(row.code_hash.clone())
+                        .or_insert_with(|| row.code.clone());
+                }
                 batch_rows.sort_unstable_by(|a, b| {
                     a.block_number
                         .cmp(&b.block_number)
@@ -154,6 +165,12 @@ pub async fn tail_once(
     }
 
     db.refresh().await?;
+    let decoded = db
+        .decode_live_bytecodes(live_bytecodes.into_iter().collect())
+        .await?;
+    if decoded > 0 {
+        tracing::info!("decoded {} new live bytecode(s)", decoded);
+    }
 
     let size_bytes = std::fs::metadata(&output_path).ok().map(|m| m.len());
     Ok(Some(ChunkReport {

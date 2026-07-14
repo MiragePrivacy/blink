@@ -499,6 +499,73 @@ async fn explorer_materialization_stays_correct_and_fresh() {
     );
 }
 
+#[tokio::test]
+async fn live_decode_updates_ranged_aggregates_beyond_explorer_snapshot() {
+    let dir = TestDir::new("live_decode_after_explorer_snapshot");
+    write_contract_parquet(
+        &dir.path
+            .join("contracts__chain_0000000001__0000000200__0000000200.parquet"),
+        200,
+        0x03,
+        1,
+    );
+
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    assert!(db.refresh_explorer().await.unwrap());
+
+    write_contract_parquet(
+        &dir.path
+            .join("tail__chain_0000000001__0000000400__0000000400.parquet"),
+        400,
+        0x33,
+        1,
+    );
+    db.refresh().await.unwrap();
+
+    // CBOR { "solc": h'000814' } followed by its two-byte length suffix.
+    let solc_0_8_20 = vec![
+        0xa1, 0x64, 0x73, 0x6f, 0x6c, 0x63, 0x43, 0x00, 0x08, 0x14, 0x00, 0x0a,
+    ];
+    let live_hash = make_bytes(0x39, 32);
+    assert_eq!(
+        db.decode_live_bytecodes(vec![(live_hash.clone(), solc_0_8_20.clone())])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.decode_live_bytecodes(vec![(live_hash, solc_0_8_20)])
+            .await
+            .unwrap(),
+        0,
+        "replaying a tail bytecode must not duplicate hash metadata"
+    );
+
+    let compilers = db.top_compilers(1, 12, Some((400, 400))).await.unwrap();
+    assert_eq!(compilers.len(), 1);
+    assert_eq!(compilers[0].compiler_version, "0.8.20");
+    assert_eq!(compilers[0].count, 1);
+    assert_eq!(
+        db.compiler_version_total(1, Some((400, 400)))
+            .await
+            .unwrap(),
+        1
+    );
+
+    let standards = db.standards_breakdown(1, Some((400, 400))).await.unwrap();
+    assert_eq!(standards.total_decoded, 1);
+
+    let explorer = db
+        .query_sql(
+            "SELECT compiler_version FROM contract_metadata WHERE block_number = 400".to_string(),
+            10,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(explorer.rows, vec![vec![serde_json::json!("0.8.20")]]);
+}
+
 /// The default explorer query asks for newest deployments first. Keep the
 /// materialized table in that physical order so DuckDB's Top-N scan can prune
 /// old row groups instead of walking the chain's full history.

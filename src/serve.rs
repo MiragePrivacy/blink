@@ -1732,6 +1732,12 @@ async fn background_tail_loop(
                 // milliseconds — so doing it every tick is cheap.
                 if let Some(chain_id) = chain_id {
                     if report.rows > 0 {
+                        cache
+                            .bytecode_sizes
+                            .remove_where(|key| key.chain_id == chain_id);
+                        cache.compilers.remove_where(|key| key.chain_id == chain_id);
+                        cache.languages.remove_where(|key| key == chain_id);
+                        cache.standards.remove_where(|key| key.chain_id == chain_id);
                         prewarm_chain_dashboard_cache(
                             &db,
                             &cache,

@@ -476,8 +476,8 @@ fn create_standard_query_views(conn: &Connection) -> Result<()> {
 ///
 /// Prefers the materialized `contract_metadata_native` table (see
 /// `db::explorer`) with deployments newer than its bounds unioned in live and
-/// undecorated; falls back to a live join over the native tables until the
-/// materialization has been built. `transaction_hash` / `block_hash` /
+/// decorated from the hash metadata table; falls back to a live join over the
+/// native tables until the materialization has been built. `transaction_hash` / `block_hash` /
 /// `factory` are always NULL here — query the raw `contracts` view when
 /// those are needed.
 pub(crate) fn create_contract_metadata_view(conn: &Connection) -> Result<()> {
@@ -549,16 +549,16 @@ pub(crate) fn create_contract_metadata_view(conn: &Connection) -> Result<()> {
             c.code_hash,
             lower('0x' || hex(c.code_hash)) AS code_hash_hex,
             c.n_code_bytes,
-            CAST(NULL AS VARCHAR) AS language,
-            CAST(NULL AS VARCHAR) AS compiler_version,
-            CAST(false AS BOOLEAN) AS has_source_hash,
-            CAST(false AS BOOLEAN) AS is_erc20,
-            CAST(false AS BOOLEAN) AS is_erc721,
-            CAST(false AS BOOLEAN) AS is_erc1155,
-            CAST(false AS BOOLEAN) AS is_proxy_eip1967,
-            CAST(false AS BOOLEAN) AS is_proxy_minimal,
-            CAST(false AS BOOLEAN) AS uses_push0,
-            CAST(NULL AS TIMESTAMP) AS decoded_at,
+            m.language,
+            m.compiler_version,
+            COALESCE(m.has_source_hash, false) AS has_source_hash,
+            COALESCE(m.is_erc20, false) AS is_erc20,
+            COALESCE(m.is_erc721, false) AS is_erc721,
+            COALESCE(m.is_erc1155, false) AS is_erc1155,
+            COALESCE(m.is_proxy_eip1967, false) AS is_proxy_eip1967,
+            COALESCE(m.is_proxy_minimal, false) AS is_proxy_minimal,
+            COALESCE(m.uses_push0, false) AS uses_push0,
+            m.decoded_at,
             {live_verified} AS is_verified,
             CAST(NULL AS VARCHAR) AS contract_name,
             CAST(NULL AS VARCHAR) AS verification_source,
@@ -566,6 +566,7 @@ pub(crate) fn create_contract_metadata_view(conn: &Connection) -> Result<()> {
             CAST(NULL AS TIMESTAMP) AS verification_checked_at
         FROM contract_deployments_native c
         LEFT JOIN contract_metadata_bounds b ON c.chain_id = b.chain_id
+        LEFT JOIN decoded_bytecodes m ON c.code_hash = m.code_hash
         WHERE b.chain_id IS NULL OR c.block_number > b.max_block
         "#
         )
