@@ -238,12 +238,14 @@ pub(crate) fn sync_rollups(
     let mut changed = !removed.is_empty();
     for file in &files {
         let key = file.display().to_string();
-        if tracked.contains(&key) {
+        if tracked.contains(&key) || source_is_tracked(conn, &key)? {
+            tracked.insert(key);
             continue;
         }
         match ingest_parquet(conn, file) {
             Ok(rows) => {
                 changed = true;
+                tracked.insert(key.clone());
                 tracing::info!(
                     "rolled up {} ({} new deployments)",
                     file.file_name()
@@ -282,6 +284,15 @@ fn tracked_sources(conn: &Connection) -> Result<HashSet<String>> {
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     rows.collect::<Result<HashSet<_>, _>>()
         .context("list tracked rollup sources")
+}
+
+fn source_is_tracked(conn: &Connection, source_key: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM rollup_sources WHERE source_path = ?",
+        params![source_key],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// Column names of a parquet file, so ingest can adapt to the differing
@@ -461,7 +472,11 @@ fn record_source(
     inserted: u64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO rollup_sources (source_path, start_block, end_block, row_count) VALUES (?, ?, ?, ?)",
+        r#"
+        INSERT INTO rollup_sources (source_path, start_block, end_block, row_count)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (source_path) DO NOTHING
+        "#,
         params![
             source_key,
             min_block.map(u64::from),
@@ -679,4 +694,29 @@ pub(crate) fn backfill_enrichment_blocks(conn: &Connection) -> Result<()> {
         "#,
     )
     .context("backfill enrichment block positions")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_an_existing_rollup_source_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        ensure_rollup_schema(&conn).expect("rollup schema");
+
+        record_source(&conn, "/tmp/tail.parquet", Some(10), Some(20), 7).expect("record source");
+        record_source(&conn, "/tmp/tail.parquet", Some(10), Some(20), 0)
+            .expect("record source again");
+
+        let (count, rows): (i64, u64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(row_count) FROM rollup_sources WHERE source_path = ?",
+                params!["/tmp/tail.parquet"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read rollup source");
+        assert_eq!(count, 1);
+        assert_eq!(rows, 7);
+    }
 }
