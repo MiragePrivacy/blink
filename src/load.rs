@@ -787,9 +787,12 @@ fn import_verifier_alliance_registry_incremental(
         );
 
         CREATE OR REPLACE TEMP TABLE va_affected_addresses AS
-        SELECT contract_address FROM va_previous_affected_addresses
-        UNION
-        SELECT contract_address FROM va_changed_file_addresses;
+        SELECT contract_address, row_number() OVER () AS rn
+        FROM (
+            SELECT contract_address FROM va_previous_affected_addresses
+            UNION
+            SELECT contract_address FROM va_changed_file_addresses
+        );
 
         CREATE OR REPLACE TEMP TABLE va_verified_contracts AS
         SELECT *, row_number() OVER () AS rn
@@ -818,21 +821,15 @@ fn import_verifier_alliance_registry_incremental(
     ))
     .context("stage incremental Verifier Alliance import")?;
 
-    // From here every base-table write runs in a bounded transaction: the
-    // enrichment and file-address tables carry ART indexes whose maintenance
-    // buffers in memory until COMMIT, and a single multi-million-row
-    // transaction OOMs a 4GB host. A crash between transactions is safe —
-    // the manifest only advances at the very end, so a re-run redoes the
-    // same files (deletes recompute, inserts follow deletes).
-    delete_in_slices(
-        conn,
-        "enrichment",
-        &format!(
-            "verification_source = 'verifier_alliance' AND chain_id = {chain_id} \
-             AND contract_address IN (SELECT contract_address FROM va_affected_addresses)"
-        ),
-        "clear affected Verifier Alliance enrichment rows",
-    )?;
+    // Replace each bounded address slice atomically. A failed or interrupted
+    // import therefore leaves either the previous labels or the replacement
+    // labels visible for every slice, never the delete-before-insert gap that
+    // previously produced zero verified contracts on the live dashboard.
+    replace_va_enrichment_in_slices(conn, chain_id)?;
+
+    // File-address bookkeeping is updated after enrichment is already
+    // correct. The manifest advances last, so an interruption retries these
+    // files on the next run.
     delete_in_slices(
         conn,
         "verification_registry_file_addresses",
@@ -861,41 +858,6 @@ fn import_verifier_alliance_registry_incremental(
             )
         },
     )?;
-    insert_in_slices(
-        conn,
-        "va_verified_contracts",
-        "insert Verifier Alliance enrichment rows",
-        |lo, hi| {
-            format!(
-                r#"
-                INSERT INTO enrichment (
-                    contract_address, chain_id, is_verified, contract_name,
-                    checked_at, verification_source, match_type,
-                    block_number, create_index
-                )
-                SELECT
-                    contract_address,
-                    {chain_id}::UBIGINT,
-                    true,
-                    CAST(NULL AS VARCHAR),
-                    COALESCE(checked_at, CURRENT_TIMESTAMP),
-                    'verifier_alliance',
-                    CASE
-                        WHEN runtime_match AND creation_match THEN 'runtime+creation'
-                        WHEN runtime_match THEN 'runtime'
-                        WHEN creation_match THEN 'creation'
-                        WHEN runtime_metadata_match OR creation_metadata_match THEN 'metadata'
-                        ELSE 'verified'
-                    END,
-                    block_number,
-                    create_index
-                FROM va_verified_contracts
-                WHERE rn > {lo} AND rn <= {hi};
-                "#
-            )
-        },
-    )?;
-
     // Bookkeeping last, so an interrupted import re-runs in full.
     run_in_txn(
         conn,
@@ -1031,6 +993,60 @@ fn changed_va_file_entries(
 /// memory until COMMIT — landing millions of rows in one transaction OOMs a
 /// 4GB host at the finish line, so writes are sliced.
 const VA_WRITE_SLICE_ROWS: usize = 250_000;
+
+fn replace_va_enrichment_in_slices(conn: &Connection, chain_id: u64) -> Result<()> {
+    let total = staged_row_count(conn, "va_affected_addresses")?;
+    let mut lo = 0i64;
+    while lo < total {
+        let hi = (lo + VA_WRITE_SLICE_ROWS as i64).min(total);
+        run_in_txn(
+            conn,
+            &format!(
+                r#"
+                DELETE FROM enrichment
+                WHERE verification_source = 'verifier_alliance'
+                  AND chain_id = {chain_id}
+                  AND contract_address IN (
+                      SELECT contract_address
+                      FROM va_affected_addresses
+                      WHERE rn > {lo} AND rn <= {hi}
+                  );
+
+                INSERT INTO enrichment (
+                    contract_address, chain_id, is_verified, contract_name,
+                    checked_at, verification_source, match_type,
+                    block_number, create_index
+                )
+                SELECT
+                    verified.contract_address,
+                    {chain_id}::UBIGINT,
+                    true,
+                    CAST(NULL AS VARCHAR),
+                    COALESCE(verified.checked_at, CURRENT_TIMESTAMP),
+                    'verifier_alliance',
+                    CASE
+                        WHEN verified.runtime_match AND verified.creation_match
+                            THEN 'runtime+creation'
+                        WHEN verified.runtime_match THEN 'runtime'
+                        WHEN verified.creation_match THEN 'creation'
+                        WHEN verified.runtime_metadata_match
+                          OR verified.creation_metadata_match THEN 'metadata'
+                        ELSE 'verified'
+                    END,
+                    verified.block_number,
+                    verified.create_index
+                FROM va_verified_contracts verified
+                JOIN va_affected_addresses affected
+                  ON affected.contract_address = verified.contract_address
+                WHERE affected.rn > {lo} AND affected.rn <= {hi};
+                "#
+            ),
+            "replace Verifier Alliance enrichment slice",
+        )?;
+        lo = hi;
+    }
+    Ok(())
+}
 
 fn run_in_txn(conn: &Connection, sql: &str, what: &str) -> Result<()> {
     let result = conn

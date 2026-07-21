@@ -212,6 +212,59 @@ async fn stats_and_recent_include_parquet_rows_newer_than_zellic() {
 }
 
 #[tokio::test]
+async fn verification_counts_partition_deduplicated_deployments_without_registry_marker() {
+    let dir = TestDir::new("verification_stats_partition_total");
+    write_contract_parquet(
+        &dir.path.join("contracts__0000000100__0000000100.parquet"),
+        100,
+        0x01,
+        ETHEREUM_CHAIN_ID,
+    );
+    write_contract_parquet(
+        &dir.path.join("contracts__0000000200__0000000200.parquet"),
+        200,
+        0x02,
+        ETHEREUM_CHAIN_ID,
+    );
+
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    db.execute_batch(
+        r#"
+        INSERT INTO enrichment (
+            contract_address, chain_id, is_verified, checked_at, block_number, create_index
+        ) VALUES
+            (unhex(repeat('03', 20)), 1, true, CURRENT_TIMESTAMP, 100, 0),
+            (unhex(repeat('03', 20)), 1, true, CURRENT_TIMESTAMP, 100, 0),
+            (unhex(repeat('04', 20)), 1, false, CURRENT_TIMESTAMP, 200, 0),
+            (unhex(repeat('ff', 20)), 1, true, CURRENT_TIMESTAMP, 200, 0)
+        "#
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let stats = db.stats(ETHEREUM_CHAIN_ID).await.unwrap();
+    assert_eq!(stats.total_contracts, 2);
+    assert_eq!(stats.verified_count, 1);
+    assert_eq!(stats.unverified_count, 1);
+    assert_eq!(stats.verified_count + stats.unverified_count, 2);
+    assert_eq!(stats.verified_pct, 50.0);
+    assert_eq!(stats.enrichment_coverage_pct, 100.0);
+
+    let buckets = db
+        .verified_ratio_over_time(ETHEREUM_CHAIN_ID, 100, Some((100, 200)))
+        .await
+        .unwrap();
+    assert_eq!(buckets.len(), 2);
+    assert_eq!((buckets[0].verified, buckets[0].unverified), (1, 0));
+    assert_eq!((buckets[1].verified, buckets[1].unverified), (0, 1));
+    assert!(buckets.iter().all(|bucket| bucket.unknown == 0));
+    assert!(buckets
+        .iter()
+        .all(|bucket| bucket.verified + bucket.unverified == 1));
+}
+
+#[tokio::test]
 async fn rollups_are_idempotent_across_reopens() {
     let dir = TestDir::new("rollup_idempotent_reopen");
     insert_zellic_snapshot(&dir.path);
@@ -282,8 +335,8 @@ async fn chart_queries_deduplicate_overlapping_parquet_deployments() {
         .unwrap();
     assert_eq!(verified.len(), 1);
     assert_eq!(verified[0].verified, 0);
-    assert_eq!(verified[0].unverified, 0);
-    assert_eq!(verified[0].unknown, 1);
+    assert_eq!(verified[0].unverified, 1);
+    assert_eq!(verified[0].unknown, 0);
 
     db.execute_batch(
         r#"

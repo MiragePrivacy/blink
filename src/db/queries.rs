@@ -128,23 +128,13 @@ fn read_string_u64_pair(row: &Row<'_>) -> duckdb::Result<(String, u64)> {
     Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
 }
 
-fn verification_registry_loaded(conn: &Connection, chain_id: u64) -> Result<bool> {
-    if !table_exists(conn, "verification_registry_imports")? {
-        return Ok(false);
-    }
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM verification_registry_imports WHERE source = 'verifier_alliance' AND chain_id = ?",
-            params![chain_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    Ok(count > 0)
+fn range_filter(block_range: Option<(u64, u64)>) -> String {
+    range_filter_on("block_number", block_range)
 }
 
-fn range_filter(block_range: Option<(u64, u64)>) -> String {
+fn range_filter_on(column: &str, block_range: Option<(u64, u64)>) -> String {
     block_range
-        .map(|(start, end)| format!("AND block_number BETWEEN {start} AND {end}"))
+        .map(|(start, end)| format!("AND {column} BETWEEN {start} AND {end}"))
         .unwrap_or_default()
 }
 
@@ -342,46 +332,36 @@ impl Db {
                 .unwrap_or((0, None, None));
             let total = total.max(0) as u64;
 
-            let registry_loaded = verification_registry_loaded(conn, chain_id)?;
-            let (enriched, verified): (i64, i64) = if registry_loaded {
-                let verified: i64 = conn
-                    .query_row(
-                        r#"
-                        SELECT COUNT(*)
-                        FROM contract_deployments_native c
-                        JOIN enrichment e
-                          ON c.contract_address = e.contract_address
-                         AND c.chain_id = e.chain_id
-                        WHERE e.is_verified
-                          AND c.chain_id = ?
-                        "#,
-                        params![chain_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                (total as i64, verified)
-            } else {
+            let verified: i64 = if table_exists(conn, "enrichment")? {
                 conn.query_row(
-                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE is_verified) FROM enrichment WHERE chain_id = ?",
+                    r#"
+                    SELECT COUNT(*)
+                    FROM contract_deployments_native c
+                    WHERE c.chain_id = ?
+                      AND EXISTS (
+                          SELECT 1
+                          FROM enrichment e
+                          WHERE e.chain_id = c.chain_id
+                            AND e.contract_address = c.contract_address
+                            AND e.is_verified
+                      )
+                    "#,
                     params![chain_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| row.get(0),
                 )
-                .unwrap_or((0, 0))
+                .unwrap_or(0)
+            } else {
+                0
             };
 
-            let verified_count = verified.max(0) as u64;
-            let enriched_count = enriched.max(0) as u64;
-            let unverified_count = enriched_count.saturating_sub(verified_count);
-            let verified_pct = if enriched_count == 0 {
+            let verified_count = (verified.max(0) as u64).min(total);
+            let unverified_count = total.saturating_sub(verified_count);
+            let verified_pct = if total == 0 {
                 0.0
             } else {
-                100.0 * verified_count as f64 / enriched_count as f64
+                100.0 * verified_count as f64 / total as f64
             };
-            let enrichment_coverage_pct = if total == 0 {
-                0.0
-            } else {
-                100.0 * enriched_count as f64 / total as f64
-            };
+            let enrichment_coverage_pct = if total == 0 { 0.0 } else { 100.0 };
 
             Ok(Stats {
                 total_contracts: total,
@@ -446,20 +426,25 @@ impl Db {
     ) -> Result<Vec<VerifiedRatioBucket>> {
         let bucket_blocks = bucket_blocks.max(1);
         self.run_read(move |conn| {
-            let registry_loaded = verification_registry_loaded(conn, chain_id)?;
             let filter = range_filter(block_range);
+            let deployment_filter = range_filter_on("c.block_number", block_range);
             let has_enrichment = table_exists(conn, "enrichment")?;
             let checked_select = if has_enrichment {
                 format!(
                     r#"
                     SELECT
-                        (block_number // {bucket_blocks})::UBIGINT AS bucket_id,
-                        COUNT(*) FILTER (WHERE is_verified)::UBIGINT AS verified,
-                        COUNT(*) FILTER (WHERE is_verified IS FALSE)::UBIGINT AS unverified
-                    FROM enrichment
-                    WHERE block_number IS NOT NULL
-                      AND chain_id = {chain_id}
-                      {filter}
+                        (c.block_number // {bucket_blocks})::UBIGINT AS bucket_id,
+                        COUNT(*)::UBIGINT AS verified
+                    FROM contract_deployments_native c
+                    WHERE c.chain_id = {chain_id}
+                      {deployment_filter}
+                      AND EXISTS (
+                          SELECT 1
+                          FROM enrichment e
+                          WHERE e.chain_id = c.chain_id
+                            AND e.contract_address = c.contract_address
+                            AND e.is_verified
+                      )
                     GROUP BY bucket_id
                     "#
                 )
@@ -467,29 +452,14 @@ impl Db {
                 r#"
                 SELECT
                     CAST(NULL AS UBIGINT) AS bucket_id,
-                    0::UBIGINT AS verified,
-                    0::UBIGINT AS unverified
+                    0::UBIGINT AS verified
                 WHERE FALSE
                 "#
                 .to_string()
             };
 
-            // With a registry loaded, every unchecked deployment is known
-            // unverified; without one, unchecked deployments are "unknown".
             let verified_value = "LEAST(COALESCE(checked.verified, 0), totals.total)";
-            let (unverified_expr, unknown_expr) = if registry_loaded {
-                (
-                    format!("GREATEST(totals.total - {verified_value}, 0)::UBIGINT"),
-                    "0::UBIGINT".to_string(),
-                )
-            } else {
-                (
-                    "COALESCE(checked.unverified, 0)::UBIGINT".to_string(),
-                    format!(
-                        "GREATEST(totals.total - {verified_value} - COALESCE(checked.unverified, 0), 0)::UBIGINT"
-                    ),
-                )
-            };
+            let unverified_expr = format!("GREATEST(totals.total - {verified_value}, 0)::UBIGINT");
             let sql = format!(
                 r#"
                 WITH totals AS (
@@ -508,7 +478,7 @@ impl Db {
                     totals.bucket_id,
                     {verified_value}::UBIGINT AS verified,
                     {unverified_expr} AS unverified,
-                    {unknown_expr} AS unknown
+                    0::UBIGINT AS unknown
                 FROM totals
                 LEFT JOIN checked ON totals.bucket_id = checked.bucket_id
                 ORDER BY totals.bucket_id
@@ -831,8 +801,6 @@ impl Db {
         let limit = limit.clamp(1, 200);
         self.run_read(move |conn| {
             let page_limit = limit as usize + 1;
-            let registry_loaded = verification_registry_loaded(conn, chain_id)?;
-
             // Recent pages live near the head of the chain: try a bounded
             // window first so the top-N scan prunes to a handful of row
             // groups, then widen only if the page didn't fill.
@@ -864,11 +832,7 @@ impl Db {
                         .get(&row.address)
                         .cloned()
                         .unwrap_or((None, None));
-                    let is_verified = if registry_loaded {
-                        Some(verified.unwrap_or(false))
-                    } else {
-                        verified
-                    };
+                    let is_verified = Some(verified.unwrap_or(false));
                     let compiler_version = row
                         .code_hash
                         .as_ref()
