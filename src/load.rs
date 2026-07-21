@@ -703,11 +703,20 @@ fn import_verifier_alliance_registry_incremental(
 ) -> Result<bool> {
     let changed_entries = changed_va_file_entries(conn, chain_id, entries)?;
     let import_exists = verification_registry_import_exists(conn, chain_id)?;
+    let repair_inconsistent_state = import_exists
+        && changed_entries.is_empty()
+        && !verification_registry_state_consistent(conn, chain_id)?;
+    if repair_inconsistent_state {
+        tracing::warn!(
+            "Verifier Alliance registry state is inconsistent for chain_id={chain_id}; repairing from local files"
+        );
+    }
     let deployment_changed = changed_entries
         .iter()
         .any(|entry| entry.table_name == "contract_deployments");
 
-    let mut changed_verified = if deployment_changed || !import_exists {
+    let mut changed_verified = if deployment_changed || !import_exists || repair_inconsistent_state
+    {
         entries
             .iter()
             .filter(|entry| entry.table_name == "verified_contracts")
@@ -723,7 +732,7 @@ fn import_verifier_alliance_registry_incremental(
     changed_verified.sort_by_key(|entry| entry.path_key.clone());
     changed_verified.dedup_by(|a, b| a.path_key == b.path_key);
 
-    if changed_entries.is_empty() && import_exists {
+    if changed_entries.is_empty() && import_exists && !repair_inconsistent_state {
         let verified = va_verified_count(conn, chain_id)?;
         print_kv_accent(
             "verified",
@@ -909,6 +918,22 @@ fn verification_registry_import_exists(conn: &Connection, chain_id: u64) -> Resu
         |row| row.get(0),
     )?;
     Ok(count > 0)
+}
+
+fn verification_registry_state_consistent(conn: &Connection, chain_id: u64) -> Result<bool> {
+    let enriched = va_verified_count(conn, chain_id)?;
+    let tracked: i64 = conn.query_row(
+        r#"
+        SELECT COUNT(DISTINCT contract_address)
+        FROM verification_registry_file_addresses
+        WHERE source = 'verifier_alliance'
+          AND chain_id = ?
+          AND table_name = 'verified_contracts'
+        "#,
+        params![chain_id],
+        |row| row.get(0),
+    )?;
+    Ok(enriched == tracked.max(0) as u64)
 }
 
 fn va_verified_count(conn: &Connection, chain_id: u64) -> Result<u64> {

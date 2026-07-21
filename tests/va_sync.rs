@@ -150,3 +150,33 @@ async fn changed_va_partition_replaces_previous_enrichment_rows() {
         .unwrap();
     assert_eq!(imported.rows, vec![vec![serde_json::json!(0)]]);
 }
+
+#[tokio::test]
+async fn unchanged_va_files_repair_missing_enrichment_rows() {
+    let data = TestDir::new();
+    let va = TestDir::new();
+    write_va_fixture(&va.0);
+
+    let db = Db::open_with_mode(&data.0, "*.parquet", false).unwrap();
+    assert!(db.import_verifier_alliance(va.0.clone(), 1).await.unwrap());
+
+    // Reproduce an interrupted legacy import: file manifests and tracked
+    // addresses committed, but the replacement enrichment rows did not.
+    db.execute_batch(
+        "DELETE FROM enrichment WHERE verification_source = 'verifier_alliance' AND chain_id = 1"
+            .to_string(),
+    )
+    .await
+    .unwrap();
+
+    assert!(db.import_verifier_alliance(va.0.clone(), 1).await.unwrap());
+    let result = db
+        .query_sql(
+            "SELECT COUNT(*) FROM enrichment WHERE chain_id = 1 AND is_verified".to_string(),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
+}

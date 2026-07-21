@@ -821,9 +821,21 @@ async fn ranged_code_aggregates_are_exact_across_bucket_boundaries() {
         .unwrap();
     assert_eq!(sizes.iter().map(|bin| bin.count).sum::<u64>(), 12);
 
-    // Once the materialized explorer table exists, the same endpoints switch
-    // to denormalized per-deployment scans — results must be identical.
+    // The SQL Explorer materialization must not become the aggregate source:
+    // it has one row per deployment and is far too large for dashboard scans.
     assert!(db.refresh_explorer().await.unwrap());
+    db.execute_batch(
+        r#"
+        UPDATE contract_metadata_native
+        SET compiler_version = 'explorer-only',
+            language = 'explorer-only',
+            uses_push0 = false,
+            has_source_hash = false
+        "#
+        .to_string(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         db.compiler_version_total(1, Some((5_000, 25_000)))
             .await
@@ -847,6 +859,7 @@ async fn ranged_code_aggregates_are_exact_across_bucket_boundaries() {
         .await
         .unwrap();
     assert_eq!(compilers.len(), 1);
+    assert_eq!(compilers[0].compiler_version, "0.8.24");
     assert_eq!(compilers[0].count, 12);
     let standards = db
         .standards_breakdown(1, Some((5_000, 25_000)))
