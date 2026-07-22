@@ -9,6 +9,15 @@ const EXPLORER_FINGERPRINT_KEY: &str = "explorer_fingerprint";
 /// Rows per build slice — bounds the join/sort working set per transaction.
 const EXPLORER_SLICE_TARGET_ROWS: u64 = 250_000;
 
+pub(crate) fn cleanup_stale_build(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "contract_metadata_native_build")? {
+        return Ok(());
+    }
+    tracing::warn!("removing incomplete sql explorer build from an earlier run");
+    conn.execute_batch("DROP TABLE contract_metadata_native_build;")
+        .context("remove incomplete sql explorer build")
+}
+
 pub(crate) fn ensure_explorer_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -420,5 +429,16 @@ mod tests {
             ranges,
             vec![(1, 90, 100), (1, 80, 80), (1, 70, 70), (100, 200, 200)]
         );
+    }
+
+    #[test]
+    fn stale_explorer_build_is_removed_at_open() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE contract_metadata_native_build (id INTEGER);")
+            .unwrap();
+
+        cleanup_stale_build(&conn).unwrap();
+        assert!(!table_exists(&conn, "contract_metadata_native_build").unwrap());
+        cleanup_stale_build(&conn).unwrap();
     }
 }

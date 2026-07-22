@@ -22,6 +22,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -79,12 +80,15 @@ impl Db {
     }
 
     pub fn open(data_dir: &Path, contracts_glob: &str, options: DbOptions) -> Result<Self> {
+        let started = Instant::now();
         if !options.read_only {
             std::fs::create_dir_all(data_dir)
                 .with_context(|| format!("create data dir {}", data_dir.display()))?;
         }
         let db_path = data_dir.join("blink.duckdb");
+        tracing::info!("opening dashboard database {}", db_path.display());
 
+        let open_started = Instant::now();
         let writer = if options.read_only {
             // Read-only connection coexists with an active writer since DuckDB
             // only takes an exclusive lock on writers.
@@ -97,6 +101,10 @@ impl Db {
             Connection::open(&db_path)
                 .with_context(|| format!("open duckdb {}", db_path.display()))?
         };
+        tracing::info!(
+            "dashboard database file opened in {:.1}s",
+            open_started.elapsed().as_secs_f64()
+        );
         configure_connection(&writer, data_dir, &options)?;
 
         if options.read_only {
@@ -109,6 +117,8 @@ impl Db {
                 );
             }
         } else {
+            explorer::cleanup_stale_build(&writer)?;
+            tracing::info!("checking deployment rollups");
             views::ensure_schema(&writer)?;
             rollups::ensure_rollup_schema(&writer)?;
             rollups::sync_rollups(&writer, data_dir, contracts_glob)?;
@@ -123,6 +133,10 @@ impl Db {
         }
 
         let files = rollups::list_contract_parquet_files(data_dir, contracts_glob)?;
+        tracing::info!(
+            "preparing dashboard query views ({} parquet files)",
+            files.len()
+        );
         views::rebuild_query_views(&writer, &files)?;
 
         let reader_count = if options.readers == 0 {
@@ -140,6 +154,12 @@ impl Db {
             views::rebuild_query_views(&conn, &files)?;
             readers.push(Arc::new(Mutex::new(conn)));
         }
+
+        tracing::info!(
+            "dashboard database ready in {:.1}s ({} readers)",
+            started.elapsed().as_secs_f64(),
+            reader_count
+        );
 
         Ok(Self {
             writer: Arc::new(Mutex::new(writer)),

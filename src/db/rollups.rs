@@ -681,13 +681,40 @@ pub(crate) fn backfill_enrichment_blocks(conn: &Connection) -> Result<()> {
     {
         return Ok(());
     }
+    let needs_backfill: bool = conn.query_row(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM enrichment
+            WHERE block_number IS NULL OR create_index IS NULL
+            LIMIT 1
+        )
+        "#,
+        [],
+        |row| row.get(0),
+    )?;
+    if !needs_backfill {
+        return Ok(());
+    }
+    tracing::info!("backfilling missing verification block positions");
     conn.execute_batch(
         r#"
         UPDATE enrichment AS e
         SET
             block_number = c.block_number,
             create_index = c.create_index
-        FROM contract_deployments_native AS c
+        FROM (
+            SELECT
+                chain_id,
+                contract_address,
+                block_number,
+                create_index
+            FROM contract_deployments_native
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY chain_id, contract_address
+                ORDER BY block_number DESC, create_index DESC
+            ) = 1
+        ) AS c
         WHERE e.contract_address = c.contract_address
           AND e.chain_id = c.chain_id
           AND (e.block_number IS NULL OR e.create_index IS NULL);
@@ -718,5 +745,49 @@ mod tests {
             .expect("read rollup source");
         assert_eq!(count, 1);
         assert_eq!(rows, 7);
+    }
+
+    #[test]
+    fn enrichment_block_backfill_runs_only_while_positions_are_missing() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE contract_deployments_native (
+                chain_id UBIGINT,
+                block_number UINTEGER,
+                create_index UINTEGER,
+                contract_address BLOB
+            );
+            CREATE TABLE enrichment (
+                chain_id UBIGINT,
+                contract_address BLOB,
+                block_number UINTEGER,
+                create_index UINTEGER
+            );
+            CREATE INDEX enrichment_chain_addr_idx
+                ON enrichment(chain_id, contract_address);
+            CREATE INDEX enrichment_chain_block_idx
+                ON enrichment(chain_id, block_number);
+            INSERT INTO contract_deployments_native VALUES
+                (1, 123, 4, unhex(repeat('11', 20))),
+                (1, 124, 5, unhex(repeat('11', 20)));
+            INSERT INTO enrichment VALUES
+                (1, unhex(repeat('11', 20)), NULL, NULL);
+            "#,
+        )
+        .unwrap();
+
+        backfill_enrichment_blocks(&conn).unwrap();
+        let position: (u32, u32) = conn
+            .query_row(
+                "SELECT block_number, create_index FROM enrichment",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(position, (124, 5));
+
+        // A second startup has no missing rows and must take the fast path.
+        backfill_enrichment_blocks(&conn).unwrap();
     }
 }
