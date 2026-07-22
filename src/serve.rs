@@ -27,7 +27,7 @@ use std::{
     future::Future,
     hash::Hash,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
@@ -692,16 +692,6 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     ));
     let cache = Arc::new(ApiCache::default());
 
-    // Load the files already on disk before publishing any stats. Without
-    // this ordering a concurrent startup import can temporarily expose and
-    // cache zero verified contracts while affected enrichment slices are
-    // being replaced.
-    if !args.read_only {
-        if let Some(verifier_alliance_dir) = verifier_alliance_dir.as_ref() {
-            import_local_verifier_alliance(&db, verifier_alliance_dir).await;
-        }
-    }
-
     seed_runtime_snapshot(&db, &runtime).await;
     prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
 
@@ -795,30 +785,6 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     axum::serve(listener, app)
         .await
         .context("axum server failed")
-}
-
-async fn import_local_verifier_alliance(db: &Db, verifier_alliance_dir: &Path) {
-    tracing::info!(
-        "loading local Verifier Alliance data before dashboard warm (dir={})",
-        verifier_alliance_dir.display()
-    );
-    for chain in chains::supported_chains() {
-        match db
-            .import_verifier_alliance(verifier_alliance_dir.to_path_buf(), chain.chain_id)
-            .await
-        {
-            Ok(changed) => tracing::info!(
-                "local Verifier Alliance data current for chain_id={}{}",
-                chain.chain_id,
-                if changed { " (updated)" } else { "" }
-            ),
-            Err(error) => tracing::warn!(
-                "local Verifier Alliance import failed for chain_id={}: {:#}",
-                chain.chain_id,
-                error
-            ),
-        }
-    }
 }
 
 fn spawn_verifier_alliance_sync_loop(

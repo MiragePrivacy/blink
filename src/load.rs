@@ -475,8 +475,6 @@ fn ensure_verification_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS verification_registry_file_addresses_idx
             ON verification_registry_file_addresses(source, chain_id, table_name, path);
-        CREATE INDEX IF NOT EXISTS verification_registry_file_addresses_addr_idx
-            ON verification_registry_file_addresses(chain_id, contract_address);
         "#,
     )
     .context("create verification registry schema")
@@ -702,6 +700,11 @@ fn import_verifier_alliance_registry_incremental(
     started: Instant,
 ) -> Result<bool> {
     let changed_entries = changed_va_file_entries(conn, chain_id, entries)?;
+    tracing::info!(
+        "Verifier Alliance manifest checked for chain_id={} ({} changed files)",
+        chain_id,
+        changed_entries.len()
+    );
     let import_exists = verification_registry_import_exists(conn, chain_id)?;
     let repair_inconsistent_state = import_exists
         && changed_entries.is_empty()
@@ -921,19 +924,24 @@ fn verification_registry_import_exists(conn: &Connection, chain_id: u64) -> Resu
 }
 
 fn verification_registry_state_consistent(conn: &Connection, chain_id: u64) -> Result<bool> {
-    let enriched = va_verified_count(conn, chain_id)?;
-    let tracked: i64 = conn.query_row(
+    let (recorded, enriched): (Option<u64>, i64) = conn.query_row(
         r#"
-        SELECT COUNT(DISTINCT contract_address)
-        FROM verification_registry_file_addresses
-        WHERE source = 'verifier_alliance'
-          AND chain_id = ?
-          AND table_name = 'verified_contracts'
+        SELECT
+            (
+                SELECT verified_count
+                FROM verification_registry_imports
+                WHERE source = 'verifier_alliance' AND chain_id = ?
+            ),
+            (
+                SELECT COUNT(*)
+                FROM enrichment
+                WHERE verification_source = 'verifier_alliance' AND chain_id = ?
+            )
         "#,
-        params![chain_id],
-        |row| row.get(0),
+        params![chain_id, chain_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(enriched == tracked.max(0) as u64)
+    Ok(recorded == Some(enriched.max(0) as u64))
 }
 
 fn va_verified_count(conn: &Connection, chain_id: u64) -> Result<u64> {
