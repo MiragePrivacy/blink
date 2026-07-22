@@ -752,6 +752,16 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         // cold aggregate queries during startup.
         let db_explorer = db.clone();
         tokio::spawn(async move {
+            match db_explorer.backfill_enrichment_positions().await {
+                Ok(0) => {}
+                Ok(updated) => {
+                    tracing::info!("verification position backfill complete ({} rows)", updated)
+                }
+                Err(err) => tracing::warn!(
+                    "verification position backfill failed; continuing with existing data: {:#}",
+                    err
+                ),
+            }
             match db_explorer.refresh_explorer().await {
                 Ok(true) => tracing::info!("sql explorer table ready"),
                 Ok(false) => {}

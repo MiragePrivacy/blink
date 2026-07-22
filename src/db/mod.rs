@@ -122,7 +122,6 @@ impl Db {
             views::ensure_schema(&writer)?;
             rollups::ensure_rollup_schema(&writer)?;
             rollups::sync_rollups(&writer, data_dir, contracts_glob)?;
-            rollups::backfill_enrichment_blocks(&writer)?;
         }
 
         let checkpoint_count = crate::checkpoints::load_runtime(&writer)?;
@@ -208,6 +207,21 @@ impl Db {
         tokio::task::spawn_blocking(move || this.refresh_explorer_blocking())
             .await
             .map_err(|e| anyhow!("join error: {}", e))?
+    }
+
+    /// Repair legacy verification rows before rebuilding the SQL Explorer.
+    /// This is maintenance work and must not delay the dashboard listener.
+    pub async fn backfill_enrichment_positions(&self) -> Result<u64> {
+        if self.read_only {
+            return Ok(0);
+        }
+        let writer = self.writer.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = writer.blocking_lock();
+            rollups::backfill_enrichment_blocks(&conn)
+        })
+        .await
+        .map_err(|e| anyhow!("join error: {}", e))?
     }
 
     /// Run raw SQL on the writer connection. Intended for tests and admin

@@ -669,58 +669,130 @@ pub fn invalidate_zellic_rollups(conn: &Connection) -> Result<()> {
     invalidate_source(conn, ZELLIC_SOURCE_KEY)
 }
 
-/// Fill enrichment rows that lack a block position from the deployments
-/// table, so the verified-ratio chart can bucket them without joins at
-/// request time.
-pub(crate) fn backfill_enrichment_blocks(conn: &Connection) -> Result<()> {
+/// Keep legacy verified enrichment rows usable by the materialized SQL
+/// explorer. Current VA imports write these positions directly; this only
+/// repairs rows created before those columns existed.
+pub(crate) fn backfill_enrichment_blocks(conn: &Connection) -> Result<u64> {
     if !table_exists(conn, "enrichment")? {
-        return Ok(());
+        return Ok(0);
     }
     if !column_exists(conn, "enrichment", "block_number")?
         || !column_exists(conn, "enrichment", "create_index")?
     {
-        return Ok(());
+        return Ok(0);
     }
-    let needs_backfill: bool = conn.query_row(
+
+    let missing: i64 = conn.query_row(
         r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM enrichment
-            WHERE block_number IS NULL OR create_index IS NULL
-            LIMIT 1
-        )
+        SELECT COUNT(*)
+        FROM enrichment
+        WHERE is_verified
+          AND (block_number IS NULL OR create_index IS NULL)
         "#,
         [],
         |row| row.get(0),
     )?;
-    if !needs_backfill {
-        return Ok(());
+    if missing == 0 {
+        return Ok(0);
     }
-    tracing::info!("backfilling missing verification block positions");
-    conn.execute_batch(
-        r#"
-        UPDATE enrichment AS e
-        SET
-            block_number = c.block_number,
-            create_index = c.create_index
-        FROM (
-            SELECT
-                chain_id,
-                contract_address,
-                block_number,
-                create_index
-            FROM contract_deployments_native
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY chain_id, contract_address
-                ORDER BY block_number DESC, create_index DESC
-            ) = 1
-        ) AS c
-        WHERE e.contract_address = c.contract_address
-          AND e.chain_id = c.chain_id
-          AND (e.block_number IS NULL OR e.create_index IS NULL);
-        "#,
-    )
-    .context("backfill enrichment block positions")
+
+    tracing::info!(
+        "matching block positions for {} legacy verified enrichment rows",
+        missing
+    );
+    let result = (|| -> Result<u64> {
+        // Put the small side of the join in its own table before touching the
+        // deployment history. The old query ranked every deployment first,
+        // which sorted more than 100M rows on production databases.
+        conn.execute_batch(
+            r#"
+            CREATE OR REPLACE TEMP TABLE enrichment_missing_positions AS
+            SELECT DISTINCT chain_id, contract_address
+            FROM enrichment
+            WHERE is_verified
+              AND (block_number IS NULL OR create_index IS NULL);
+
+            CREATE OR REPLACE TEMP TABLE enrichment_position_backfill AS
+            SELECT *, row_number() OVER () AS rn
+            FROM (
+                SELECT
+                    c.chain_id,
+                    c.contract_address,
+                    arg_max(
+                        c.block_number,
+                        struct_pack(block := c.block_number, idx := c.create_index)
+                    )::UINTEGER AS block_number,
+                    arg_max(
+                        c.create_index,
+                        struct_pack(block := c.block_number, idx := c.create_index)
+                    )::UINTEGER AS create_index
+                FROM contract_deployments_native c
+                JOIN enrichment_missing_positions missing
+                  ON missing.chain_id = c.chain_id
+                 AND missing.contract_address = c.contract_address
+                GROUP BY c.chain_id, c.contract_address
+            );
+            "#,
+        )
+        .context("stage enrichment block positions")?;
+
+        let matched: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM enrichment_position_backfill",
+            [],
+            |row| row.get(0),
+        )?;
+        if matched == 0 {
+            tracing::warn!(
+                "none of the {} legacy verified enrichment rows matched a deployment",
+                missing
+            );
+            return Ok(0);
+        }
+
+        const SLICE_ROWS: i64 = 100_000;
+        let mut updated = 0i64;
+        while updated < matched {
+            let hi = (updated + SLICE_ROWS).min(matched);
+            conn.execute_batch(&format!(
+                r#"
+                UPDATE enrichment AS e
+                SET
+                    block_number = positions.block_number,
+                    create_index = positions.create_index
+                FROM (
+                    SELECT chain_id, contract_address, block_number, create_index
+                    FROM enrichment_position_backfill
+                    WHERE rn > {updated} AND rn <= {hi}
+                ) positions
+                WHERE e.chain_id = positions.chain_id
+                  AND e.contract_address = positions.contract_address
+                  AND e.is_verified
+                  AND (e.block_number IS NULL OR e.create_index IS NULL);
+                "#
+            ))
+            .context("update enrichment block position slice")?;
+            updated = hi;
+            tracing::info!(
+                "verification position backfill progress: {}/{}",
+                updated,
+                matched
+            );
+        }
+
+        if matched < missing {
+            tracing::warn!(
+                "{} legacy verified enrichment rows have no matching deployment",
+                missing - matched
+            );
+        }
+        Ok(matched as u64)
+    })();
+
+    let _ = conn.execute_batch(
+        "DROP TABLE IF EXISTS enrichment_position_backfill; \
+         DROP TABLE IF EXISTS enrichment_missing_positions;",
+    );
+    result
 }
 
 #[cfg(test)]
@@ -761,6 +833,7 @@ mod tests {
             CREATE TABLE enrichment (
                 chain_id UBIGINT,
                 contract_address BLOB,
+                is_verified BOOLEAN,
                 block_number UINTEGER,
                 create_index UINTEGER
             );
@@ -770,24 +843,35 @@ mod tests {
                 ON enrichment(chain_id, block_number);
             INSERT INTO contract_deployments_native VALUES
                 (1, 123, 4, unhex(repeat('11', 20))),
-                (1, 124, 5, unhex(repeat('11', 20)));
+                (1, 124, 5, unhex(repeat('11', 20))),
+                (1, 200, 1, unhex(repeat('22', 20)));
             INSERT INTO enrichment VALUES
-                (1, unhex(repeat('11', 20)), NULL, NULL);
+                (1, unhex(repeat('11', 20)), true, NULL, NULL),
+                (1, unhex(repeat('22', 20)), false, NULL, NULL);
             "#,
         )
         .unwrap();
 
-        backfill_enrichment_blocks(&conn).unwrap();
+        assert_eq!(backfill_enrichment_blocks(&conn).unwrap(), 1);
         let position: (u32, u32) = conn
             .query_row(
-                "SELECT block_number, create_index FROM enrichment",
+                "SELECT block_number, create_index FROM enrichment WHERE is_verified",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(position, (124, 5));
 
+        let unverified_position: (Option<u32>, Option<u32>) = conn
+            .query_row(
+                "SELECT block_number, create_index FROM enrichment WHERE NOT is_verified",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unverified_position, (None, None));
+
         // A second startup has no missing rows and must take the fast path.
-        backfill_enrichment_blocks(&conn).unwrap();
+        assert_eq!(backfill_enrichment_blocks(&conn).unwrap(), 0);
     }
 }

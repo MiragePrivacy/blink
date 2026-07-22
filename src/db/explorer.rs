@@ -333,8 +333,9 @@ impl Db {
                     m.code_hash IS NOT NULL
                 FROM contract_deployments_native c
                 LEFT JOIN explorer_meta_build m ON c.code_hash = m.code_hash
-                -- The block-range condition relies on
-                -- backfill_enrichment_blocks having run at open: every
+                -- The block-range condition relies on the enrichment
+                -- position maintenance having completed before this build:
+                -- every
                 -- enrichment row whose address exists in the deployments
                 -- table carries that deployment's block_number, so the join
                 -- hash-builds only this slice's enrichment rows instead of
