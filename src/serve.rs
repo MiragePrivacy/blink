@@ -459,6 +459,17 @@ mod cache_tests {
             .expect("refresh result"));
         assert_eq!(cache.get(&1), Some(20));
     }
+
+    #[test]
+    fn recognizes_errors_that_require_a_database_restart() {
+        assert!(is_fatal_database_error(
+            "FATAL Error: Corrupted ART index - likely the same row id was inserted twice"
+        ));
+        assert!(is_fatal_database_error(
+            "database has been invalidated because of a previous fatal error"
+        ));
+        assert!(!is_fatal_database_error("HTTP error 429 Too Many Requests"));
+    }
 }
 
 #[derive(Debug)]
@@ -742,16 +753,6 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         // cold aggregate queries during startup.
         let db_explorer = db.clone();
         tokio::spawn(async move {
-            match db_explorer.backfill_enrichment_positions().await {
-                Ok(0) => {}
-                Ok(updated) => {
-                    tracing::info!("verification position backfill complete ({} rows)", updated)
-                }
-                Err(err) => tracing::warn!(
-                    "verification position backfill failed; continuing with existing data: {:#}",
-                    err
-                ),
-            }
             match db_explorer.refresh_explorer().await {
                 Ok(true) => tracing::info!("sql explorer table ready"),
                 Ok(false) => {}
@@ -1954,8 +1955,23 @@ async fn background_tail_loop(
                 let msg = format!("{:#}", err);
                 runtime.mark_tail_error(chain_id, msg.clone()).await;
                 tracing::warn!("tail failed: {}", msg);
+                if is_fatal_database_error(&msg) {
+                    tracing::error!(
+                        "tail loop stopped for chain_id={}: DuckDB was invalidated; restart blink serve",
+                        chain_id
+                            .map(|chain_id| chain_id.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    );
+                    break;
+                }
             }
         }
         tokio::time::sleep(config.interval).await;
     }
+}
+
+fn is_fatal_database_error(message: &str) -> bool {
+    message.contains("database has been invalidated")
+        || message.contains("Corrupted ART index")
+        || message.contains("FATAL Error")
 }

@@ -924,7 +924,7 @@ fn verification_registry_import_exists(conn: &Connection, chain_id: u64) -> Resu
 }
 
 fn verification_registry_state_consistent(conn: &Connection, chain_id: u64) -> Result<bool> {
-    let (recorded, enriched): (Option<u64>, i64) = conn.query_row(
+    let (recorded, enriched, missing_positions): (Option<u64>, i64, i64) = conn.query_row(
         r#"
         SELECT
             (
@@ -936,12 +936,19 @@ fn verification_registry_state_consistent(conn: &Connection, chain_id: u64) -> R
                 SELECT COUNT(*)
                 FROM enrichment
                 WHERE verification_source = 'verifier_alliance' AND chain_id = ?
+            ),
+            (
+                SELECT COUNT(*)
+                FROM enrichment
+                WHERE verification_source = 'verifier_alliance'
+                  AND chain_id = ?
+                  AND (block_number IS NULL OR create_index IS NULL)
             )
         "#,
-        params![chain_id, chain_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        params![chain_id, chain_id, chain_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    Ok(recorded == Some(enriched.max(0) as u64))
+    Ok(recorded == Some(enriched.max(0) as u64) && missing_positions == 0)
 }
 
 fn va_verified_count(conn: &Connection, chain_id: u64) -> Result<u64> {
