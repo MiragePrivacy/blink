@@ -7,7 +7,7 @@ use super::{table_exists, views, Db};
 
 const EXPLORER_FINGERPRINT_KEY: &str = "explorer_fingerprint";
 /// Rows per build slice — bounds the join/sort working set per transaction.
-const EXPLORER_SLICE_TARGET_ROWS: u64 = 2_000_000;
+const EXPLORER_SLICE_TARGET_ROWS: u64 = 250_000;
 
 pub(crate) fn ensure_explorer_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -140,53 +140,42 @@ struct ChainSlice {
     end_block: u64,
 }
 
-fn build_slices(conn: &Connection) -> Result<Vec<ChainSlice>> {
-    let mut stmt = conn.prepare(
+fn build_slices(conn: &Connection, target_rows: u64) -> Result<Vec<ChainSlice>> {
+    let target_rows = target_rows.max(1);
+    let mut stmt = conn.prepare(&format!(
         r#"
-        SELECT chain_id, MIN(block_number), MAX(block_number), SUM(contract_count)
-        FROM rollup_block_counts
-        GROUP BY chain_id
-        ORDER BY chain_id
-        "#,
-    )?;
-    let chains = stmt
+        WITH cumulative AS (
+            SELECT
+                chain_id,
+                block_number,
+                SUM(contract_count) OVER (
+                    PARTITION BY chain_id
+                    ORDER BY block_number DESC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                )::UBIGINT AS cumulative_rows
+            FROM rollup_block_counts
+        ), assigned AS (
+            SELECT
+                chain_id,
+                block_number,
+                ((cumulative_rows - 1) // {target_rows})::UBIGINT AS slice_id
+            FROM cumulative
+        )
+        SELECT chain_id, MIN(block_number), MAX(block_number)
+        FROM assigned
+        GROUP BY chain_id, slice_id
+        ORDER BY chain_id, slice_id
+        "#
+    ))?;
+    let slices = stmt
         .query_map([], |row| {
-            Ok((
-                row.get::<_, u64>(0)?,
-                row.get::<_, u32>(1)?,
-                row.get::<_, u32>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
+            Ok(ChainSlice {
+                chain_id: row.get(0)?,
+                start_block: row.get::<_, u32>(1)?.into(),
+                end_block: row.get::<_, u32>(2)?.into(),
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-
-    let mut slices = Vec::new();
-    for (chain_id, min_block, max_block, rows) in chains {
-        let (min_block, max_block) = (u64::from(min_block), u64::from(max_block));
-        let span = max_block - min_block + 1;
-        let slice_count = (rows.max(0) as u64)
-            .div_ceil(EXPLORER_SLICE_TARGET_ROWS)
-            .max(1);
-        let slice_blocks = span.div_ceil(slice_count).max(1);
-        // Append each chain newest-first. DuckDB's Top-N operator can then
-        // use row-group min/max metadata to skip historical rows for the SQL
-        // explorer's common ORDER BY block_number DESC LIMIT queries.
-        let mut end = max_block;
-        loop {
-            let start = end
-                .saturating_sub(slice_blocks.saturating_sub(1))
-                .max(min_block);
-            slices.push(ChainSlice {
-                chain_id,
-                start_block: start,
-                end_block: end,
-            });
-            if start == min_block {
-                break;
-            }
-            end = start - 1;
-        }
-    }
     Ok(slices)
 }
 
@@ -195,6 +184,22 @@ impl Db {
     /// rebuild ran. Takes and releases the writer lock per slice so the tail
     /// loop keeps running during the minutes-long build.
     pub(crate) fn refresh_explorer_blocking(&self) -> Result<bool> {
+        let result = self.refresh_explorer_blocking_inner();
+        if result.is_err() {
+            let conn = self.writer.blocking_lock();
+            if let Err(error) = conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS contract_metadata_native_build;
+                DROP TABLE IF EXISTS explorer_meta_build;
+                "#,
+            ) {
+                tracing::warn!("could not clean up failed sql explorer build: {error}");
+            }
+        }
+        result
+    }
+
+    fn refresh_explorer_blocking_inner(&self) -> Result<bool> {
         if self.read_only {
             return Ok(false);
         }
@@ -277,7 +282,7 @@ impl Db {
 
         let slices = {
             let conn = self.writer.blocking_lock();
-            build_slices(&conn)?
+            build_slices(&conn, EXPLORER_SLICE_TARGET_ROWS)?
         };
         let total_slices = slices.len();
         let is_verified_expr = {
@@ -379,5 +384,41 @@ impl Db {
             views::create_contract_metadata_view(&conn)?;
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explorer_slices_follow_row_density_newest_first() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE rollup_block_counts (
+                chain_id UBIGINT,
+                block_number UINTEGER,
+                contract_count UBIGINT
+            );
+            INSERT INTO rollup_block_counts VALUES
+                (1, 100, 1),
+                (1, 90, 9),
+                (1, 80, 6),
+                (1, 70, 6),
+                (100, 200, 3);
+            "#,
+        )
+        .unwrap();
+
+        let slices = build_slices(&conn, 10).unwrap();
+        let ranges = slices
+            .into_iter()
+            .map(|slice| (slice.chain_id, slice.start_block, slice.end_block))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranges,
+            vec![(1, 90, 100), (1, 80, 80), (1, 70, 70), (100, 200, 200)]
+        );
     }
 }
