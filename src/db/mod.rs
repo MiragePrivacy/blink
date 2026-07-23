@@ -223,6 +223,17 @@ impl Db {
         .map_err(|e| anyhow!("join error: {}", e))?
     }
 
+    /// Confirm the shared DuckDB instance is still usable. A DuckDB fatal
+    /// error invalidates every connection in the instance until restart.
+    pub async fn health_check(&self) -> Result<()> {
+        self.run_read(|conn| {
+            conn.query_row("SELECT 1", [], |row| row.get::<_, i32>(0))
+                .context("query dashboard database health")?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn record_block_checkpoint(
         &self,
         chain_id: u64,

@@ -704,7 +704,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     let cache = Arc::new(ApiCache::default());
 
     seed_runtime_snapshot(&db, &runtime).await;
-    prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await;
+    prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await?;
 
     let state = AppState {
         db: db.clone(),
@@ -1528,7 +1528,7 @@ struct LanguagesResponse {
     languages: Vec<crate::db::LanguageCount>,
 }
 
-async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
+async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) -> Result<()> {
     let started = Instant::now();
     tracing::info!("warming dashboard cache in background");
     for chain in chains::supported_chains() {
@@ -1541,10 +1541,14 @@ async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
         )
         .await;
     }
+    db.health_check()
+        .await
+        .context("dashboard database was invalidated during cache warm")?;
     tracing::info!(
         "dashboard cache warmed in {:.1}s",
         started.elapsed().as_secs_f64()
     );
+    Ok(())
 }
 
 fn spawn_tail_loops(
