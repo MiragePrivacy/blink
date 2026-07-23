@@ -212,6 +212,59 @@ async fn stats_and_recent_include_parquet_rows_newer_than_zellic() {
 }
 
 #[tokio::test]
+async fn verification_counts_partition_deduplicated_deployments_without_registry_marker() {
+    let dir = TestDir::new("verification_stats_partition_total");
+    write_contract_parquet(
+        &dir.path.join("contracts__0000000100__0000000100.parquet"),
+        100,
+        0x01,
+        ETHEREUM_CHAIN_ID,
+    );
+    write_contract_parquet(
+        &dir.path.join("contracts__0000000200__0000000200.parquet"),
+        200,
+        0x02,
+        ETHEREUM_CHAIN_ID,
+    );
+
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    db.execute_batch(
+        r#"
+        INSERT INTO enrichment (
+            contract_address, chain_id, is_verified, checked_at, block_number, create_index
+        ) VALUES
+            (unhex(repeat('03', 20)), 1, true, CURRENT_TIMESTAMP, 100, 0),
+            (unhex(repeat('03', 20)), 1, true, CURRENT_TIMESTAMP, 100, 0),
+            (unhex(repeat('04', 20)), 1, false, CURRENT_TIMESTAMP, 200, 0),
+            (unhex(repeat('ff', 20)), 1, true, CURRENT_TIMESTAMP, 200, 0)
+        "#
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let stats = db.stats(ETHEREUM_CHAIN_ID).await.unwrap();
+    assert_eq!(stats.total_contracts, 2);
+    assert_eq!(stats.verified_count, 1);
+    assert_eq!(stats.unverified_count, 1);
+    assert_eq!(stats.verified_count + stats.unverified_count, 2);
+    assert_eq!(stats.verified_pct, 50.0);
+    assert_eq!(stats.enrichment_coverage_pct, 100.0);
+
+    let buckets = db
+        .verified_ratio_over_time(ETHEREUM_CHAIN_ID, 100, Some((100, 200)))
+        .await
+        .unwrap();
+    assert_eq!(buckets.len(), 2);
+    assert_eq!((buckets[0].verified, buckets[0].unverified), (1, 0));
+    assert_eq!((buckets[1].verified, buckets[1].unverified), (0, 1));
+    assert!(buckets.iter().all(|bucket| bucket.unknown == 0));
+    assert!(buckets
+        .iter()
+        .all(|bucket| bucket.verified + bucket.unverified == 1));
+}
+
+#[tokio::test]
 async fn rollups_are_idempotent_across_reopens() {
     let dir = TestDir::new("rollup_idempotent_reopen");
     insert_zellic_snapshot(&dir.path);
@@ -282,8 +335,8 @@ async fn chart_queries_deduplicate_overlapping_parquet_deployments() {
         .unwrap();
     assert_eq!(verified.len(), 1);
     assert_eq!(verified[0].verified, 0);
-    assert_eq!(verified[0].unverified, 0);
-    assert_eq!(verified[0].unknown, 1);
+    assert_eq!(verified[0].unverified, 1);
+    assert_eq!(verified[0].unknown, 0);
 
     db.execute_batch(
         r#"
@@ -499,6 +552,110 @@ async fn explorer_materialization_stays_correct_and_fresh() {
     );
 }
 
+#[tokio::test]
+async fn live_decode_updates_ranged_aggregates_beyond_explorer_snapshot() {
+    let dir = TestDir::new("live_decode_after_explorer_snapshot");
+    write_contract_parquet(
+        &dir.path
+            .join("contracts__chain_0000000001__0000000200__0000000200.parquet"),
+        200,
+        0x03,
+        1,
+    );
+
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    assert!(db.refresh_explorer().await.unwrap());
+
+    write_contract_parquet(
+        &dir.path
+            .join("tail__chain_0000000001__0000000400__0000000400.parquet"),
+        400,
+        0x33,
+        1,
+    );
+    db.refresh().await.unwrap();
+
+    // CBOR { "solc": h'000814' } followed by its two-byte length suffix.
+    let solc_0_8_20 = vec![
+        0xa1, 0x64, 0x73, 0x6f, 0x6c, 0x63, 0x43, 0x00, 0x08, 0x14, 0x00, 0x0a,
+    ];
+    let live_hash = make_bytes(0x39, 32);
+    assert_eq!(
+        db.decode_live_bytecodes(vec![(live_hash.clone(), solc_0_8_20.clone())])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.decode_live_bytecodes(vec![(live_hash, solc_0_8_20)])
+            .await
+            .unwrap(),
+        0,
+        "replaying a tail bytecode must not duplicate hash metadata"
+    );
+
+    let compilers = db.top_compilers(1, 12, Some((400, 400))).await.unwrap();
+    assert_eq!(compilers.len(), 1);
+    assert_eq!(compilers[0].compiler_version, "0.8.20");
+    assert_eq!(compilers[0].count, 1);
+    assert_eq!(
+        db.compiler_version_total(1, Some((400, 400)))
+            .await
+            .unwrap(),
+        1
+    );
+
+    let standards = db.standards_breakdown(1, Some((400, 400))).await.unwrap();
+    assert_eq!(standards.total_decoded, 1);
+
+    let explorer = db
+        .query_sql(
+            "SELECT compiler_version FROM contract_metadata WHERE block_number = 400".to_string(),
+            10,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(explorer.rows, vec![vec![serde_json::json!("0.8.20")]]);
+}
+
+/// The default explorer query asks for newest deployments first. Keep the
+/// materialized table in that physical order so DuckDB's Top-N scan can prune
+/// old row groups instead of walking the chain's full history.
+#[tokio::test]
+async fn explorer_materialization_is_clustered_newest_first() {
+    let dir = TestDir::new("explorer_newest_first");
+    write_multi_block_parquet(
+        &dir.path
+            .join("contracts__chain_0000000001__0000000100__0000000300.parquet"),
+        &[100, 300, 200],
+        ETHEREUM_CHAIN_ID,
+    );
+
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    assert!(db.refresh_explorer().await.unwrap());
+
+    let rows = db
+        .query_sql(
+            "SELECT block_number FROM contract_metadata_native WHERE chain_id = 1".to_string(),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            serde_json::json!(300),
+            serde_json::json!(200),
+            serde_json::json!(100),
+        ]
+    );
+}
+
 /// While a schema-upgrading explorer rebuild runs (or after a failed one),
 /// the on-disk table is the previous generation without newer columns —
 /// aggregates must fall back to the join path instead of binder-erroring.
@@ -664,9 +821,21 @@ async fn ranged_code_aggregates_are_exact_across_bucket_boundaries() {
         .unwrap();
     assert_eq!(sizes.iter().map(|bin| bin.count).sum::<u64>(), 12);
 
-    // Once the materialized explorer table exists, the same endpoints switch
-    // to denormalized per-deployment scans — results must be identical.
+    // The SQL Explorer materialization must not become the aggregate source:
+    // it has one row per deployment and is far too large for dashboard scans.
     assert!(db.refresh_explorer().await.unwrap());
+    db.execute_batch(
+        r#"
+        UPDATE contract_metadata_native
+        SET compiler_version = 'explorer-only',
+            language = 'explorer-only',
+            uses_push0 = false,
+            has_source_hash = false
+        "#
+        .to_string(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         db.compiler_version_total(1, Some((5_000, 25_000)))
             .await
@@ -690,6 +859,7 @@ async fn ranged_code_aggregates_are_exact_across_bucket_boundaries() {
         .await
         .unwrap();
     assert_eq!(compilers.len(), 1);
+    assert_eq!(compilers[0].compiler_version, "0.8.24");
     assert_eq!(compilers[0].count, 12);
     let standards = db
         .standards_breakdown(1, Some((5_000, 25_000)))

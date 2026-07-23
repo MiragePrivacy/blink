@@ -7,10 +7,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Row};
 
-use super::{column_exists, rollups, sql, table_exists, Db};
+use super::{rollups, sql, table_exists, Db};
 
 /// Fast path for the "recent deployments" page: scan only this many blocks
-/// below the cursor/head first, and fall back to an unbounded scan when the
+/// below the curso``r/head first, and fall back to an unbounded scan when the
 /// window doesn't fill the page (tiny datasets, sparse chains).
 const RECENT_SCAN_WINDOW_BLOCKS: u64 = 100_000;
 
@@ -128,23 +128,13 @@ fn read_string_u64_pair(row: &Row<'_>) -> duckdb::Result<(String, u64)> {
     Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
 }
 
-fn verification_registry_loaded(conn: &Connection, chain_id: u64) -> Result<bool> {
-    if !table_exists(conn, "verification_registry_imports")? {
-        return Ok(false);
-    }
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM verification_registry_imports WHERE source = 'verifier_alliance' AND chain_id = ?",
-            params![chain_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    Ok(count > 0)
+fn range_filter(block_range: Option<(u64, u64)>) -> String {
+    range_filter_on("block_number", block_range)
 }
 
-fn range_filter(block_range: Option<(u64, u64)>) -> String {
+fn range_filter_on(column: &str, block_range: Option<(u64, u64)>) -> String {
     block_range
-        .map(|(start, end)| format!("AND block_number BETWEEN {start} AND {end}"))
+        .map(|(start, end)| format!("AND {column} BETWEEN {start} AND {end}"))
         .unwrap_or_default()
 }
 
@@ -195,53 +185,6 @@ fn code_counts_source(chain_id: u64, block_range: Option<(u64, u64)>) -> String 
         parts.push(deployments_code_scan(chain_id, trailing_start_block, end));
     }
     parts.join("\nUNION ALL\n")
-}
-
-/// Whether the materialized explorer table can back the metadata aggregates
-/// (compilers/standards/sizes/languages). It denormalizes decode metadata per
-/// deployment, sorted by (chain, block), so ranged aggregates are pruned
-/// scans with no join against the multi-million-row metadata table.
-///
-/// The column check matters: while a schema-upgrading rebuild runs (or if one
-/// failed), the previous-generation table is still what's on disk — fall back
-/// to the join path rather than referencing columns it doesn't have yet.
-fn explorer_backed(conn: &Connection) -> Result<bool> {
-    Ok(table_exists(conn, "contract_metadata_native")?
-        && table_exists(conn, "contract_metadata_bounds")?
-        && column_exists(conn, "contract_metadata_native", "is_decoded")?)
-}
-
-/// Per-deployment metadata rows for aggregate endpoints: the materialized
-/// table for everything up to its bounds, plus live (undecorated) rows for
-/// newer blocks — fresh contracts have rarely been decoded yet, matching the
-/// join-based semantics.
-fn explorer_code_rows_source(chain_id: u64, block_range: Option<(u64, u64)>) -> String {
-    let filter = range_filter(block_range);
-    format!(
-        r#"
-        SELECT
-            n_code_bytes, language, compiler_version, has_source_hash,
-            is_erc20, is_erc721, is_erc1155, is_proxy_eip1967,
-            is_proxy_minimal, uses_push0, is_decoded
-        FROM contract_metadata_native
-        WHERE chain_id = {chain_id}
-          {filter}
-        UNION ALL
-        SELECT
-            c.n_code_bytes,
-            CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), false,
-            false, false, false, false,
-            false, false, false
-        FROM contract_deployments_native c
-        LEFT JOIN contract_metadata_bounds b ON c.chain_id = b.chain_id
-        WHERE c.chain_id = {chain_id}
-          AND (b.chain_id IS NULL OR c.block_number > b.max_block)
-          {live_filter}
-        "#,
-        live_filter = block_range
-            .map(|(start, end)| format!("AND c.block_number BETWEEN {start} AND {end}"))
-            .unwrap_or_default()
-    )
 }
 
 fn deployments_code_scan(chain_id: u64, start: u64, end: u64) -> String {
@@ -339,46 +282,36 @@ impl Db {
                 .unwrap_or((0, None, None));
             let total = total.max(0) as u64;
 
-            let registry_loaded = verification_registry_loaded(conn, chain_id)?;
-            let (enriched, verified): (i64, i64) = if registry_loaded {
-                let verified: i64 = conn
-                    .query_row(
-                        r#"
-                        SELECT COUNT(*)
-                        FROM contract_deployments_native c
-                        JOIN enrichment e
-                          ON c.contract_address = e.contract_address
-                         AND c.chain_id = e.chain_id
-                        WHERE e.is_verified
-                          AND c.chain_id = ?
-                        "#,
-                        params![chain_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                (total as i64, verified)
-            } else {
+            let verified: i64 = if table_exists(conn, "enrichment")? {
                 conn.query_row(
-                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE is_verified) FROM enrichment WHERE chain_id = ?",
+                    r#"
+                    SELECT COUNT(*)
+                    FROM contract_deployments_native c
+                    WHERE c.chain_id = ?
+                      AND EXISTS (
+                          SELECT 1
+                          FROM enrichment e
+                          WHERE e.chain_id = c.chain_id
+                            AND e.contract_address = c.contract_address
+                            AND e.is_verified
+                      )
+                    "#,
                     params![chain_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| row.get(0),
                 )
-                .unwrap_or((0, 0))
+                .unwrap_or(0)
+            } else {
+                0
             };
 
-            let verified_count = verified.max(0) as u64;
-            let enriched_count = enriched.max(0) as u64;
-            let unverified_count = enriched_count.saturating_sub(verified_count);
-            let verified_pct = if enriched_count == 0 {
+            let verified_count = (verified.max(0) as u64).min(total);
+            let unverified_count = total.saturating_sub(verified_count);
+            let verified_pct = if total == 0 {
                 0.0
             } else {
-                100.0 * verified_count as f64 / enriched_count as f64
+                100.0 * verified_count as f64 / total as f64
             };
-            let enrichment_coverage_pct = if total == 0 {
-                0.0
-            } else {
-                100.0 * enriched_count as f64 / total as f64
-            };
+            let enrichment_coverage_pct = if total == 0 { 0.0 } else { 100.0 };
 
             Ok(Stats {
                 total_contracts: total,
@@ -443,20 +376,25 @@ impl Db {
     ) -> Result<Vec<VerifiedRatioBucket>> {
         let bucket_blocks = bucket_blocks.max(1);
         self.run_read(move |conn| {
-            let registry_loaded = verification_registry_loaded(conn, chain_id)?;
             let filter = range_filter(block_range);
+            let deployment_filter = range_filter_on("c.block_number", block_range);
             let has_enrichment = table_exists(conn, "enrichment")?;
             let checked_select = if has_enrichment {
                 format!(
                     r#"
                     SELECT
-                        (block_number // {bucket_blocks})::UBIGINT AS bucket_id,
-                        COUNT(*) FILTER (WHERE is_verified)::UBIGINT AS verified,
-                        COUNT(*) FILTER (WHERE is_verified IS FALSE)::UBIGINT AS unverified
-                    FROM enrichment
-                    WHERE block_number IS NOT NULL
-                      AND chain_id = {chain_id}
-                      {filter}
+                        (c.block_number // {bucket_blocks})::UBIGINT AS bucket_id,
+                        COUNT(*)::UBIGINT AS verified
+                    FROM contract_deployments_native c
+                    WHERE c.chain_id = {chain_id}
+                      {deployment_filter}
+                      AND EXISTS (
+                          SELECT 1
+                          FROM enrichment e
+                          WHERE e.chain_id = c.chain_id
+                            AND e.contract_address = c.contract_address
+                            AND e.is_verified
+                      )
                     GROUP BY bucket_id
                     "#
                 )
@@ -464,29 +402,14 @@ impl Db {
                 r#"
                 SELECT
                     CAST(NULL AS UBIGINT) AS bucket_id,
-                    0::UBIGINT AS verified,
-                    0::UBIGINT AS unverified
+                    0::UBIGINT AS verified
                 WHERE FALSE
                 "#
                 .to_string()
             };
 
-            // With a registry loaded, every unchecked deployment is known
-            // unverified; without one, unchecked deployments are "unknown".
             let verified_value = "LEAST(COALESCE(checked.verified, 0), totals.total)";
-            let (unverified_expr, unknown_expr) = if registry_loaded {
-                (
-                    format!("GREATEST(totals.total - {verified_value}, 0)::UBIGINT"),
-                    "0::UBIGINT".to_string(),
-                )
-            } else {
-                (
-                    "COALESCE(checked.unverified, 0)::UBIGINT".to_string(),
-                    format!(
-                        "GREATEST(totals.total - {verified_value} - COALESCE(checked.unverified, 0), 0)::UBIGINT"
-                    ),
-                )
-            };
+            let unverified_expr = format!("GREATEST(totals.total - {verified_value}, 0)::UBIGINT");
             let sql = format!(
                 r#"
                 WITH totals AS (
@@ -505,7 +428,7 @@ impl Db {
                     totals.bucket_id,
                     {verified_value}::UBIGINT AS verified,
                     {unverified_expr} AS unverified,
-                    {unknown_expr} AS unknown
+                    0::UBIGINT AS unknown
                 FROM totals
                 LEFT JOIN checked ON totals.bucket_id = checked.bucket_id
                 ORDER BY totals.bucket_id
@@ -572,43 +495,29 @@ impl Db {
                         ELSE 11
                     END AS bin_id
             "#;
-            let sql = if explorer_backed(conn)? {
-                let rows_source = explorer_code_rows_source(chain_id, block_range);
-                format!(
-                    r#"
-                    SELECT {bin_case}, COUNT(*)::UBIGINT AS cnt
-                    FROM ({rows_source}) rows
-                    WHERE n_code_bytes IS NOT NULL
-                      AND n_code_bytes <= 24576
-                    GROUP BY bin_id
-                    ORDER BY bin_id
-                    "#
+            let count_source = code_counts_source(chain_id, block_range);
+            let sql = format!(
+                r#"
+                WITH counts AS (
+                    {count_source}
                 )
-            } else {
-                let count_source = code_counts_source(chain_id, block_range);
-                format!(
-                    r#"
-                    WITH counts AS (
-                        {count_source}
-                    )
+                SELECT
+                    {bin_case},
+                    SUM(counts.contract_count)::UBIGINT AS cnt
+                FROM (
                     SELECT
-                        {bin_case},
-                        SUM(counts.contract_count)::UBIGINT AS cnt
-                    FROM (
-                        SELECT
-                            counts.n_code_bytes AS n_code_bytes,
-                            m.is_proxy_minimal AS is_proxy_minimal,
-                            counts.contract_count AS contract_count
-                        FROM counts
-                        LEFT JOIN bytecode_metadata_by_hash m ON counts.code_hash = m.code_hash
-                    ) counts
-                    WHERE counts.n_code_bytes IS NOT NULL
-                      AND counts.n_code_bytes <= 24576
-                    GROUP BY bin_id
-                    ORDER BY bin_id
-                    "#
-                )
-            };
+                        counts.n_code_bytes AS n_code_bytes,
+                        m.is_proxy_minimal AS is_proxy_minimal,
+                        counts.contract_count AS contract_count
+                    FROM counts
+                    LEFT JOIN bytecode_metadata_by_hash m ON counts.code_hash = m.code_hash
+                ) counts
+                WHERE counts.n_code_bytes IS NOT NULL
+                  AND counts.n_code_bytes <= 24576
+                GROUP BY bin_id
+                ORDER BY bin_id
+                "#
+            );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map([], read_u64_pair)?;
             for r in rows {
@@ -642,35 +551,21 @@ impl Db {
             // Compiler distribution is bytecode-derived. Verification sources
             // can confirm source publication, but local decode remains the
             // source of truth for compiler metadata in this dashboard.
-            let sql = if explorer_backed(conn)? {
-                let rows_source = explorer_code_rows_source(chain_id, block_range);
-                format!(
-                    r#"
-                    SELECT compiler_version, COUNT(*)::UBIGINT AS cnt
-                    FROM ({rows_source}) rows
-                    WHERE compiler_version IS NOT NULL
-                    GROUP BY compiler_version
-                    ORDER BY cnt DESC
-                    LIMIT ?
-                    "#
+            let count_source = code_counts_source(chain_id, block_range);
+            let sql = format!(
+                r#"
+                WITH counts AS (
+                    {count_source}
                 )
-            } else {
-                let count_source = code_counts_source(chain_id, block_range);
-                format!(
-                    r#"
-                    WITH counts AS (
-                        {count_source}
-                    )
-                    SELECT m.compiler_version, SUM(c.contract_count)::UBIGINT AS cnt
-                    FROM counts c
-                    JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
-                    WHERE m.compiler_version IS NOT NULL
-                    GROUP BY m.compiler_version
-                    ORDER BY cnt DESC
-                    LIMIT ?
-                    "#
-                )
-            };
+                SELECT m.compiler_version, SUM(c.contract_count)::UBIGINT AS cnt
+                FROM counts c
+                JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
+                WHERE m.compiler_version IS NOT NULL
+                GROUP BY m.compiler_version
+                ORDER BY cnt DESC
+                LIMIT ?
+                "#
+            );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params![limit as i64], read_string_u64_pair)?;
             let mut out = Vec::new();
@@ -692,29 +587,18 @@ impl Db {
         block_range: Option<(u64, u64)>,
     ) -> Result<u64> {
         self.run_read(move |conn| {
-            let sql = if explorer_backed(conn)? {
-                let rows_source = explorer_code_rows_source(chain_id, block_range);
-                format!(
-                    r#"
-                    SELECT COUNT(*)::BIGINT
-                    FROM ({rows_source}) rows
-                    WHERE compiler_version IS NOT NULL
-                    "#
+            let count_source = code_counts_source(chain_id, block_range);
+            let sql = format!(
+                r#"
+                WITH counts AS (
+                    {count_source}
                 )
-            } else {
-                let count_source = code_counts_source(chain_id, block_range);
-                format!(
-                    r#"
-                    WITH counts AS (
-                        {count_source}
-                    )
-                    SELECT COALESCE(SUM(c.contract_count), 0)::BIGINT
-                    FROM counts c
-                    JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
-                    WHERE m.compiler_version IS NOT NULL
-                    "#
-                )
-            };
+                SELECT COALESCE(SUM(c.contract_count), 0)::BIGINT
+                FROM counts c
+                JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
+                WHERE m.compiler_version IS NOT NULL
+                "#
+            );
             let count: i64 = conn.query_row(&sql, [], |row| row.get(0)).unwrap_or(0);
             Ok(count.max(0) as u64)
         })
@@ -723,30 +607,17 @@ impl Db {
 
     pub async fn language_distribution(&self, chain_id: u64) -> Result<Vec<LanguageCount>> {
         self.run_read(move |conn| {
-            let sql = if explorer_backed(conn)? {
-                let rows_source = explorer_code_rows_source(chain_id, None);
-                format!(
-                    r#"
-                    SELECT COALESCE(language, 'unknown') AS lang,
-                           COUNT(*)::UBIGINT AS cnt
-                    FROM ({rows_source}) rows
-                    GROUP BY lang
-                    ORDER BY cnt DESC
-                    "#
-                )
-            } else {
-                format!(
-                    r#"
-                    SELECT COALESCE(m.language, 'unknown') AS lang,
-                           SUM(c.contract_count)::UBIGINT AS cnt
-                    FROM rollup_code_counts c
-                    LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
-                    WHERE c.chain_id = {chain_id}
-                    GROUP BY lang
-                    ORDER BY cnt DESC
-                    "#
-                )
-            };
+            let sql = format!(
+                r#"
+                SELECT COALESCE(m.language, 'unknown') AS lang,
+                       SUM(c.contract_count)::UBIGINT AS cnt
+                FROM rollup_code_counts c
+                LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
+                WHERE c.chain_id = {chain_id}
+                GROUP BY lang
+                ORDER BY cnt DESC
+                "#
+            );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map([], read_string_u64_pair)?;
             let mut out = Vec::new();
@@ -765,43 +636,25 @@ impl Db {
         block_range: Option<(u64, u64)>,
     ) -> Result<StandardsBreakdown> {
         self.run_read(move |conn| {
-            let sql = if explorer_backed(conn)? {
-                let rows_source = explorer_code_rows_source(chain_id, block_range);
-                format!(
-                    r#"
-                    SELECT
-                        COUNT(*) FILTER (WHERE is_erc20)::UBIGINT,
-                        COUNT(*) FILTER (WHERE is_erc721)::UBIGINT,
-                        COUNT(*) FILTER (WHERE is_erc1155)::UBIGINT,
-                        COUNT(*) FILTER (WHERE is_proxy_eip1967)::UBIGINT,
-                        COUNT(*) FILTER (WHERE is_proxy_minimal)::UBIGINT,
-                        COUNT(*) FILTER (WHERE uses_push0)::UBIGINT,
-                        COUNT(*) FILTER (WHERE has_source_hash)::UBIGINT,
-                        COUNT(*) FILTER (WHERE is_decoded)::UBIGINT
-                    FROM ({rows_source}) rows
-                    "#
+            let count_source = code_counts_source(chain_id, block_range);
+            let sql = format!(
+                r#"
+                WITH counts AS (
+                    {count_source}
                 )
-            } else {
-                let count_source = code_counts_source(chain_id, block_range);
-                format!(
-                    r#"
-                    WITH counts AS (
-                        {count_source}
-                    )
-                    SELECT
-                        COALESCE(SUM(CASE WHEN m.is_erc20 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                        COALESCE(SUM(CASE WHEN m.is_erc721 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                        COALESCE(SUM(CASE WHEN m.is_erc1155 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                        COALESCE(SUM(CASE WHEN m.is_proxy_eip1967 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                        COALESCE(SUM(CASE WHEN m.is_proxy_minimal THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                        COALESCE(SUM(CASE WHEN m.uses_push0 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                        COALESCE(SUM(CASE WHEN m.has_source_hash THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
-                        COALESCE(SUM(CASE WHEN m.code_hash IS NOT NULL THEN c.contract_count ELSE 0 END), 0)::UBIGINT
-                    FROM counts c
-                    LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
-                    "#
-                )
-            };
+                SELECT
+                    COALESCE(SUM(CASE WHEN m.is_erc20 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.is_erc721 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.is_erc1155 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.is_proxy_eip1967 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.is_proxy_minimal THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.uses_push0 THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.has_source_hash THEN c.contract_count ELSE 0 END), 0)::UBIGINT,
+                    COALESCE(SUM(CASE WHEN m.code_hash IS NOT NULL THEN c.contract_count ELSE 0 END), 0)::UBIGINT
+                FROM counts c
+                LEFT JOIN bytecode_metadata_by_hash m ON c.code_hash = m.code_hash
+                "#
+            );
             conn.query_row(&sql, [], |row| {
                 Ok(StandardsBreakdown {
                     erc20: row.get(0)?,
@@ -828,8 +681,6 @@ impl Db {
         let limit = limit.clamp(1, 200);
         self.run_read(move |conn| {
             let page_limit = limit as usize + 1;
-            let registry_loaded = verification_registry_loaded(conn, chain_id)?;
-
             // Recent pages live near the head of the chain: try a bounded
             // window first so the top-N scan prunes to a handful of row
             // groups, then widen only if the page didn't fill.
@@ -861,11 +712,7 @@ impl Db {
                         .get(&row.address)
                         .cloned()
                         .unwrap_or((None, None));
-                    let is_verified = if registry_loaded {
-                        Some(verified.unwrap_or(false))
-                    } else {
-                        verified
-                    };
+                    let is_verified = Some(verified.unwrap_or(false));
                     let compiler_version = row
                         .code_hash
                         .as_ref()

@@ -3,7 +3,7 @@
 use anyhow::Result;
 use tracing_subscriber::{fmt::time::ChronoLocal, EnvFilter};
 
-use blink::{cli, decode, extract::run_contracts, load, serve};
+use blink::{checkpoints, cli, decode, extract::run_contracts, load, serve};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -13,6 +13,7 @@ async fn main() -> Result<()> {
         cli::Commands::Contracts(args) => run_contracts(args).await,
         cli::Commands::Load(args) => load::run_load(args).await,
         cli::Commands::Decode(args) => decode::run_decode(args).await,
+        cli::Commands::Checkpoints(args) => checkpoints::run_checkpoints(args).await,
         cli::Commands::Serve(args) => serve::run_serve(args).await,
     }
 }
