@@ -41,6 +41,8 @@ pub enum Commands {
     Load(LoadArgs),
     /// Decode bytecode locally: compiler version, language, ERC standards, proxy detection
     Decode(DecodeArgs),
+    /// Build persistent block-time checkpoints from configured RPCs
+    Checkpoints(CheckpointsArgs),
     /// Serve the public monitoring dashboard
     Serve(ServeArgs),
 }
@@ -57,6 +59,7 @@ fn command() -> Command {
             "contracts" => Some("blink contracts"),
             "load" => Some("blink load"),
             "decode" => Some("blink decode"),
+            "checkpoints" => Some("blink checkpoints"),
             "serve" => Some("blink serve"),
             _ => None,
         };
@@ -162,6 +165,23 @@ pub struct DecodeArgs {
 }
 
 #[derive(Parser, Debug, Clone)]
+pub struct CheckpointsArgs {
+    /// RPC URLs to sample. Repeat for multiple chains.
+    /// BLINK_SERVE_RPCS accepts a comma-separated list.
+    #[arg(long, env = "BLINK_SERVE_RPCS", value_delimiter = ',')]
+    pub rpc: Vec<String>,
+    /// Blink data directory containing blink.duckdb (env: BLINK_DATA_DIR)
+    #[arg(long, env = "BLINK_DATA_DIR", default_value = "./data/blink")]
+    pub data_dir: PathBuf,
+    /// Distance between persistent historical checkpoints
+    #[arg(long, default_value_t = 100_000)]
+    pub interval_blocks: u64,
+    /// Block headers per JSON-RPC batch request
+    #[arg(long, default_value_t = 50)]
+    pub batch_size: usize,
+}
+
+#[derive(Parser, Debug, Clone)]
 pub struct ServeArgs {
     /// Bind address (env: BLINK_BIND)
     #[arg(long, env = "BLINK_BIND", default_value = "127.0.0.1:8080")]
@@ -203,4 +223,11 @@ pub struct ServeArgs {
     /// Read connections serving dashboard queries (0 = auto-size from cores)
     #[arg(long, env = "BLINK_DB_READERS", default_value_t = 0)]
     pub db_readers: usize,
+    /// Enable automatic Verifier Alliance download/import from this directory.
+    /// The AWS CLI must be installed and available on PATH.
+    #[arg(long, env = "BLINK_VA_DIR")]
+    pub verifier_alliance_dir: Option<PathBuf>,
+    /// Seconds between automatic Verifier Alliance sync attempts
+    #[arg(long, env = "BLINK_VA_SYNC_INTERVAL_SECS", default_value_t = 3_600)]
+    pub verifier_alliance_sync_interval_secs: u64,
 }

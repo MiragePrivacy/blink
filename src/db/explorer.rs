@@ -7,7 +7,16 @@ use super::{table_exists, views, Db};
 
 const EXPLORER_FINGERPRINT_KEY: &str = "explorer_fingerprint";
 /// Rows per build slice — bounds the join/sort working set per transaction.
-const EXPLORER_SLICE_TARGET_ROWS: u64 = 2_000_000;
+const EXPLORER_SLICE_TARGET_ROWS: u64 = 250_000;
+
+pub(crate) fn cleanup_stale_build(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "contract_metadata_native_build")? {
+        return Ok(());
+    }
+    tracing::warn!("removing incomplete sql explorer build from an earlier run");
+    conn.execute_batch("DROP TABLE contract_metadata_native_build;")
+        .context("remove incomplete sql explorer build")
+}
 
 pub(crate) fn ensure_explorer_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -61,10 +70,10 @@ fn input_fingerprint(conn: &Connection) -> Result<String> {
     } else {
         0
     };
-    // Bump the version prefix when the table schema changes so upgraded
-    // servers rebuild instead of querying a stale shape.
+    // Bump the version prefix when the table schema or physical layout
+    // changes so upgraded servers rebuild instead of querying a stale copy.
     Ok(format!(
-        "v2|meta:{meta_rows}@{}|enr:{enrichment_rows}@{}|reg:{registry_rows}",
+        "v3|meta:{meta_rows}@{}|enr:{enrichment_rows}@{}|reg:{registry_rows}",
         meta_latest.unwrap_or_default(),
         enrichment_latest.unwrap_or_default()
     ))
@@ -140,45 +149,42 @@ struct ChainSlice {
     end_block: u64,
 }
 
-fn build_slices(conn: &Connection) -> Result<Vec<ChainSlice>> {
-    let mut stmt = conn.prepare(
+fn build_slices(conn: &Connection, target_rows: u64) -> Result<Vec<ChainSlice>> {
+    let target_rows = target_rows.max(1);
+    let mut stmt = conn.prepare(&format!(
         r#"
-        SELECT chain_id, MIN(block_number), MAX(block_number), SUM(contract_count)
-        FROM rollup_block_counts
-        GROUP BY chain_id
-        ORDER BY chain_id
-        "#,
-    )?;
-    let chains = stmt
+        WITH cumulative AS (
+            SELECT
+                chain_id,
+                block_number,
+                SUM(contract_count) OVER (
+                    PARTITION BY chain_id
+                    ORDER BY block_number DESC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                )::UBIGINT AS cumulative_rows
+            FROM rollup_block_counts
+        ), assigned AS (
+            SELECT
+                chain_id,
+                block_number,
+                ((cumulative_rows - 1) // {target_rows})::UBIGINT AS slice_id
+            FROM cumulative
+        )
+        SELECT chain_id, MIN(block_number), MAX(block_number)
+        FROM assigned
+        GROUP BY chain_id, slice_id
+        ORDER BY chain_id, slice_id
+        "#
+    ))?;
+    let slices = stmt
         .query_map([], |row| {
-            Ok((
-                row.get::<_, u64>(0)?,
-                row.get::<_, u32>(1)?,
-                row.get::<_, u32>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
+            Ok(ChainSlice {
+                chain_id: row.get(0)?,
+                start_block: row.get::<_, u32>(1)?.into(),
+                end_block: row.get::<_, u32>(2)?.into(),
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-
-    let mut slices = Vec::new();
-    for (chain_id, min_block, max_block, rows) in chains {
-        let (min_block, max_block) = (u64::from(min_block), u64::from(max_block));
-        let span = max_block - min_block + 1;
-        let slice_count = (rows.max(0) as u64)
-            .div_ceil(EXPLORER_SLICE_TARGET_ROWS)
-            .max(1);
-        let slice_blocks = span.div_ceil(slice_count).max(1);
-        let mut start = min_block;
-        while start <= max_block {
-            let end = (start + slice_blocks - 1).min(max_block);
-            slices.push(ChainSlice {
-                chain_id,
-                start_block: start,
-                end_block: end,
-            });
-            start = end + 1;
-        }
-    }
     Ok(slices)
 }
 
@@ -187,6 +193,22 @@ impl Db {
     /// rebuild ran. Takes and releases the writer lock per slice so the tail
     /// loop keeps running during the minutes-long build.
     pub(crate) fn refresh_explorer_blocking(&self) -> Result<bool> {
+        let result = self.refresh_explorer_blocking_inner();
+        if result.is_err() {
+            let conn = self.writer.blocking_lock();
+            if let Err(error) = conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS contract_metadata_native_build;
+                DROP TABLE IF EXISTS explorer_meta_build;
+                "#,
+            ) {
+                tracing::warn!("could not clean up failed sql explorer build: {error}");
+            }
+        }
+        result
+    }
+
+    fn refresh_explorer_blocking_inner(&self) -> Result<bool> {
         if self.read_only {
             return Ok(false);
         }
@@ -269,7 +291,7 @@ impl Db {
 
         let slices = {
             let conn = self.writer.blocking_lock();
-            build_slices(&conn)?
+            build_slices(&conn, EXPLORER_SLICE_TARGET_ROWS)?
         };
         let total_slices = slices.len();
         let is_verified_expr = {
@@ -311,19 +333,17 @@ impl Db {
                     m.code_hash IS NOT NULL
                 FROM contract_deployments_native c
                 LEFT JOIN explorer_meta_build m ON c.code_hash = m.code_hash
-                -- The block-range condition relies on
-                -- backfill_enrichment_blocks having run at open: every
-                -- enrichment row whose address exists in the deployments
-                -- table carries that deployment's block_number, so the join
-                -- hash-builds only this slice's enrichment rows instead of
-                -- the whole table.
+                -- Current VA imports persist each verification's deployment
+                -- position, so this join hash-builds only the enrichment rows
+                -- for the current slice instead of the whole table. Legacy
+                -- rows without positions are repaired by the VA importer.
                 LEFT JOIN enrichment_current e
                   ON c.contract_address = e.contract_address
                  AND c.chain_id = e.chain_id
                  AND e.block_number BETWEEN {start_block} AND {end_block}
                 WHERE c.chain_id = {chain_id}
                   AND c.block_number BETWEEN {start_block} AND {end_block}
-                ORDER BY c.block_number, c.create_index;
+                ORDER BY c.block_number DESC, c.create_index DESC;
                 "#
             ))
             .with_context(|| {
@@ -371,5 +391,52 @@ impl Db {
             views::create_contract_metadata_view(&conn)?;
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explorer_slices_follow_row_density_newest_first() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE rollup_block_counts (
+                chain_id UBIGINT,
+                block_number UINTEGER,
+                contract_count UBIGINT
+            );
+            INSERT INTO rollup_block_counts VALUES
+                (1, 100, 1),
+                (1, 90, 9),
+                (1, 80, 6),
+                (1, 70, 6),
+                (100, 200, 3);
+            "#,
+        )
+        .unwrap();
+
+        let slices = build_slices(&conn, 10).unwrap();
+        let ranges = slices
+            .into_iter()
+            .map(|slice| (slice.chain_id, slice.start_block, slice.end_block))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranges,
+            vec![(1, 90, 100), (1, 80, 80), (1, 70, 70), (100, 200, 200)]
+        );
+    }
+
+    #[test]
+    fn stale_explorer_build_is_removed_at_open() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE contract_metadata_native_build (id INTEGER);")
+            .unwrap();
+
+        cleanup_stale_build(&conn).unwrap();
+        assert!(!table_exists(&conn, "contract_metadata_native_build").unwrap());
+        cleanup_stale_build(&conn).unwrap();
     }
 }

@@ -85,10 +85,10 @@ fn range_end_block_moves_visible_window() {
 }
 
 #[test]
-fn relative_preset_cache_key_survives_tail_moves_inside_bucket() {
+fn relative_preset_cache_key_survives_tail_moves_across_bucket_boundary() {
     let q = query(Some("day"), None);
     let first = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, 20_000_001);
-    let second = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, 20_000_099);
+    let second = parse_time_series_window(&q, ETHEREUM_CHAIN_ID, 20_000_401);
 
     assert_ne!(first.block_range, second.block_range);
     assert_eq!(

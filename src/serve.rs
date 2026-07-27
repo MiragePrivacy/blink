@@ -4,12 +4,13 @@
 //! Optional background tasks:
 //! - repeated `--rpc URL` flags poll one or more chain heads and extract
 //!   newly produced blocks into separate `tail__chain_*` parquet files.
+//! - `--verifier-alliance-dir` periodically downloads and incrementally
+//!   imports Verifier Alliance labels without restarting the server.
 //!
-//! Serving model: every cacheable endpoint is stale-while-revalidate. A
-//! cached entry is returned immediately no matter its age; entries past
-//! their TTL trigger a background refresh (deduplicated per key). Combined
-//! with the rollup tables in `db`, cold misses are native-table queries, so
-//! the server starts serving instantly and warms itself in the background.
+//! Serving model: the default dashboard is warmed before the listener binds,
+//! then every cacheable endpoint is stale-while-revalidate. A cached entry is
+//! returned immediately no matter its age; entries past their TTL trigger a
+//! background refresh (deduplicated per key).
 //!
 //! Endpoints (all return JSON):
 //! - `GET /api/stats` — totals, verified pct, last block, verification coverage.
@@ -175,6 +176,8 @@ async fn track_latency(State(state): State<AppState>, req: Request, next: Next) 
 const API_CACHE_TTL: Duration = Duration::from_secs(600);
 const HIGHEST_BLOCK_TTL: Duration = Duration::from_secs(5);
 const TAIL_START_DELAY: Duration = Duration::from_secs(15);
+const VA_SYNC_START_DELAY: Duration = Duration::from_secs(30);
+const VA_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(900);
 const DEFAULT_COMPILER_LIMIT: u32 = 12;
 const DEFAULT_RECENT_LIMIT: u32 = 20;
 const INITIAL_DEPLOYS_RANGE: &str = "day";
@@ -342,6 +345,57 @@ where
         self.lookup(key).map(|(_, value)| value)
     }
 
+    /// Refresh a key without discarding its current value. If another task is
+    /// already refreshing the key, that work wins and this call is a no-op.
+    async fn refresh_if_idle<F, Fut>(&self, key: K, make: F) -> Result<bool>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<V>> + Send,
+    {
+        let Ok(slot) = self.claim(key) else {
+            return Ok(false);
+        };
+        let result = make().await;
+        if let Ok(value) = &result {
+            self.insert(key, value.clone());
+        }
+        self.release(&key);
+        drop(slot);
+        result.map(|_| true)
+    }
+
+    fn expire_where(&self, predicate: impl Fn(K) -> bool) {
+        let expired_at = Instant::now()
+            .checked_sub(API_CACHE_TTL + Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        for (key, (stored_at, _)) in self
+            .inner
+            .values
+            .lock()
+            .expect("cache map poisoned")
+            .iter_mut()
+        {
+            if predicate(*key) {
+                *stored_at = expired_at;
+            }
+        }
+    }
+
+    fn touch_where(&self, predicate: impl Fn(K) -> bool) {
+        let now = Instant::now();
+        for (key, (stored_at, _)) in self
+            .inner
+            .values
+            .lock()
+            .expect("cache map poisoned")
+            .iter_mut()
+        {
+            if predicate(*key) {
+                *stored_at = now;
+            }
+        }
+    }
+
     /// Claim the compute slot for `key`: the holder gets the sender (waiters
     /// wake when it drops); if already claimed, the receiver to wait on.
     fn claim(&self, key: K) -> Result<watch::Sender<()>, watch::Receiver<()>> {
@@ -360,6 +414,61 @@ where
             .lock()
             .expect("cache map poisoned")
             .remove(key);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_refresh_keeps_stale_value_available() {
+        let cache = CacheMap::<u64, u64>::default();
+        cache.insert(1, 10);
+        cache.expire_where(|key| key == 1);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let refresh_cache = cache.clone();
+        let refresh = tokio::spawn(async move {
+            refresh_cache
+                .refresh_if_idle(1, || async move {
+                    let _ = started_tx.send(());
+                    let _ = finish_rx.await;
+                    Ok(20)
+                })
+                .await
+        });
+
+        started_rx.await.expect("refresh started");
+        let stale = tokio::time::timeout(
+            Duration::from_millis(100),
+            cache.get_or_refresh(1, API_CACHE_TTL, || async {
+                Err(anyhow::anyhow!("must not start a duplicate refresh"))
+            }),
+        )
+        .await
+        .expect("stale cache read must not block")
+        .expect("stale cache value");
+        assert_eq!(stale, 10);
+
+        finish_tx.send(()).expect("finish refresh");
+        assert!(refresh
+            .await
+            .expect("refresh task")
+            .expect("refresh result"));
+        assert_eq!(cache.get(&1), Some(20));
+    }
+
+    #[test]
+    fn recognizes_errors_that_require_a_database_restart() {
+        assert!(is_fatal_database_error(
+            "FATAL Error: Corrupted ART index - likely the same row id was inserted twice"
+        ));
+        assert!(is_fatal_database_error(
+            "database has been invalidated because of a previous fatal error"
+        ));
+        assert!(!is_fatal_database_error("HTTP error 429 Too Many Requests"));
     }
 }
 
@@ -586,28 +695,17 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     let tail_enabled = !rpcs.is_empty() && !args.read_only;
+    let verifier_alliance_dir = args.verifier_alliance_dir.clone();
     let runtime = Arc::new(RuntimeState::new(
         args.read_only,
         tail_enabled,
         args.tail_interval_secs.max(15),
     ));
     let cache = Arc::new(ApiCache::default());
+
     seed_runtime_snapshot(&db, &runtime).await;
-    // Rollup-backed queries are fast enough to serve cold, so warming happens
-    // off the startup path — the listener binds immediately.
-    tokio::spawn(prewarm_initial_dashboard_cache(db.clone(), cache.clone()));
-    if !args.read_only {
-        // Materialized SQL-explorer table; queries fall back to a live join
-        // until it's ready.
-        let db_explorer = db.clone();
-        tokio::spawn(async move {
-            match db_explorer.refresh_explorer().await {
-                Ok(true) => tracing::info!("sql explorer table ready"),
-                Ok(false) => {}
-                Err(err) => tracing::warn!("sql explorer table rebuild failed: {:#}", err),
-            }
-        });
-    }
+    prewarm_initial_dashboard_cache(db.clone(), cache.clone()).await?;
+
     let state = AppState {
         db: db.clone(),
         runtime: runtime.clone(),
@@ -650,6 +748,17 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     tracing::info!("serving blink dashboard on http://{}", addr);
     tracing::info!(" data dir: {}", args.data_dir.display());
     if !args.read_only {
+        // The materialized SQL-explorer table is maintenance work. Start it
+        // only after the dashboard cache is ready so it cannot contend with
+        // cold aggregate queries during startup.
+        let db_explorer = db.clone();
+        tokio::spawn(async move {
+            match db_explorer.refresh_explorer().await {
+                Ok(true) => tracing::info!("sql explorer table ready"),
+                Ok(false) => {}
+                Err(err) => tracing::warn!("sql explorer table rebuild failed: {:#}", err),
+            }
+        });
         spawn_tail_loops(
             db.clone(),
             runtime.clone(),
@@ -663,10 +772,86 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
                 data_dir: args.data_dir.clone(),
             },
         );
+        if let Some(verifier_alliance_dir) = verifier_alliance_dir {
+            spawn_verifier_alliance_sync_loop(
+                db.clone(),
+                cache.clone(),
+                verifier_alliance_dir,
+                Duration::from_secs(args.verifier_alliance_sync_interval_secs),
+            );
+        }
+    } else if verifier_alliance_dir.is_some() {
+        tracing::warn!("--read-only is set; automatic Verifier Alliance sync is disabled");
     }
     axum::serve(listener, app)
         .await
         .context("axum server failed")
+}
+
+fn spawn_verifier_alliance_sync_loop(
+    db: Db,
+    cache: Arc<ApiCache>,
+    verifier_alliance_dir: PathBuf,
+    interval: Duration,
+) {
+    let interval = interval.max(VA_SYNC_MIN_INTERVAL);
+    tracing::info!(
+        "automatic Verifier Alliance sync enabled (dir={}, interval={}s)",
+        verifier_alliance_dir.display(),
+        interval.as_secs()
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(VA_SYNC_START_DELAY).await;
+        loop {
+            let started = Instant::now();
+            defer_dashboard_cache_refreshes(&cache);
+            tracing::info!("syncing Verifier Alliance dataset from object storage");
+            match crate::va_sync::sync_verifier_alliance_files(&verifier_alliance_dir).await {
+                Ok(()) => {
+                    for chain in chains::supported_chains() {
+                        match db
+                            .import_verifier_alliance(verifier_alliance_dir.clone(), chain.chain_id)
+                            .await
+                        {
+                            Ok(changed) => {
+                                if changed {
+                                    refresh_verification_cache(&db, &cache, chain.chain_id).await;
+                                }
+                                tracing::info!(
+                                    "Verifier Alliance data current for chain_id={}{}",
+                                    chain.chain_id,
+                                    if changed { " (updated)" } else { "" }
+                                );
+                            }
+                            Err(error) => tracing::warn!(
+                                "Verifier Alliance import failed for chain_id={}: {:#}",
+                                chain.chain_id,
+                                error
+                            ),
+                        }
+                    }
+                    tracing::info!(
+                        "Verifier Alliance sync completed in {:.1}s",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                Err(error) => tracing::warn!("Verifier Alliance download failed: {:#}", error),
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+fn defer_dashboard_cache_refreshes(cache: &ApiCache) {
+    cache.stats.touch_where(|_| true);
+    cache.deploys.touch_where(|_| true);
+    cache.verified.touch_where(|_| true);
+    cache.bytecode_sizes.touch_where(|_| true);
+    cache.compilers.touch_where(|_| true);
+    cache.recent.touch_where(|_| true);
+    cache.languages.touch_where(|_| true);
+    cache.standards.touch_where(|_| true);
+    cache.highest_blocks.touch_where(|_| true);
 }
 
 fn dashboard_cors_layer() -> CorsLayer {
@@ -855,10 +1040,11 @@ fn normalized_cache_range(
 ) -> (Option<u64>, Option<u64>, Option<u64>) {
     if uses_relative_preset_window(q) {
         let range_code = q.range.as_deref().map(relative_range_code);
-        let end_bucket = window
-            .block_range
-            .map(|(_, end)| end / bucket_blocks.max(1));
-        return (Some(bucket_blocks.max(1)), range_code, end_bucket);
+        // A relative range is one logical cache entry as the chain advances.
+        // Keeping the key stable lets stale-while-revalidate serve the last
+        // result immediately instead of creating a cold miss at each bucket
+        // boundary.
+        return (Some(bucket_blocks.max(1)), range_code, None);
     }
     (
         None,
@@ -1342,7 +1528,7 @@ struct LanguagesResponse {
     languages: Vec<crate::db::LanguageCount>,
 }
 
-async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
+async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) -> Result<()> {
     let started = Instant::now();
     tracing::info!("warming dashboard cache in background");
     for chain in chains::supported_chains() {
@@ -1355,10 +1541,14 @@ async fn prewarm_initial_dashboard_cache(db: Db, cache: Arc<ApiCache>) {
         )
         .await;
     }
+    db.health_check()
+        .await
+        .context("dashboard database was invalidated during cache warm")?;
     tracing::info!(
         "dashboard cache warmed in {:.1}s",
         started.elapsed().as_secs_f64()
     );
+    Ok(())
 }
 
 fn spawn_tail_loops(
@@ -1395,15 +1585,23 @@ async fn prewarm_chain_dashboard_cache(
     include_widgets: bool,
 ) {
     let started = Instant::now();
-    let highest = match db.highest_contract_block(chain_id).await {
-        Ok(Some(block)) => block,
-        Ok(None) => 0,
+    let db_for_highest = db.clone();
+    let highest = match cache
+        .highest_blocks
+        .get_or_refresh(chain_id, HIGHEST_BLOCK_TTL, move || async move {
+            Ok(db_for_highest
+                .highest_contract_block(chain_id)
+                .await?
+                .unwrap_or(0))
+        })
+        .await
+    {
+        Ok(block) => block,
         Err(err) => {
             log_prewarm_error(chain_id, "highest block", err);
             return;
         }
     };
-    cache.highest_blocks.insert(chain_id, highest);
 
     for range in chart_ranges {
         prewarm_chart_range(db, cache, chain_id, highest, range).await;
@@ -1418,16 +1616,23 @@ async fn prewarm_chain_dashboard_cache(
         let aggregate_window = parse_time_series_window(&aggregate_query, chain_id, highest);
         let aggregate_key = range_cache_key_for_query(chain_id, &aggregate_query, aggregate_window);
 
-        match db.stats(chain_id).await {
-            Ok(stats) => cache.stats.insert(chain_id, stats),
+        match cache
+            .stats
+            .refresh_if_idle(chain_id, || db.stats(chain_id))
+            .await
+        {
+            Ok(_) => {}
             Err(err) => log_prewarm_error(chain_id, "stats", err),
         }
 
-        match db
-            .bytecode_size_distribution(chain_id, aggregate_window.block_range)
+        match cache
+            .bytecode_sizes
+            .refresh_if_idle(aggregate_key, || {
+                db.bytecode_size_distribution(chain_id, aggregate_window.block_range)
+            })
             .await
         {
-            Ok(bins) => cache.bytecode_sizes.insert(aggregate_key, bins),
+            Ok(_) => {}
             Err(err) => log_prewarm_error(chain_id, "bytecode sizes", err),
         }
 
@@ -1443,34 +1648,43 @@ async fn prewarm_chain_dashboard_cache(
             start_block: compiler_start_block,
             end_block: compiler_end_block,
         };
-        match async {
-            Ok::<_, anyhow::Error>((
-                db.top_compilers(
-                    chain_id,
-                    DEFAULT_COMPILER_LIMIT,
-                    aggregate_window.block_range,
-                )
-                .await?,
-                db.compiler_version_total(chain_id, aggregate_window.block_range)
+        match cache
+            .compilers
+            .refresh_if_idle(compiler_key, || async {
+                Ok((
+                    db.top_compilers(
+                        chain_id,
+                        DEFAULT_COMPILER_LIMIT,
+                        aggregate_window.block_range,
+                    )
                     .await?,
-            ))
-        }
-        .await
+                    db.compiler_version_total(chain_id, aggregate_window.block_range)
+                        .await?,
+                ))
+            })
+            .await
         {
-            Ok(compilers) => cache.compilers.insert(compiler_key, compilers),
+            Ok(_) => {}
             Err(err) => log_prewarm_error(chain_id, "compilers", err),
         }
 
-        match db.language_distribution(chain_id).await {
-            Ok(languages) => cache.languages.insert(chain_id, languages),
+        match cache
+            .languages
+            .refresh_if_idle(chain_id, || db.language_distribution(chain_id))
+            .await
+        {
+            Ok(_) => {}
             Err(err) => log_prewarm_error(chain_id, "languages", err),
         }
 
-        match db
-            .standards_breakdown(chain_id, aggregate_window.block_range)
+        match cache
+            .standards
+            .refresh_if_idle(aggregate_key, || {
+                db.standards_breakdown(chain_id, aggregate_window.block_range)
+            })
             .await
         {
-            Ok(standards) => cache.standards.insert(aggregate_key, standards),
+            Ok(_) => {}
             Err(err) => log_prewarm_error(chain_id, "standards", err),
         }
 
@@ -1480,11 +1694,14 @@ async fn prewarm_chain_dashboard_cache(
             before_block: None,
             before_create_index: None,
         };
-        match db
-            .recent_contracts(chain_id, DEFAULT_RECENT_LIMIT, None)
+        match cache
+            .recent
+            .refresh_if_idle(recent_key, || {
+                db.recent_contracts(chain_id, DEFAULT_RECENT_LIMIT, None)
+            })
             .await
         {
-            Ok(recent) => cache.recent.insert(recent_key, recent),
+            Ok(_) => {}
             Err(err) => log_prewarm_error(chain_id, "recent deployments", err),
         }
     }
@@ -1505,20 +1722,93 @@ async fn prewarm_chart_range(db: &Db, cache: &ApiCache, chain_id: u64, highest: 
     let window = parse_time_series_window(&query, chain_id, highest);
     let cache_key = bucket_cache_key(chain_id, &query, window);
 
-    match db
-        .deploys_over_time(chain_id, window.bucket_blocks, window.block_range)
+    match cache
+        .deploys
+        .refresh_if_idle(cache_key, || {
+            db.deploys_over_time(chain_id, window.bucket_blocks, window.block_range)
+        })
         .await
     {
-        Ok(buckets) => cache.deploys.insert(cache_key, buckets),
+        Ok(_) => {}
         Err(err) => log_prewarm_error(chain_id, &format!("deployments {range}"), err),
     }
 
-    match db
-        .verified_ratio_over_time(chain_id, window.bucket_blocks, window.block_range)
+    match cache
+        .verified
+        .refresh_if_idle(cache_key, || {
+            db.verified_ratio_over_time(chain_id, window.bucket_blocks, window.block_range)
+        })
         .await
     {
-        Ok(buckets) => cache.verified.insert(cache_key, buckets),
+        Ok(_) => {}
         Err(err) => log_prewarm_error(chain_id, &format!("verification {range}"), err),
+    }
+}
+
+async fn refresh_verification_cache(db: &Db, cache: &ApiCache, chain_id: u64) {
+    cache.stats.expire_where(|key| key == chain_id);
+    cache.verified.expire_where(|key| key.chain_id == chain_id);
+    cache.recent.expire_where(|key| key.chain_id == chain_id);
+
+    match cache
+        .stats
+        .refresh_if_idle(chain_id, || db.stats(chain_id))
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => log_prewarm_error(chain_id, "stats after VA sync", error),
+    }
+
+    let db_for_highest = db.clone();
+    let highest = match cache
+        .highest_blocks
+        .get_or_refresh(chain_id, HIGHEST_BLOCK_TTL, move || async move {
+            Ok(db_for_highest
+                .highest_contract_block(chain_id)
+                .await?
+                .unwrap_or(0))
+        })
+        .await
+    {
+        Ok(block) => block,
+        Err(error) => {
+            log_prewarm_error(chain_id, "highest block after VA sync", error);
+            return;
+        }
+    };
+    let query = BucketQuery {
+        chain_id: Some(chain_id),
+        range: Some(INITIAL_VERIFIED_RANGE.to_string()),
+        ..BucketQuery::default()
+    };
+    let window = parse_time_series_window(&query, chain_id, highest);
+    let cache_key = bucket_cache_key(chain_id, &query, window);
+    match cache
+        .verified
+        .refresh_if_idle(cache_key, || {
+            db.verified_ratio_over_time(chain_id, window.bucket_blocks, window.block_range)
+        })
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => log_prewarm_error(chain_id, "verification after VA sync", error),
+    }
+
+    let recent_key = RecentCacheKey {
+        chain_id,
+        limit: DEFAULT_RECENT_LIMIT,
+        before_block: None,
+        before_create_index: None,
+    };
+    match cache
+        .recent
+        .refresh_if_idle(recent_key, || {
+            db.recent_contracts(chain_id, DEFAULT_RECENT_LIMIT, None)
+        })
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => log_prewarm_error(chain_id, "recent deployments after VA sync", error),
     }
 }
 
@@ -1529,6 +1819,80 @@ fn log_prewarm_error(chain_id: u64, label: &str, err: anyhow::Error) {
         label,
         err
     );
+}
+
+fn is_relative_range(start_block: Option<u64>, end_block: Option<u64>) -> bool {
+    end_block.is_none() && matches!(start_block, Some(1..=5))
+}
+
+fn is_live_relative_range(start_block: Option<u64>, end_block: Option<u64>) -> bool {
+    end_block.is_none() && matches!(start_block, Some(1 | 2))
+}
+
+async fn refresh_tail_dashboard_cache(db: &Db, cache: &ApiCache, chain_id: u64) {
+    // Keep existing values available while refreshes run. The time-series
+    // rollups are cheap enough to refresh each tail; metadata widgets only
+    // expire their 1H/1D views and refresh on demand because their joins are
+    // much heavier on the production dataset.
+    cache.stats.expire_where(|key| key == chain_id);
+    cache.deploys.expire_where(|key| {
+        key.chain_id == chain_id && is_relative_range(key.start_block, key.end_block)
+    });
+    cache.verified.expire_where(|key| {
+        key.chain_id == chain_id && is_relative_range(key.start_block, key.end_block)
+    });
+    cache.bytecode_sizes.expire_where(|key| {
+        key.chain_id == chain_id && is_live_relative_range(key.start_block, key.end_block)
+    });
+    cache.compilers.expire_where(|key| {
+        key.chain_id == chain_id && is_live_relative_range(key.start_block, key.end_block)
+    });
+    cache.standards.expire_where(|key| {
+        key.chain_id == chain_id && is_live_relative_range(key.start_block, key.end_block)
+    });
+    cache.recent.expire_where(|key| {
+        key.chain_id == chain_id && key.before_block.is_none() && key.before_create_index.is_none()
+    });
+
+    let highest = match db.highest_contract_block(chain_id).await {
+        Ok(Some(block)) => block,
+        Ok(None) => 0,
+        Err(error) => {
+            log_prewarm_error(chain_id, "highest block after tail", error);
+            return;
+        }
+    };
+    cache.highest_blocks.insert(chain_id, highest);
+
+    match cache
+        .stats
+        .refresh_if_idle(chain_id, || db.stats(chain_id))
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => log_prewarm_error(chain_id, "stats after tail", error),
+    }
+
+    for range in [INITIAL_DEPLOYS_RANGE, INITIAL_VERIFIED_RANGE] {
+        prewarm_chart_range(db, cache, chain_id, highest, range).await;
+    }
+
+    let recent_key = RecentCacheKey {
+        chain_id,
+        limit: DEFAULT_RECENT_LIMIT,
+        before_block: None,
+        before_create_index: None,
+    };
+    match cache
+        .recent
+        .refresh_if_idle(recent_key, || {
+            db.recent_contracts(chain_id, DEFAULT_RECENT_LIMIT, None)
+        })
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => log_prewarm_error(chain_id, "recent deployments after tail", error),
+    }
 }
 
 async fn background_tail_loop(
@@ -1579,21 +1943,11 @@ async fn background_tail_loop(
                     report.end_block,
                     report.rows
                 );
-                // New blocks just landed in the rollups: overwrite this
-                // chain's cached dashboard entries right away instead of
-                // letting the top-right block number and the recent table
-                // trail by up to a cache TTL. These are rollup queries —
-                // milliseconds — so doing it every tick is cheap.
+                // Refresh the tail-sensitive entries without deleting stale
+                // values that active dashboard requests can serve.
                 if let Some(chain_id) = chain_id {
                     if report.rows > 0 {
-                        prewarm_chain_dashboard_cache(
-                            &db,
-                            &cache,
-                            chain_id,
-                            &[INITIAL_DEPLOYS_RANGE, INITIAL_VERIFIED_RANGE],
-                            true,
-                        )
-                        .await;
+                        refresh_tail_dashboard_cache(&db, &cache, chain_id).await;
                     }
                 }
             }
@@ -1605,8 +1959,23 @@ async fn background_tail_loop(
                 let msg = format!("{:#}", err);
                 runtime.mark_tail_error(chain_id, msg.clone()).await;
                 tracing::warn!("tail failed: {}", msg);
+                if is_fatal_database_error(&msg) {
+                    tracing::error!(
+                        "tail loop stopped for chain_id={}: DuckDB was invalidated; restart blink serve",
+                        chain_id
+                            .map(|chain_id| chain_id.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    );
+                    break;
+                }
             }
         }
         tokio::time::sleep(config.interval).await;
     }
+}
+
+fn is_fatal_database_error(message: &str) -> bool {
+    message.contains("database has been invalidated")
+        || message.contains("Corrupted ART index")
+        || message.contains("FATAL Error")
 }

@@ -1,6 +1,11 @@
 //! Continuous tail extraction for the dashboard's `serve` mode.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy::{
     providers::{Provider, ProviderBuilder},
@@ -40,6 +45,8 @@ pub async fn tail_once(
         .await
         .context("tail: get head block")?;
     let target = head.saturating_sub(confirmations);
+
+    sync_block_time_checkpoint(db, rpc_url, chain_id, target).await?;
 
     let highest_indexed = db.highest_block(chain_id).await?.unwrap_or(0);
     let start_block = if highest_indexed == 0 {
@@ -85,6 +92,7 @@ pub async fn tail_once(
     let schema = parquet_io::schema();
     let mut writer = None;
     let mut rows_written = 0usize;
+    let mut live_bytecodes = HashMap::<Vec<u8>, Vec<u8>>::new();
 
     let mut pending: BTreeMap<usize, Vec<(u64, Vec<LocalizedTransactionTrace>)>> = BTreeMap::new();
     let mut next_index = 0usize;
@@ -119,6 +127,11 @@ pub async fn tail_once(
                 batch_rows.append(&mut block_rows);
             }
             if !batch_rows.is_empty() {
+                for row in &batch_rows {
+                    live_bytecodes
+                        .entry(row.code_hash.clone())
+                        .or_insert_with(|| row.code.clone());
+                }
                 batch_rows.sort_unstable_by(|a, b| {
                     a.block_number
                         .cmp(&b.block_number)
@@ -152,6 +165,12 @@ pub async fn tail_once(
     }
 
     db.refresh().await?;
+    let decoded = db
+        .decode_live_bytecodes(live_bytecodes.into_iter().collect())
+        .await?;
+    if decoded > 0 {
+        tracing::info!("decoded {} new live bytecode(s)", decoded);
+    }
 
     let size_bytes = std::fs::metadata(&output_path).ok().map(|m| m.len());
     Ok(Some(ChunkReport {
@@ -165,4 +184,38 @@ pub async fn tail_once(
         finished_at: Utc::now(),
         skipped: false,
     }))
+}
+
+async fn sync_block_time_checkpoint(
+    db: &Db,
+    rpc_url: &str,
+    chain_id: u64,
+    target: u64,
+) -> Result<()> {
+    let latest = db.latest_checkpoint_block(chain_id).await?;
+    let interval = crate::blocks::blocks_per_day(chain_id, target).max(1);
+    if latest.is_some_and(|block| target.saturating_sub(block) < interval) {
+        return Ok(());
+    }
+
+    let client = BatchClient::new(rpc_url.to_string(), 1)?;
+    let checkpoint = client
+        .block_timestamps_batch(
+            &[target],
+            5,
+            Duration::from_millis(500),
+            Duration::from_secs(15),
+        )
+        .await?
+        .into_iter()
+        .next()
+        .context("tail: missing checkpoint block response")?;
+    db.record_block_checkpoint(chain_id, checkpoint.0, checkpoint.1)
+        .await?;
+    tracing::info!(
+        "recorded block-time checkpoint chain_id={} block={}",
+        chain_id,
+        checkpoint.0
+    );
+    Ok(())
 }

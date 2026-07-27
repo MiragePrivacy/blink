@@ -7,7 +7,7 @@
 use std::{sync::Arc, time::Duration};
 
 use alloy::rpc::types::trace::parity::LocalizedTransactionTrace;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
@@ -16,7 +16,7 @@ use tokio::sync::Semaphore;
 struct JsonRpcRequest {
     jsonrpc: &'static str,
     method: &'static str,
-    params: [serde_json::Value; 1],
+    params: Vec<serde_json::Value>,
     id: u64,
 }
 
@@ -67,7 +67,7 @@ impl BatchClient {
             .map(|(i, &block)| JsonRpcRequest {
                 jsonrpc: "2.0",
                 method: "trace_block",
-                params: [serde_json::Value::String(format!("0x{:x}", block))],
+                params: vec![serde_json::Value::String(format!("0x{:x}", block))],
                 id: i as u64,
             })
             .collect();
@@ -163,6 +163,135 @@ impl BatchClient {
             }
         }
     }
+
+    pub async fn block_timestamps_batch(
+        &self,
+        blocks: &[u64],
+        max_retries: u32,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Result<Vec<(u64, i64)>> {
+        let requests = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| JsonRpcRequest {
+                jsonrpc: "2.0",
+                method: "eth_getBlockByNumber",
+                params: vec![
+                    serde_json::Value::String(format!("0x{block:x}")),
+                    serde_json::Value::Bool(false),
+                ],
+                id: index as u64,
+            })
+            .collect::<Vec<_>>();
+
+        let mut attempts = 0u32;
+        let mut backoff = initial_backoff;
+        loop {
+            attempts += 1;
+            let permit = self.semaphore.acquire().await?;
+            let response = self.client.post(&self.rpc_url).json(&requests).send().await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let responses: Vec<JsonRpcResponse> = response.json().await?;
+                    let mut timestamps = vec![None; blocks.len()];
+                    let mut rate_limited = false;
+                    for response in responses {
+                        let index = response.id as usize;
+                        if index >= blocks.len() {
+                            return Err(anyhow!(
+                                "invalid response id {} for batch len {}",
+                                response.id,
+                                blocks.len()
+                            ));
+                        }
+                        if let Some(error) = response.error {
+                            if is_rate_limited(&error) {
+                                rate_limited = true;
+                                break;
+                            }
+                            return Err(anyhow!(
+                                "RPC error for block {}: {} (code {})",
+                                blocks[index],
+                                error.message,
+                                error.code
+                            ));
+                        }
+                        let value = response
+                            .result
+                            .ok_or_else(|| anyhow!("missing block {}", blocks[index]))?;
+                        let timestamp = value
+                            .get("timestamp")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                anyhow!("missing timestamp for block {}", blocks[index])
+                            })?;
+                        let timestamp = parse_quantity(timestamp).with_context(|| {
+                            format!("invalid timestamp for block {}", blocks[index])
+                        })?;
+                        timestamps[index] = Some(timestamp as i64);
+                    }
+
+                    if rate_limited {
+                        if attempts <= max_retries {
+                            drop(permit);
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff.saturating_mul(2)).min(max_backoff);
+                            continue;
+                        }
+                        return Err(anyhow!(
+                            "RPC rate limited for block timestamps {:?} after {} retries",
+                            blocks,
+                            max_retries
+                        ));
+                    }
+
+                    return blocks
+                        .iter()
+                        .enumerate()
+                        .map(|(index, block)| {
+                            timestamps[index]
+                                .map(|timestamp| (*block, timestamp))
+                                .ok_or_else(|| anyhow!("missing timestamp for block {block}"))
+                        })
+                        .collect();
+                }
+                Ok(response) if attempts <= max_retries => {
+                    tracing::debug!(
+                        "block timestamp RPC returned {}; retrying",
+                        response.status()
+                    );
+                    drop(permit);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff.saturating_mul(2)).min(max_backoff);
+                }
+                Ok(response) => {
+                    return Err(anyhow!(
+                        "HTTP error {} fetching block timestamps {:?}",
+                        response.status(),
+                        blocks
+                    ));
+                }
+                Err(_) if attempts <= max_retries => {
+                    drop(permit);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff.saturating_mul(2)).min(max_backoff);
+                }
+                Err(error) => {
+                    return Err(anyhow!(
+                        "request failed fetching block timestamps {:?}: {}",
+                        blocks,
+                        error
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn parse_quantity(value: &str) -> Result<u64> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    u64::from_str_radix(value, 16).map_err(Into::into)
 }
 
 fn is_rate_limited(err: &JsonRpcError) -> bool {

@@ -238,12 +238,14 @@ pub(crate) fn sync_rollups(
     let mut changed = !removed.is_empty();
     for file in &files {
         let key = file.display().to_string();
-        if tracked.contains(&key) {
+        if tracked.contains(&key) || source_is_tracked(conn, &key)? {
+            tracked.insert(key);
             continue;
         }
         match ingest_parquet(conn, file) {
             Ok(rows) => {
                 changed = true;
+                tracked.insert(key.clone());
                 tracing::info!(
                     "rolled up {} ({} new deployments)",
                     file.file_name()
@@ -282,6 +284,15 @@ fn tracked_sources(conn: &Connection) -> Result<HashSet<String>> {
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     rows.collect::<Result<HashSet<_>, _>>()
         .context("list tracked rollup sources")
+}
+
+fn source_is_tracked(conn: &Connection, source_key: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM rollup_sources WHERE source_path = ?",
+        params![source_key],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// Column names of a parquet file, so ingest can adapt to the differing
@@ -461,7 +472,11 @@ fn record_source(
     inserted: u64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO rollup_sources (source_path, start_block, end_block, row_count) VALUES (?, ?, ?, ?)",
+        r#"
+        INSERT INTO rollup_sources (source_path, start_block, end_block, row_count)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (source_path) DO NOTHING
+        "#,
         params![
             source_key,
             min_block.map(u64::from),
@@ -654,29 +669,27 @@ pub fn invalidate_zellic_rollups(conn: &Connection) -> Result<()> {
     invalidate_source(conn, ZELLIC_SOURCE_KEY)
 }
 
-/// Fill enrichment rows that lack a block position from the deployments
-/// table, so the verified-ratio chart can bucket them without joins at
-/// request time.
-pub(crate) fn backfill_enrichment_blocks(conn: &Connection) -> Result<()> {
-    if !table_exists(conn, "enrichment")? {
-        return Ok(());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_an_existing_rollup_source_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        ensure_rollup_schema(&conn).expect("rollup schema");
+
+        record_source(&conn, "/tmp/tail.parquet", Some(10), Some(20), 7).expect("record source");
+        record_source(&conn, "/tmp/tail.parquet", Some(10), Some(20), 0)
+            .expect("record source again");
+
+        let (count, rows): (i64, u64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(row_count) FROM rollup_sources WHERE source_path = ?",
+                params!["/tmp/tail.parquet"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read rollup source");
+        assert_eq!(count, 1);
+        assert_eq!(rows, 7);
     }
-    if !column_exists(conn, "enrichment", "block_number")?
-        || !column_exists(conn, "enrichment", "create_index")?
-    {
-        return Ok(());
-    }
-    conn.execute_batch(
-        r#"
-        UPDATE enrichment AS e
-        SET
-            block_number = c.block_number,
-            create_index = c.create_index
-        FROM contract_deployments_native AS c
-        WHERE e.contract_address = c.contract_address
-          AND e.chain_id = c.chain_id
-          AND (e.block_number IS NULL OR e.create_index IS NULL);
-        "#,
-    )
-    .context("backfill enrichment block positions")
 }
