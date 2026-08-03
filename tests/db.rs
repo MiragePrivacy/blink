@@ -471,6 +471,77 @@ async fn dashboard_sql_scopes_contract_metadata_by_chain() {
     assert_eq!(result.rows[0][1], serde_json::json!(300));
 }
 
+#[tokio::test]
+async fn contract_opcodes_queries_creation_and_runtime_separately() {
+    let dir = TestDir::new("contract_opcodes");
+    write_backfill_parquet(&dir.path);
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+
+    db.execute_batch(
+        r#"
+        INSERT INTO bytecode_opcode_sets (
+            bytecode_hash, code_kind, opcodes, parser_version
+        ) VALUES
+            (unhex(repeat('03', 32)), 'creation', ['PUSH1', 'CREATE2'], 1),
+            (unhex(repeat('09', 32)), 'runtime', ['PUSH1', 'DELEGATECALL'], 1),
+            (unhex(repeat('19', 32)), 'runtime', ['SELFDESTRUCT'], 1);
+
+        INSERT INTO contract_creation_bytecodes (
+            chain_id, block_number, create_index, contract_address,
+            bytecode_hash, source_file
+        ) VALUES (
+            1, 200, 0, unhex(repeat('05', 20)),
+            unhex(repeat('03', 32)), 'test'
+        );
+        "#
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let creation = db
+        .query_sql(
+            "SELECT address, code_kind, opcodes FROM contract_opcodes \
+             WHERE code_kind = 'creation' AND list_contains(opcodes, 'CREATE2')"
+                .to_string(),
+            10,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(creation.row_count, 1);
+    assert_eq!(creation.rows[0][1], serde_json::json!("creation"));
+    assert_eq!(creation.rows[0][2], serde_json::json!(["PUSH1", "CREATE2"]));
+
+    let runtime = db
+        .query_sql(
+            "SELECT address FROM contract_opcodes \
+             WHERE code_kind = 'runtime' AND list_contains(opcodes, 'DELEGATECALL')"
+                .to_string(),
+            10,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(runtime.row_count, 1);
+    assert_eq!(
+        runtime.rows[0][0],
+        serde_json::json!(format!("0x{}", hex_string(0x05, 20)))
+    );
+
+    let wrong_chain = db
+        .query_sql(
+            "SELECT address FROM contract_opcodes \
+             WHERE list_contains(opcodes, 'SELFDESTRUCT')"
+                .to_string(),
+            10,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert!(wrong_chain.rows.is_empty());
+}
+
 fn hex_string(byte: u8, len: usize) -> String {
     hex::encode(vec![byte; len])
 }
