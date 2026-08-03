@@ -480,6 +480,8 @@ fn run_decode_blocking(args: DecodeArgs, data_dir: PathBuf) -> Result<()> {
 }
 
 fn copy_decode_rows_to_tsv(parquet_file: &Path, temp_path: &Path) -> Result<()> {
+    let parquet_conn =
+        Connection::open_in_memory().context("open bundled DuckDB for decode row export")?;
     let parquet_path = parquet_file.display().to_string().replace('\'', "''");
     let temp_path_str = temp_path.display().to_string().replace('\'', "''");
     // Cryo's schema has a precomputed `n_code_bytes` (uint32). Filtering on
@@ -488,7 +490,7 @@ fn copy_decode_rows_to_tsv(parquet_file: &Path, temp_path: &Path) -> Result<()> 
     // that column, so we fall back to `octet_length(code)` for those files —
     // they're the official paradigm dataset and don't have the corruption
     // problem in practice.
-    let has_n_code_bytes = parquet_has_column(parquet_file, "n_code_bytes")?;
+    let has_n_code_bytes = parquet_has_column(&parquet_conn, parquet_file, "n_code_bytes")?;
     let length_filter = if has_n_code_bytes {
         format!(
             "AND n_code_bytes IS NOT NULL
@@ -513,15 +515,9 @@ fn copy_decode_rows_to_tsv(parquet_file: &Path, temp_path: &Path) -> Result<()> 
               {length_filter}
         ) TO '{temp_path_str}' (FORMAT CSV, HEADER false, DELIMITER '\\t');",
     );
-    let output = std::process::Command::new("duckdb")
-        .arg("-c")
-        .arg(&sql)
-        .output()
-        .context("run duckdb CLI for decode row export")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("duckdb CLI export failed: {}", stderr.trim()));
-    }
+    parquet_conn
+        .execute_batch(&sql)
+        .with_context(|| format!("export decode rows from {}", parquet_file.display()))?;
     Ok(())
 }
 
@@ -1027,7 +1023,9 @@ fn flush_opcode_contract_batch(
 }
 
 fn copy_opcode_rows_to_tsv(parquet_file: &Path, temp_path: &Path) -> Result<()> {
-    let columns = parquet_columns(parquet_file)?;
+    let parquet_conn =
+        Connection::open_in_memory().context("open bundled DuckDB for opcode row export")?;
+    let columns = parquet_columns(&parquet_conn, parquet_file)?;
     if !columns.contains("contract_address") || !columns.contains("code") {
         return Err(anyhow!("parquet lacks contract_address/code columns"));
     }
@@ -1083,37 +1081,24 @@ fn copy_opcode_rows_to_tsv(parquet_file: &Path, temp_path: &Path) -> Result<()> 
         ) TO '{temp_path}' (FORMAT CSV, HEADER false, DELIMITER '\t');
         "#
     );
-    let output = std::process::Command::new("duckdb")
-        .arg("-c")
-        .arg(&sql)
-        .output()
-        .context("run duckdb CLI for opcode row export")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "duckdb CLI opcode export failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
+    parquet_conn
+        .execute_batch(&sql)
+        .with_context(|| format!("export opcode rows from {}", parquet_file.display()))?;
     Ok(())
 }
 
-fn parquet_columns(parquet_file: &Path) -> Result<std::collections::HashSet<String>> {
+fn parquet_columns(
+    conn: &Connection,
+    parquet_file: &Path,
+) -> Result<std::collections::HashSet<String>> {
     let parquet_path = parquet_file.display().to_string().replace('\'', "''");
     let sql =
         format!("SELECT string_agg(DISTINCT name, ',') FROM parquet_schema('{parquet_path}');");
-    let output = std::process::Command::new("duckdb")
-        .arg("-noheader")
-        .arg("-c")
-        .arg(&sql)
-        .output()
-        .context("run duckdb CLI for parquet column discovery")?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "duckdb CLI schema discovery failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
+    let names: Option<String> = conn
+        .query_row(&sql, [], |row| row.get(0))
+        .with_context(|| format!("read parquet schema for {}", parquet_file.display()))?;
+    Ok(names
+        .unwrap_or_default()
         .trim()
         .split(',')
         .map(str::trim)
@@ -1226,22 +1211,13 @@ pub(crate) fn flush_creation_links(
     Ok(inserted as u64)
 }
 
-fn parquet_has_column(parquet_file: &Path, column: &str) -> Result<bool> {
+fn parquet_has_column(conn: &Connection, parquet_file: &Path, column: &str) -> Result<bool> {
     let parquet_path = parquet_file.display().to_string().replace('\'', "''");
     let sql =
         format!("SELECT COUNT(*) FROM parquet_schema('{parquet_path}') WHERE name = '{column}';");
-    let output = std::process::Command::new("duckdb")
-        .arg("-noheader")
-        .arg("-c")
-        .arg(&sql)
-        .output()
-        .context("run duckdb CLI for parquet schema check")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("duckdb CLI schema check failed: {}", stderr.trim()));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let count: u64 = stdout.trim().parse().unwrap_or(0);
+    let count: i64 = conn
+        .query_row(&sql, [], |row| row.get(0))
+        .with_context(|| format!("read parquet schema for {}", parquet_file.display()))?;
     Ok(count > 0)
 }
 

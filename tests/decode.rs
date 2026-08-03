@@ -159,6 +159,7 @@ fn decode_backfills_creation_and_runtime_opcode_sets_idempotently() {
                 "--batch-size",
                 "1",
             ])
+            .env("PATH", "")
             .output()
             .unwrap();
         assert!(
