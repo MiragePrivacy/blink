@@ -1688,6 +1688,7 @@ dependencies = [
  "chrono",
  "clap",
  "duckdb",
+ "eot",
  "futures",
  "hex",
  "indicatif",
@@ -2466,6 +2467,12 @@ dependencies = [
  "quote",
  "syn 2.0.114",
 ]
+
+[[package]]
+name = "eot"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26c685edb5c949f9e07e31fc36a8f02b15654eb725c29ec29b4fcb25990e2552"
 
 [[package]]
 name = "equivalent"

@@ -16,7 +16,10 @@ use chrono::Utc;
 use futures::{stream, StreamExt};
 
 use super::{batch::BatchClient, parquet_io, traces::extract_contracts};
-use crate::{db::Db, types::ChunkReport};
+use crate::{
+    db::{Db, LiveCreationBytecode},
+    types::ChunkReport,
+};
 
 const TAIL_BATCH_BLOCK_LIMIT: u64 = 1_000;
 
@@ -93,6 +96,7 @@ pub async fn tail_once(
     let mut writer = None;
     let mut rows_written = 0usize;
     let mut live_bytecodes = HashMap::<Vec<u8>, Vec<u8>>::new();
+    let mut live_creation_bytecodes = Vec::new();
 
     let mut pending: BTreeMap<usize, Vec<(u64, Vec<LocalizedTransactionTrace>)>> = BTreeMap::new();
     let mut next_index = 0usize;
@@ -131,6 +135,14 @@ pub async fn tail_once(
                     live_bytecodes
                         .entry(row.code_hash.clone())
                         .or_insert_with(|| row.code.clone());
+                    live_creation_bytecodes.push(LiveCreationBytecode {
+                        chain_id: row.chain_id,
+                        block_number: row.block_number,
+                        create_index: row.create_index,
+                        contract_address: row.contract_address.clone(),
+                        bytecode_hash: row.init_code_hash.clone(),
+                        code: row.init_code.clone(),
+                    });
                 }
                 batch_rows.sort_unstable_by(|a, b| {
                     a.block_number
@@ -168,8 +180,14 @@ pub async fn tail_once(
     let decoded = db
         .decode_live_bytecodes(live_bytecodes.into_iter().collect())
         .await?;
+    let creation_decoded = db
+        .decode_live_creation_bytecodes(live_creation_bytecodes, output_path.display().to_string())
+        .await?;
     if decoded > 0 {
         tracing::info!("decoded {} new live bytecode(s)", decoded);
+    }
+    if creation_decoded > 0 {
+        tracing::info!("decoded {} new live creation bytecode(s)", creation_decoded);
     }
 
     let size_bytes = std::fs::metadata(&output_path).ok().map(|m| m.len());

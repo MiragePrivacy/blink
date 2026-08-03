@@ -39,7 +39,7 @@ impl Language {
 pub fn analyze(code: &[u8]) -> BytecodeMetadata {
     let mut meta = BytecodeMetadata::default();
     decode_cbor_tail(code, &mut meta);
-    scan_opcodes(code, &mut meta);
+    scan_opcodes(&code[..runtime_code_end(code)], &mut meta);
     detect_minimal_proxy(code, &mut meta);
     meta
 }
@@ -95,6 +95,25 @@ fn decode_cbor_tail(code: &[u8], meta: &mut BytecodeMetadata) {
         if meta.language.is_none() && !map.is_empty() {
             meta.language = Some(Language::Other);
         }
+    }
+}
+
+/// End of executable runtime bytecode, excluding a validated CBOR compiler
+/// metadata trailer and its two-byte length suffix when present.
+pub(crate) fn runtime_code_end(code: &[u8]) -> usize {
+    if code.len() < 4 {
+        return code.len();
+    }
+    let n = code.len();
+    let metadata_len = u16::from_be_bytes([code[n - 2], code[n - 1]]) as usize;
+    if metadata_len == 0 || metadata_len + 2 > n {
+        return n;
+    }
+    let start = n - 2 - metadata_len;
+    if parse_cbor_map(&code[start..n - 2]).is_ok() {
+        start
+    } else {
+        n
     }
 }
 
