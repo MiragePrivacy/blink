@@ -67,6 +67,15 @@ pub struct Db {
     read_only: bool,
 }
 
+pub(crate) struct LiveCreationBytecode {
+    pub chain_id: u64,
+    pub block_number: u32,
+    pub create_index: u32,
+    pub contract_address: Vec<u8>,
+    pub bytecode_hash: Vec<u8>,
+    pub code: Vec<u8>,
+}
+
 impl Db {
     pub fn open_with_mode(data_dir: &Path, contracts_glob: &str, read_only: bool) -> Result<Self> {
         Self::open(
@@ -308,11 +317,91 @@ impl Db {
                 })
                 .map(|(code_hash, code)| {
                     let metadata = crate::decode::bytecode_meta::analyze(&code);
-                    (code_hash, metadata)
+                    let opcodes = crate::decode::opcodes::opcode_names(
+                        &code,
+                        crate::decode::opcodes::CodeKind::Runtime,
+                    );
+                    (code_hash, metadata, opcodes)
                 })
                 .collect::<Vec<_>>();
             let mut conn = writer.blocking_lock();
-            crate::decode::flush_hash_batch(&mut conn, &analyzed)
+            let metadata = analyzed
+                .iter()
+                .map(|(hash, metadata, _)| (hash.clone(), metadata.clone()))
+                .collect::<Vec<_>>();
+            let opcode_sets = analyzed
+                .into_iter()
+                .map(|(bytecode_hash, _, opcodes)| crate::decode::OpcodeSetRow {
+                    bytecode_hash,
+                    code_kind: crate::decode::opcodes::CodeKind::Runtime,
+                    opcodes,
+                })
+                .collect::<Vec<_>>();
+            let metadata_inserted = crate::decode::flush_hash_batch(&mut conn, &metadata)?;
+            let opcode_sets_inserted = crate::decode::flush_opcode_sets(&mut conn, &opcode_sets)?;
+            Ok(metadata_inserted.max(opcode_sets_inserted))
+        })
+        .await
+        .map_err(|error| anyhow!("join error: {error}"))?
+    }
+
+    pub(crate) async fn decode_live_creation_bytecodes(
+        &self,
+        bytecodes: Vec<LiveCreationBytecode>,
+        source_file: String,
+    ) -> Result<u64> {
+        if self.read_only || bytecodes.is_empty() {
+            return Ok(0);
+        }
+        let writer = self.writer.clone();
+        tokio::task::spawn_blocking(move || -> Result<u64> {
+            let analyzed = bytecodes
+                .into_par_iter()
+                .filter(|bytecode| {
+                    bytecode.bytecode_hash.len() == 32
+                        && bytecode.contract_address.len() == 20
+                        && !bytecode.code.is_empty()
+                        && bytecode.code.len() <= 65_536
+                })
+                .map(|bytecode| {
+                    let opcodes = crate::decode::opcodes::opcode_names(
+                        &bytecode.code,
+                        crate::decode::opcodes::CodeKind::Creation,
+                    );
+                    (
+                        crate::decode::OpcodeSetRow {
+                            bytecode_hash: bytecode.bytecode_hash.clone(),
+                            code_kind: crate::decode::opcodes::CodeKind::Creation,
+                            opcodes,
+                        },
+                        crate::decode::CreationBytecodeLink {
+                            chain_id: bytecode.chain_id,
+                            block_number: bytecode.block_number,
+                            create_index: bytecode.create_index,
+                            contract_address: bytecode.contract_address,
+                            bytecode_hash: bytecode.bytecode_hash,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut seen = std::collections::HashSet::with_capacity(analyzed.len());
+            let opcode_sets = analyzed
+                .iter()
+                .filter(|(set, _)| seen.insert(set.bytecode_hash.as_slice()))
+                .map(|(set, _)| crate::decode::OpcodeSetRow {
+                    bytecode_hash: set.bytecode_hash.clone(),
+                    code_kind: set.code_kind,
+                    opcodes: set.opcodes.clone(),
+                })
+                .collect::<Vec<_>>();
+            let links = analyzed
+                .into_iter()
+                .map(|(_, link)| link)
+                .collect::<Vec<_>>();
+            let mut conn = writer.blocking_lock();
+            let inserted = crate::decode::flush_opcode_sets(&mut conn, &opcode_sets)?;
+            crate::decode::flush_creation_links(&mut conn, &source_file, &links)?;
+            Ok(inserted)
         })
         .await
         .map_err(|error| anyhow!("join error: {error}"))?

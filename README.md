@@ -88,6 +88,48 @@ Each parquet file contains contract creations with this schema:
 | code_hash | binary | Keccak256 of deployed code |
 | chain_id | uint64 | Chain ID |
 
+## Opcode queries
+
+Run the decoder after loading or extracting contract data. It stores compact,
+deduplicated opcode sets for both constructor and deployed runtime bytecode:
+
+```bash
+blink decode --data-dir ./data/blink
+```
+
+The SQL explorer exposes `contract_opcodes` with one row per contract and code
+kind. Opcode names are canonical uppercase mnemonics supplied by `eot`.
+
+```sql
+-- Constructor/creation bytecode only
+SELECT address
+FROM contract_opcodes
+WHERE code_kind = 'creation'
+  AND list_contains(opcodes, 'CREATE2');
+
+-- Deployed runtime bytecode only
+SELECT address
+FROM contract_opcodes
+WHERE code_kind = 'runtime'
+  AND list_contains(opcodes, 'DELEGATECALL');
+
+-- Either kind
+SELECT DISTINCT address
+FROM contract_opcodes
+WHERE list_contains(opcodes, 'SELFDESTRUCT');
+```
+
+The HTTP SQL explorer returns at most 1,000 rows per request. Its response
+includes `offset` and `has_more`; pass the next `offset` to `POST /api/query`
+to page through every match. Use a deterministic `ORDER BY` when paging, and
+omit an SQL `LIMIT` if the full result set should remain available.
+
+`PUSH1` through `PUSH32` payload bytes are not interpreted as opcodes. Runtime
+compiler metadata is excluded when recognized. Creation analysis follows
+statically discoverable control-flow from program counter zero so embedded
+runtime code and constructor arguments are not indexed as constructor
+instructions merely because they contain opcode-shaped bytes.
+
 ## Performance
 
 blink is designed for speed:

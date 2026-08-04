@@ -471,6 +471,109 @@ async fn dashboard_sql_scopes_contract_metadata_by_chain() {
     assert_eq!(result.rows[0][1], serde_json::json!(300));
 }
 
+#[tokio::test]
+async fn dashboard_sql_pages_through_all_matching_rows() {
+    let dir = TestDir::new("query_pagination");
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    let sql = "SELECT range AS value FROM range(2505) ORDER BY value".to_string();
+
+    let first = db
+        .query_sql_page(sql.clone(), 1_000, 0, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(first.row_count, 1_000);
+    assert_eq!(first.offset, 0);
+    assert!(first.has_more);
+    assert_eq!(first.rows[0][0], serde_json::json!(0));
+    assert_eq!(first.rows[999][0], serde_json::json!(999));
+
+    let second = db
+        .query_sql_page(sql.clone(), 1_000, 1_000, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(second.row_count, 1_000);
+    assert_eq!(second.offset, 1_000);
+    assert!(second.has_more);
+    assert_eq!(second.rows[0][0], serde_json::json!(1_000));
+
+    let last = db.query_sql_page(sql, 1_000, 2_000, Some(1)).await.unwrap();
+    assert_eq!(last.row_count, 505);
+    assert_eq!(last.offset, 2_000);
+    assert!(!last.has_more);
+    assert_eq!(last.rows[504][0], serde_json::json!(2_504));
+}
+
+#[tokio::test]
+async fn contract_opcodes_queries_creation_and_runtime_separately() {
+    let dir = TestDir::new("contract_opcodes");
+    write_backfill_parquet(&dir.path);
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+
+    db.execute_batch(
+        r#"
+        INSERT INTO bytecode_opcode_sets (
+            bytecode_hash, code_kind, opcodes, parser_version
+        ) VALUES
+            (unhex(repeat('03', 32)), 'creation', ['PUSH1', 'CREATE2'], 1),
+            (unhex(repeat('09', 32)), 'runtime', ['PUSH1', 'DELEGATECALL'], 1),
+            (unhex(repeat('19', 32)), 'runtime', ['SELFDESTRUCT'], 1);
+
+        INSERT INTO contract_creation_bytecodes (
+            chain_id, block_number, create_index, contract_address,
+            bytecode_hash, source_file
+        ) VALUES (
+            1, 200, 0, unhex(repeat('05', 20)),
+            unhex(repeat('03', 32)), 'test'
+        );
+        "#
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let creation = db
+        .query_sql(
+            "SELECT address, code_kind, opcodes FROM contract_opcodes \
+             WHERE code_kind = 'creation' AND list_contains(opcodes, 'CREATE2')"
+                .to_string(),
+            10,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(creation.row_count, 1);
+    assert_eq!(creation.rows[0][1], serde_json::json!("creation"));
+    assert_eq!(creation.rows[0][2], serde_json::json!(["PUSH1", "CREATE2"]));
+
+    let runtime = db
+        .query_sql(
+            "SELECT address FROM contract_opcodes \
+             WHERE code_kind = 'runtime' AND list_contains(opcodes, 'DELEGATECALL')"
+                .to_string(),
+            10,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(runtime.row_count, 1);
+    assert_eq!(
+        runtime.rows[0][0],
+        serde_json::json!(format!("0x{}", hex_string(0x05, 20)))
+    );
+
+    let wrong_chain = db
+        .query_sql(
+            "SELECT address FROM contract_opcodes \
+             WHERE list_contains(opcodes, 'SELFDESTRUCT')"
+                .to_string(),
+            10,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert!(wrong_chain.rows.is_empty());
+}
+
 fn hex_string(byte: u8, len: usize) -> String {
     hex::encode(vec![byte; len])
 }

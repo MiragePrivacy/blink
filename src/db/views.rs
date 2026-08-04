@@ -83,6 +83,34 @@ pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
         UPDATE bytecode_metadata_by_hash
             SET is_proxy_minimal = false
             WHERE is_proxy_minimal IS NULL;
+
+        CREATE TABLE IF NOT EXISTS bytecode_opcode_sets (
+            bytecode_hash    BLOB NOT NULL,
+            code_kind        VARCHAR NOT NULL,
+            opcodes          VARCHAR[] NOT NULL,
+            parser_version   USMALLINT NOT NULL,
+            decoded_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS bytecode_opcode_sets_lookup_idx
+            ON bytecode_opcode_sets(code_kind, bytecode_hash, parser_version);
+        CREATE TABLE IF NOT EXISTS contract_creation_bytecodes (
+            chain_id         UBIGINT NOT NULL,
+            block_number     UINTEGER NOT NULL,
+            create_index     UINTEGER NOT NULL,
+            contract_address BLOB NOT NULL,
+            bytecode_hash    BLOB NOT NULL,
+            source_file      VARCHAR NOT NULL,
+            linked_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS opcode_decode_runs (
+            file_path        VARCHAR NOT NULL,
+            parser_version   USMALLINT NOT NULL,
+            file_size        UBIGINT NOT NULL,
+            file_mtime_secs  BIGINT NOT NULL,
+            rows_processed   UBIGINT NOT NULL,
+            completed_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (file_path, parser_version)
+        );
         "#,
     )
     .context("create blink schema")?;
@@ -346,7 +374,7 @@ fn create_enrichment_current_view(conn: &Connection) -> Result<()> {
 }
 
 /// Views consumed by `POST /api/query` users: `bytecodes`,
-/// `decoded_bytecodes`, `contract_metadata_all`.
+/// `decoded_bytecodes`, `contract_metadata_all`, `contract_opcodes_all`.
 fn create_standard_query_views(conn: &Connection) -> Result<()> {
     let has_rollups = table_exists(conn, "rollup_code_counts")?;
     let has_zellic_bytecodes = table_exists(conn, "zellic_bytecodes")?;
@@ -469,7 +497,156 @@ fn create_standard_query_views(conn: &Connection) -> Result<()> {
     conn.execute_batch(&decoded_sql)
         .context("create decoded bytecodes query view")?;
 
-    create_contract_metadata_view(conn)
+    create_contract_metadata_view(conn)?;
+    create_opcode_query_views(conn)
+}
+
+fn create_opcode_query_views(conn: &Connection) -> Result<()> {
+    let has_opcode_sets = table_exists(conn, "bytecode_opcode_sets")?;
+    let opcode_sets_sql = if has_opcode_sets {
+        r#"
+        CREATE OR REPLACE TEMP VIEW bytecode_opcode_sets_current AS
+        SELECT
+            bytecode_hash,
+            lower('0x' || hex(bytecode_hash)) AS bytecode_hash_hex,
+            code_kind,
+            opcodes,
+            parser_version,
+            decoded_at
+        FROM bytecode_opcode_sets
+        QUALIFY row_number() OVER (
+            PARTITION BY bytecode_hash, code_kind
+            ORDER BY parser_version DESC, decoded_at DESC NULLS LAST
+        ) = 1;
+        "#
+    } else {
+        r#"
+        CREATE OR REPLACE TEMP VIEW bytecode_opcode_sets_current AS
+        SELECT
+            CAST(NULL AS BLOB) AS bytecode_hash,
+            CAST(NULL AS VARCHAR) AS bytecode_hash_hex,
+            CAST(NULL AS VARCHAR) AS code_kind,
+            CAST(NULL AS VARCHAR[]) AS opcodes,
+            CAST(NULL AS USMALLINT) AS parser_version,
+            CAST(NULL AS TIMESTAMP) AS decoded_at
+        WHERE FALSE;
+        "#
+    };
+    conn.execute_batch(opcode_sets_sql)
+        .context("create current opcode-set view")?;
+
+    let has_creation_links = table_exists(conn, "contract_creation_bytecodes")?;
+    let creation_links_sql = if has_creation_links {
+        r#"
+        CREATE OR REPLACE TEMP VIEW contract_creation_bytecodes_current AS
+        SELECT
+            chain_id,
+            block_number,
+            create_index,
+            contract_address,
+            any_value(bytecode_hash) AS bytecode_hash
+        FROM contract_creation_bytecodes
+        GROUP BY chain_id, block_number, create_index, contract_address;
+        "#
+    } else {
+        r#"
+        CREATE OR REPLACE TEMP VIEW contract_creation_bytecodes_current AS
+        SELECT
+            CAST(NULL AS UBIGINT) AS chain_id,
+            CAST(NULL AS UINTEGER) AS block_number,
+            CAST(NULL AS UINTEGER) AS create_index,
+            CAST(NULL AS BLOB) AS contract_address,
+            CAST(NULL AS BLOB) AS bytecode_hash
+        WHERE FALSE;
+        "#
+    };
+    conn.execute_batch(creation_links_sql)
+        .context("create current creation-bytecode link view")?;
+
+    let has_deployments = table_exists(conn, "contract_deployments_native")?;
+    let runtime_select = if has_deployments {
+        Some(
+            r#"
+            SELECT
+                c.chain_id,
+                c.block_number,
+                c.create_index,
+                c.contract_address,
+                lower('0x' || hex(c.contract_address)) AS address,
+                'runtime'::VARCHAR AS code_kind,
+                c.code_hash AS bytecode_hash,
+                lower('0x' || hex(c.code_hash)) AS bytecode_hash_hex,
+                o.opcodes,
+                o.parser_version,
+                o.decoded_at
+            FROM contract_deployments_native c
+            JOIN bytecode_opcode_sets_current o
+              ON o.bytecode_hash = c.code_hash
+             AND o.code_kind = 'runtime'
+            "#,
+        )
+    } else {
+        None
+    };
+    let creation_select = if has_creation_links {
+        Some(
+            r#"
+            SELECT
+                c.chain_id,
+                c.block_number,
+                c.create_index,
+                c.contract_address,
+                lower('0x' || hex(c.contract_address)) AS address,
+                'creation'::VARCHAR AS code_kind,
+                c.bytecode_hash,
+                lower('0x' || hex(c.bytecode_hash)) AS bytecode_hash_hex,
+                o.opcodes,
+                o.parser_version,
+                o.decoded_at
+            FROM contract_creation_bytecodes_current c
+            JOIN bytecode_opcode_sets_current o
+              ON o.bytecode_hash = c.bytecode_hash
+             AND o.code_kind = 'creation'
+            "#,
+        )
+    } else {
+        None
+    };
+    let body = [runtime_select, creation_select]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\nUNION ALL\n");
+    let body = if body.is_empty() {
+        r#"
+        SELECT
+            CAST(NULL AS UBIGINT) AS chain_id,
+            CAST(NULL AS UINTEGER) AS block_number,
+            CAST(NULL AS UINTEGER) AS create_index,
+            CAST(NULL AS BLOB) AS contract_address,
+            CAST(NULL AS VARCHAR) AS address,
+            CAST(NULL AS VARCHAR) AS code_kind,
+            CAST(NULL AS BLOB) AS bytecode_hash,
+            CAST(NULL AS VARCHAR) AS bytecode_hash_hex,
+            CAST(NULL AS VARCHAR[]) AS opcodes,
+            CAST(NULL AS USMALLINT) AS parser_version,
+            CAST(NULL AS TIMESTAMP) AS decoded_at
+        WHERE FALSE
+        "#
+        .to_string()
+    } else {
+        body
+    };
+    conn.execute_batch(&format!(
+        r#"
+        CREATE OR REPLACE TEMP VIEW contract_opcodes_all AS
+        {body};
+
+        CREATE OR REPLACE TEMP VIEW contract_opcodes AS
+        SELECT * FROM contract_opcodes_all;
+        "#
+    ))
+    .context("create contract opcode query views")
 }
 
 /// The SQL-explorer surface: `contract_metadata_all` / `contract_metadata`.

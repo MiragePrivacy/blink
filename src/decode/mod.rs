@@ -7,6 +7,7 @@
 //! (unless `--overwrite`).
 //!
 pub mod bytecode_meta;
+pub mod opcodes;
 
 use std::{
     fs::File,
@@ -20,13 +21,43 @@ use duckdb::{params, Connection};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
-use self::bytecode_meta::{analyze, BytecodeMetadata};
+use self::{
+    bytecode_meta::{analyze, BytecodeMetadata},
+    opcodes::{opcode_names, CodeKind, OPCODE_PARSER_VERSION},
+};
 use crate::{
     cli::DecodeArgs,
     util::{format_count, match_simple_glob, print_header, print_kv, print_kv_accent},
 };
 
 const MAX_DECODE_CODE_BYTES: u64 = 65_536;
+
+#[derive(Debug)]
+pub(crate) struct OpcodeSetRow {
+    pub bytecode_hash: Vec<u8>,
+    pub code_kind: CodeKind,
+    pub opcodes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CreationBytecodeLink {
+    pub chain_id: u64,
+    pub block_number: u32,
+    pub create_index: u32,
+    pub contract_address: Vec<u8>,
+    pub bytecode_hash: Vec<u8>,
+}
+
+struct OpcodeContractInput {
+    chain_id: u64,
+    block_number: u32,
+    create_index: u32,
+    contract_address: Vec<u8>,
+    init_code_hash: Option<Vec<u8>>,
+    init_code: Option<Vec<u8>>,
+    code_hash: Vec<u8>,
+    code: Vec<u8>,
+}
 
 const SCHEMA: &str = r#"
 -- Scalable address-level decode storage. The legacy `bytecode_metadata` table
@@ -83,6 +114,43 @@ CREATE TABLE IF NOT EXISTS decode_runs (
     rows_processed   UBIGINT NOT NULL,
     completed_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Compact presence sets keyed by bytecode hash and code kind. Keeping one
+-- VARCHAR[] per unique bytecode avoids multiplying every instruction across
+-- every deployment while remaining directly queryable with list_contains().
+CREATE TABLE IF NOT EXISTS bytecode_opcode_sets (
+    bytecode_hash    BLOB NOT NULL,
+    code_kind        VARCHAR NOT NULL,
+    opcodes          VARCHAR[] NOT NULL,
+    parser_version   USMALLINT NOT NULL,
+    decoded_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS bytecode_opcode_sets_lookup_idx
+    ON bytecode_opcode_sets(code_kind, bytecode_hash, parser_version);
+
+-- Runtime hashes already live on contract_deployments_native. Creation
+-- hashes do not, so retain this narrow address -> init-code-hash mapping.
+CREATE TABLE IF NOT EXISTS contract_creation_bytecodes (
+    chain_id         UBIGINT NOT NULL,
+    block_number     UINTEGER NOT NULL,
+    create_index     UINTEGER NOT NULL,
+    contract_address BLOB NOT NULL,
+    bytecode_hash    BLOB NOT NULL,
+    source_file      VARCHAR NOT NULL,
+    linked_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Independent from decode_runs: databases decoded before opcode sets were
+-- introduced must backfill once even though their metadata pass is complete.
+CREATE TABLE IF NOT EXISTS opcode_decode_runs (
+    file_path        VARCHAR NOT NULL,
+    parser_version   USMALLINT NOT NULL,
+    file_size        UBIGINT NOT NULL,
+    file_mtime_secs  BIGINT NOT NULL,
+    rows_processed   UBIGINT NOT NULL,
+    completed_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (file_path, parser_version)
+);
 "#;
 
 pub async fn run_decode(args: DecodeArgs) -> Result<()> {
@@ -110,7 +178,7 @@ fn run_decode_blocking(args: DecodeArgs, data_dir: PathBuf) -> Result<()> {
     if args.overwrite {
         write_conn
             .execute_batch(
-                "DROP TABLE IF EXISTS bytecode_metadata; DELETE FROM bytecode_metadata_v2; DELETE FROM bytecode_metadata_by_hash; DELETE FROM decode_runs;",
+                "DROP TABLE IF EXISTS bytecode_metadata; DELETE FROM bytecode_metadata_v2; DELETE FROM bytecode_metadata_by_hash; DELETE FROM decode_runs; DELETE FROM bytecode_opcode_sets; DELETE FROM contract_creation_bytecodes; DELETE FROM opcode_decode_runs;",
             )
             .context("clear bytecode_metadata for --overwrite")?;
     }
@@ -367,7 +435,17 @@ fn run_decode_blocking(args: DecodeArgs, data_dir: PathBuf) -> Result<()> {
         let _ = write_conn.execute_batch("CHECKPOINT");
     }
 
+    let (opcode_scanned, opcode_sets_written) = decode_opcode_datasets(
+        &db_path,
+        &mut write_conn,
+        &files,
+        args.batch_size,
+        has_zellic_bytecodes,
+        args.overwrite,
+    )?;
+
     let elapsed = started.elapsed();
+    let work_rows = total_rows.max(opcode_scanned);
     println!();
     if total_skipped_files > 0 {
         print_kv(
@@ -378,11 +456,19 @@ fn run_decode_blocking(args: DecodeArgs, data_dir: PathBuf) -> Result<()> {
     print_kv_accent("scanned", &format_count(total_rows));
     print_kv_accent("decoded", &format!("{} rows", format_count(total_decoded)));
     print_kv_accent(
+        "opcodes",
+        &format!(
+            "{} contracts scanned · {} bytecode sets",
+            format_count(opcode_scanned),
+            format_count(opcode_sets_written)
+        ),
+    );
+    print_kv_accent(
         "speed",
-        &if total_rows > 0 {
+        &if work_rows > 0 {
             format!(
                 "{:.0} rows/sec · total {:.1}s",
-                total_rows as f64 / elapsed.as_secs_f64().max(0.001),
+                work_rows as f64 / elapsed.as_secs_f64().max(0.001),
                 elapsed.as_secs_f64()
             )
         } else {
@@ -394,6 +480,8 @@ fn run_decode_blocking(args: DecodeArgs, data_dir: PathBuf) -> Result<()> {
 }
 
 fn copy_decode_rows_to_tsv(parquet_file: &Path, temp_path: &Path) -> Result<()> {
+    let parquet_conn =
+        Connection::open_in_memory().context("open bundled DuckDB for decode row export")?;
     let parquet_path = parquet_file.display().to_string().replace('\'', "''");
     let temp_path_str = temp_path.display().to_string().replace('\'', "''");
     // Cryo's schema has a precomputed `n_code_bytes` (uint32). Filtering on
@@ -402,7 +490,7 @@ fn copy_decode_rows_to_tsv(parquet_file: &Path, temp_path: &Path) -> Result<()> 
     // that column, so we fall back to `octet_length(code)` for those files —
     // they're the official paradigm dataset and don't have the corruption
     // problem in practice.
-    let has_n_code_bytes = parquet_has_column(parquet_file, "n_code_bytes")?;
+    let has_n_code_bytes = parquet_has_column(&parquet_conn, parquet_file, "n_code_bytes")?;
     let length_filter = if has_n_code_bytes {
         format!(
             "AND n_code_bytes IS NOT NULL
@@ -427,15 +515,9 @@ fn copy_decode_rows_to_tsv(parquet_file: &Path, temp_path: &Path) -> Result<()> 
               {length_filter}
         ) TO '{temp_path_str}' (FORMAT CSV, HEADER false, DELIMITER '\\t');",
     );
-    let output = std::process::Command::new("duckdb")
-        .arg("-c")
-        .arg(&sql)
-        .output()
-        .context("run duckdb CLI for decode row export")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("duckdb CLI export failed: {}", stderr.trim()));
-    }
+    parquet_conn
+        .execute_batch(&sql)
+        .with_context(|| format!("export decode rows from {}", parquet_file.display()))?;
     Ok(())
 }
 
@@ -608,22 +690,534 @@ fn copy_zellic_decode_rows_to_tsv(conn: &Connection, temp_path: &Path) -> Result
         .context("export Zellic decode rows")
 }
 
-fn parquet_has_column(parquet_file: &Path, column: &str) -> Result<bool> {
+fn decode_opcode_datasets(
+    db_path: &Path,
+    conn: &mut Connection,
+    files: &[PathBuf],
+    batch_size: usize,
+    has_zellic_bytecodes: bool,
+    overwrite: bool,
+) -> Result<(u64, u64)> {
+    println!();
+    print_kv_accent(
+        "opcode parser",
+        &format!("eot · generation {}", OPCODE_PARSER_VERSION),
+    );
+
+    let mut scanned = 0u64;
+    let mut written = 0u64;
+    if has_zellic_bytecodes {
+        let (source_scanned, source_written) =
+            decode_zellic_opcode_sets(db_path, conn, batch_size)?;
+        scanned += source_scanned;
+        written += source_written;
+    }
+
+    let completed: std::collections::HashMap<String, (u64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT file_path, file_size, file_mtime_secs
+             FROM opcode_decode_runs WHERE parser_version = ?",
+        )?;
+        let rows = stmt.query_map(params![OPCODE_PARSER_VERSION], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, u64>(1)?, row.get::<_, i64>(2)?),
+            ))
+        })?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+
+    for file in files {
+        let source_file = file.display().to_string();
+        let (file_size, file_mtime_secs) = match std::fs::metadata(file) {
+            Ok(metadata) => (
+                metadata.len(),
+                metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs() as i64)
+                    .unwrap_or(0),
+            ),
+            Err(_) => (0, 0),
+        };
+        if !overwrite
+            && completed
+                .get(&source_file)
+                .is_some_and(|&(size, mtime)| size == file_size && mtime == file_mtime_secs)
+        {
+            continue;
+        }
+
+        // A failed earlier attempt may have appended only part of this
+        // source's creation links. Opcode sets are hash-keyed and idempotent.
+        conn.execute(
+            "DELETE FROM contract_creation_bytecodes WHERE source_file = ?",
+            params![source_file.as_str()],
+        )
+        .context("clear partial creation bytecode links")?;
+
+        let (file_scanned, file_written) = decode_parquet_opcode_sets(conn, file, batch_size)?;
+        scanned += file_scanned;
+        written += file_written;
+
+        conn.execute(
+            r#"
+            INSERT INTO opcode_decode_runs (
+                file_path, parser_version, file_size, file_mtime_secs,
+                rows_processed, completed_at
+            ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (file_path, parser_version) DO UPDATE SET
+                file_size       = excluded.file_size,
+                file_mtime_secs = excluded.file_mtime_secs,
+                rows_processed  = excluded.rows_processed,
+                completed_at    = excluded.completed_at
+            "#,
+            params![
+                source_file,
+                OPCODE_PARSER_VERSION,
+                file_size,
+                file_mtime_secs,
+                file_scanned
+            ],
+        )
+        .context("record opcode_decode_runs marker")?;
+        let _ = conn.execute_batch("CHECKPOINT");
+    }
+
+    Ok((scanned, written))
+}
+
+fn decode_zellic_opcode_sets(
+    db_path: &Path,
+    conn: &mut Connection,
+    batch_size: usize,
+) -> Result<(u64, u64)> {
+    let pending: u64 = conn
+        .query_row(
+            &format!(
+                r#"
+                SELECT COUNT(*)::UBIGINT
+                FROM zellic_bytecodes b
+                WHERE b.n_code_bytes BETWEEN 1 AND {MAX_DECODE_CODE_BYTES}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM bytecode_opcode_sets o
+                      WHERE o.bytecode_hash = b.code_hash
+                        AND o.code_kind = 'runtime'
+                        AND o.parser_version = {OPCODE_PARSER_VERSION}
+                  )
+                "#
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if pending == 0 {
+        return Ok((0, 0));
+    }
+
+    let temp_path = temp_zellic_opcode_path(db_path);
+    if let Some(parent) = temp_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let _ = std::fs::remove_file(&temp_path);
+    let temp_path_sql = temp_path.display().to_string().replace('\'', "''");
+    conn.execute_batch(&format!(
+        r#"
+        COPY (
+            SELECT hex(b.code_hash), hex(b.code)
+            FROM zellic_bytecodes b
+            WHERE b.n_code_bytes BETWEEN 1 AND {MAX_DECODE_CODE_BYTES}
+              AND octet_length(b.code) = b.n_code_bytes
+              AND NOT EXISTS (
+                  SELECT 1 FROM bytecode_opcode_sets o
+                  WHERE o.bytecode_hash = b.code_hash
+                    AND o.code_kind = 'runtime'
+                    AND o.parser_version = {OPCODE_PARSER_VERSION}
+              )
+        ) TO '{temp_path_sql}' (FORMAT CSV, HEADER false, DELIMITER '\t');
+        "#
+    ))
+    .context("export Zellic opcode rows")?;
+
+    let file = File::open(&temp_path)
+        .with_context(|| format!("open Zellic opcode export {}", temp_path.display()))?;
+    let mut raw = Vec::with_capacity(batch_size.max(5_000));
+    let mut scanned = 0u64;
+    let mut written = 0u64;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let Some((hash_hex, code_hex)) = line.split_once('\t') else {
+            continue;
+        };
+        let (Ok(bytecode_hash), Ok(code)) = (hex::decode(hash_hex), hex::decode(code_hex)) else {
+            continue;
+        };
+        if bytecode_hash.len() != 32 || code.is_empty() || code.len() as u64 > MAX_DECODE_CODE_BYTES
+        {
+            continue;
+        }
+        raw.push((bytecode_hash, code));
+        scanned += 1;
+        if raw.len() >= batch_size.max(5_000) {
+            written += analyze_and_flush_runtime_opcode_batch(conn, std::mem::take(&mut raw))?;
+            raw = Vec::with_capacity(batch_size.max(5_000));
+        }
+    }
+    if !raw.is_empty() {
+        written += analyze_and_flush_runtime_opcode_batch(conn, raw)?;
+    }
+    let _ = std::fs::remove_file(&temp_path);
+    Ok((scanned, written))
+}
+
+fn analyze_and_flush_runtime_opcode_batch(
+    conn: &mut Connection,
+    raw: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<u64> {
+    let rows = raw
+        .into_par_iter()
+        .map(|(bytecode_hash, code)| OpcodeSetRow {
+            bytecode_hash,
+            code_kind: CodeKind::Runtime,
+            opcodes: opcode_names(&code, CodeKind::Runtime),
+        })
+        .collect::<Vec<_>>();
+    flush_opcode_sets(conn, &rows)
+}
+
+fn decode_parquet_opcode_sets(
+    conn: &mut Connection,
+    parquet_file: &Path,
+    batch_size: usize,
+) -> Result<(u64, u64)> {
+    let temp_path = temp_opcode_decode_path(parquet_file);
+    let _ = std::fs::remove_file(&temp_path);
+    copy_opcode_rows_to_tsv(parquet_file, &temp_path)?;
+
+    let file = File::open(&temp_path)
+        .with_context(|| format!("open opcode export {}", temp_path.display()))?;
+    let mut raw = Vec::with_capacity(batch_size.max(5_000));
+    let mut scanned = 0u64;
+    let mut written = 0u64;
+    let source_file = parquet_file.display().to_string();
+
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 8 {
+            continue;
+        }
+        let (Ok(chain_id), Ok(block_number), Ok(create_index)) = (
+            fields[0].parse::<u64>(),
+            fields[1].parse::<u32>(),
+            fields[2].parse::<u32>(),
+        ) else {
+            continue;
+        };
+        let Ok(contract_address) = hex::decode(fields[3]) else {
+            continue;
+        };
+        let Ok(code) = hex::decode(fields[7]) else {
+            continue;
+        };
+        if contract_address.len() != 20
+            || code.is_empty()
+            || code.len() as u64 > MAX_DECODE_CODE_BYTES
+        {
+            continue;
+        }
+        let code_hash = hex::decode(fields[6])
+            .ok()
+            .filter(|hash| hash.len() == 32)
+            .unwrap_or_else(|| alloy::primitives::keccak256(&code).to_vec());
+        let init_code = hex::decode(fields[5])
+            .ok()
+            .filter(|bytes| !bytes.is_empty() && bytes.len() as u64 <= MAX_DECODE_CODE_BYTES);
+        let init_code_hash = init_code.as_ref().map(|init_code| {
+            hex::decode(fields[4])
+                .ok()
+                .filter(|hash| hash.len() == 32)
+                .unwrap_or_else(|| alloy::primitives::keccak256(init_code).to_vec())
+        });
+
+        raw.push(OpcodeContractInput {
+            chain_id,
+            block_number,
+            create_index,
+            contract_address,
+            init_code_hash,
+            init_code,
+            code_hash,
+            code,
+        });
+        scanned += 1;
+
+        if raw.len() >= batch_size.max(5_000) {
+            written += flush_opcode_contract_batch(conn, &source_file, std::mem::take(&mut raw))?;
+            raw = Vec::with_capacity(batch_size.max(5_000));
+        }
+    }
+    if !raw.is_empty() {
+        written += flush_opcode_contract_batch(conn, &source_file, raw)?;
+    }
+    let _ = std::fs::remove_file(&temp_path);
+    Ok((scanned, written))
+}
+
+fn flush_opcode_contract_batch(
+    conn: &mut Connection,
+    source_file: &str,
+    raw: Vec<OpcodeContractInput>,
+) -> Result<u64> {
+    let analyzed = raw
+        .into_par_iter()
+        .map(|input| {
+            let runtime = OpcodeSetRow {
+                bytecode_hash: input.code_hash,
+                code_kind: CodeKind::Runtime,
+                opcodes: opcode_names(&input.code, CodeKind::Runtime),
+            };
+            let creation =
+                input
+                    .init_code
+                    .zip(input.init_code_hash)
+                    .map(|(init_code, init_code_hash)| {
+                        (
+                            OpcodeSetRow {
+                                bytecode_hash: init_code_hash.clone(),
+                                code_kind: CodeKind::Creation,
+                                opcodes: opcode_names(&init_code, CodeKind::Creation),
+                            },
+                            CreationBytecodeLink {
+                                chain_id: input.chain_id,
+                                block_number: input.block_number,
+                                create_index: input.create_index,
+                                contract_address: input.contract_address,
+                                bytecode_hash: init_code_hash,
+                            },
+                        )
+                    });
+            (runtime, creation)
+        })
+        .collect::<Vec<_>>();
+
+    let mut seen = std::collections::HashSet::with_capacity(analyzed.len() * 2);
+    let mut sets = Vec::with_capacity(analyzed.len() * 2);
+    let mut links = Vec::with_capacity(analyzed.len());
+    for (runtime, creation) in analyzed {
+        if seen.insert((runtime.code_kind, runtime.bytecode_hash.clone())) {
+            sets.push(runtime);
+        }
+        if let Some((creation, link)) = creation {
+            if seen.insert((creation.code_kind, creation.bytecode_hash.clone())) {
+                sets.push(creation);
+            }
+            links.push(link);
+        }
+    }
+
+    let inserted = flush_opcode_sets(conn, &sets)?;
+    flush_creation_links(conn, source_file, &links)?;
+    Ok(inserted)
+}
+
+fn copy_opcode_rows_to_tsv(parquet_file: &Path, temp_path: &Path) -> Result<()> {
+    let parquet_conn =
+        Connection::open_in_memory().context("open bundled DuckDB for opcode row export")?;
+    let columns = parquet_columns(&parquet_conn, parquet_file)?;
+    if !columns.contains("contract_address") || !columns.contains("code") {
+        return Err(anyhow!("parquet lacks contract_address/code columns"));
+    }
+
+    let expr = |column: &str, fallback: &str| {
+        if columns.contains(column) {
+            column.to_string()
+        } else {
+            fallback.to_string()
+        }
+    };
+    let chain_id = expr("chain_id", "1");
+    let block_number = expr("block_number", "0");
+    let create_index = expr("create_index", "0");
+    let init_code_hash = expr("init_code_hash", "NULL::BLOB");
+    let code_hash = expr("code_hash", "NULL::BLOB");
+    let init_code = if columns.contains("init_code") {
+        format!(
+            "CASE WHEN octet_length(init_code) BETWEEN 1 AND {MAX_DECODE_CODE_BYTES} \
+             THEN init_code ELSE NULL::BLOB END"
+        )
+    } else {
+        "NULL::BLOB".to_string()
+    };
+    let runtime_filter = if columns.contains("n_code_bytes") {
+        format!(
+            "n_code_bytes BETWEEN 1 AND {MAX_DECODE_CODE_BYTES} AND \
+             octet_length(code) = n_code_bytes"
+        )
+    } else {
+        format!("octet_length(code) BETWEEN 1 AND {MAX_DECODE_CODE_BYTES}")
+    };
+
+    let parquet_path = parquet_file.display().to_string().replace('\'', "''");
+    let temp_path = temp_path.display().to_string().replace('\'', "''");
+    let sql = format!(
+        r#"
+        COPY (
+            SELECT
+                COALESCE({chain_id}, 1)::VARCHAR,
+                COALESCE({block_number}, 0)::VARCHAR,
+                COALESCE({create_index}, 0)::VARCHAR,
+                hex(contract_address),
+                COALESCE(hex({init_code_hash}), ''),
+                COALESCE(hex({init_code}), ''),
+                COALESCE(hex({code_hash}), ''),
+                hex(code)
+            FROM read_parquet('{parquet_path}')
+            WHERE contract_address IS NOT NULL
+              AND octet_length(contract_address) = 20
+              AND code IS NOT NULL
+              AND {runtime_filter}
+        ) TO '{temp_path}' (FORMAT CSV, HEADER false, DELIMITER '\t');
+        "#
+    );
+    parquet_conn
+        .execute_batch(&sql)
+        .with_context(|| format!("export opcode rows from {}", parquet_file.display()))?;
+    Ok(())
+}
+
+fn parquet_columns(
+    conn: &Connection,
+    parquet_file: &Path,
+) -> Result<std::collections::HashSet<String>> {
+    let parquet_path = parquet_file.display().to_string().replace('\'', "''");
+    let sql =
+        format!("SELECT string_agg(DISTINCT name, ',') FROM parquet_schema('{parquet_path}');");
+    let names: Option<String> = conn
+        .query_row(&sql, [], |row| row.get(0))
+        .with_context(|| format!("read parquet schema for {}", parquet_file.display()))?;
+    Ok(names
+        .unwrap_or_default()
+        .trim()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+pub(crate) fn flush_opcode_sets(conn: &mut Connection, rows: &[OpcodeSetRow]) -> Result<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    conn.execute_batch(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS _opcode_set_stage (
+            bytecode_hash BLOB,
+            code_kind VARCHAR,
+            opcodes_json VARCHAR
+        );
+        DELETE FROM _opcode_set_stage;
+        "#,
+    )?;
+    {
+        let mut appender = conn.appender("_opcode_set_stage")?;
+        for row in rows {
+            let opcodes_json = serde_json::to_string(&row.opcodes)?;
+            appender.append_row(params![
+                &row.bytecode_hash,
+                row.code_kind.as_str(),
+                opcodes_json
+            ])?;
+        }
+        appender.flush()?;
+    }
+
+    let inserted = conn.execute(
+        &format!(
+            r#"
+            INSERT INTO bytecode_opcode_sets (
+                bytecode_hash, code_kind, opcodes, parser_version, decoded_at
+            )
+            SELECT
+                s.bytecode_hash,
+                s.code_kind,
+                from_json(s.opcodes_json, '["VARCHAR"]')::VARCHAR[],
+                {OPCODE_PARSER_VERSION},
+                CURRENT_TIMESTAMP
+            FROM _opcode_set_stage s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM bytecode_opcode_sets existing
+                WHERE existing.bytecode_hash = s.bytecode_hash
+                  AND existing.code_kind = s.code_kind
+                  AND existing.parser_version = {OPCODE_PARSER_VERSION}
+            )
+            "#
+        ),
+        [],
+    )?;
+    Ok(inserted as u64)
+}
+
+pub(crate) fn flush_creation_links(
+    conn: &mut Connection,
+    source_file: &str,
+    links: &[CreationBytecodeLink],
+) -> Result<u64> {
+    if links.is_empty() {
+        return Ok(0);
+    }
+    conn.execute_batch(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS _creation_link_stage (
+            chain_id UBIGINT,
+            block_number UINTEGER,
+            create_index UINTEGER,
+            contract_address BLOB,
+            bytecode_hash BLOB,
+            source_file VARCHAR
+        );
+        DELETE FROM _creation_link_stage;
+        "#,
+    )?;
+    {
+        let mut appender = conn.appender("_creation_link_stage")?;
+        for link in links {
+            appender.append_row(params![
+                link.chain_id,
+                link.block_number,
+                link.create_index,
+                &link.contract_address,
+                &link.bytecode_hash,
+                source_file
+            ])?;
+        }
+        appender.flush()?;
+    }
+    let inserted = conn.execute(
+        r#"
+        INSERT INTO contract_creation_bytecodes (
+            chain_id, block_number, create_index, contract_address,
+            bytecode_hash, source_file
+        )
+        SELECT
+            chain_id, block_number, create_index, contract_address,
+            bytecode_hash, source_file
+        FROM _creation_link_stage
+        "#,
+        [],
+    )?;
+    Ok(inserted as u64)
+}
+
+fn parquet_has_column(conn: &Connection, parquet_file: &Path, column: &str) -> Result<bool> {
     let parquet_path = parquet_file.display().to_string().replace('\'', "''");
     let sql =
         format!("SELECT COUNT(*) FROM parquet_schema('{parquet_path}') WHERE name = '{column}';");
-    let output = std::process::Command::new("duckdb")
-        .arg("-noheader")
-        .arg("-c")
-        .arg(&sql)
-        .output()
-        .context("run duckdb CLI for parquet schema check")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("duckdb CLI schema check failed: {}", stderr.trim()));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let count: u64 = stdout.trim().parse().unwrap_or(0);
+    let count: i64 = conn
+        .query_row(&sql, [], |row| row.get(0))
+        .with_context(|| format!("read parquet schema for {}", parquet_file.display()))?;
     Ok(count > 0)
 }
 
@@ -649,6 +1243,36 @@ fn temp_zellic_decode_path(db_path: &Path) -> PathBuf {
         .map(|p| p.join(".blink").join("tmp"))
         .unwrap_or_else(std::env::temp_dir);
     dir.join(format!("blink_zellic_decode_{}.tsv", std::process::id()))
+}
+
+fn temp_zellic_opcode_path(db_path: &Path) -> PathBuf {
+    let dir = db_path
+        .parent()
+        .map(|path| path.join(".blink").join("tmp"))
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join(format!("blink_zellic_opcodes_{}.tsv", std::process::id()))
+}
+
+fn temp_opcode_decode_path(file: &Path) -> PathBuf {
+    let file_name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("contracts");
+    let safe_name = file_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    std::env::temp_dir().join(format!(
+        "blink_opcode_decode_{}_{}.tsv",
+        std::process::id(),
+        safe_name
+    ))
 }
 
 fn flush_batch(
