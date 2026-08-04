@@ -472,6 +472,38 @@ async fn dashboard_sql_scopes_contract_metadata_by_chain() {
 }
 
 #[tokio::test]
+async fn dashboard_sql_pages_through_all_matching_rows() {
+    let dir = TestDir::new("query_pagination");
+    let db = Db::open_with_mode(&dir.path, "*.parquet", false).unwrap();
+    let sql = "SELECT range AS value FROM range(2505) ORDER BY value".to_string();
+
+    let first = db
+        .query_sql_page(sql.clone(), 1_000, 0, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(first.row_count, 1_000);
+    assert_eq!(first.offset, 0);
+    assert!(first.has_more);
+    assert_eq!(first.rows[0][0], serde_json::json!(0));
+    assert_eq!(first.rows[999][0], serde_json::json!(999));
+
+    let second = db
+        .query_sql_page(sql.clone(), 1_000, 1_000, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(second.row_count, 1_000);
+    assert_eq!(second.offset, 1_000);
+    assert!(second.has_more);
+    assert_eq!(second.rows[0][0], serde_json::json!(1_000));
+
+    let last = db.query_sql_page(sql, 1_000, 2_000, Some(1)).await.unwrap();
+    assert_eq!(last.row_count, 505);
+    assert_eq!(last.offset, 2_000);
+    assert!(!last.has_more);
+    assert_eq!(last.rows[504][0], serde_json::json!(2_504));
+}
+
+#[tokio::test]
 async fn contract_opcodes_queries_creation_and_runtime_separately() {
     let dir = TestDir::new("contract_opcodes");
     write_backfill_parquet(&dir.path);

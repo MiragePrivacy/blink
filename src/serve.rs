@@ -1398,8 +1398,10 @@ async fn recent_handler(
 struct SqlQueryRequest {
     /// Read-only SQL query over dashboard views.
     sql: String,
-    /// Maximum rows to return.
+    /// Maximum rows to return per page (capped at 1,000).
     limit: Option<u32>,
+    /// Number of matching rows to skip before returning this page.
+    offset: Option<u64>,
     /// Chain id used to scope the `contract_metadata` dashboard view.
     chain_id: Option<u64>,
 }
@@ -1421,9 +1423,10 @@ async fn query_handler(
 ) -> Result<Json<crate::db::SqlQueryResult>, AppError> {
     state
         .db
-        .query_sql(
+        .query_sql_page(
             req.sql,
             req.limit.unwrap_or(100),
+            req.offset.unwrap_or(0),
             Some(selected_chain_id(req.chain_id)),
         )
         .await

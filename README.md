@@ -119,6 +119,11 @@ FROM contract_opcodes
 WHERE list_contains(opcodes, 'SELFDESTRUCT');
 ```
 
+The HTTP SQL explorer returns at most 1,000 rows per request. Its response
+includes `offset` and `has_more`; pass the next `offset` to `POST /api/query`
+to page through every match. Use a deterministic `ORDER BY` when paging, and
+omit an SQL `LIMIT` if the full result set should remain available.
+
 `PUSH1` through `PUSH32` payload bytes are not interpreted as opcodes. Runtime
 compiler metadata is excluded when recognized. Creation analysis follows
 statically discoverable control-flow from program counter zero so embedded

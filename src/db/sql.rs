@@ -11,6 +11,8 @@ pub struct SqlQueryResult {
     pub rows: Vec<Vec<Value>>,
     pub row_count: usize,
     pub limit: u32,
+    pub offset: u64,
+    pub has_more: bool,
     pub elapsed_ms: u128,
 }
 
@@ -111,7 +113,12 @@ pub(crate) fn normalize_read_only_sql(sql: &str) -> Result<String> {
     Ok(without_trailing_semicolon.to_string())
 }
 
-pub(crate) fn wrap_dashboard_query(sql: &str, limit: u32, chain_id: Option<u64>) -> String {
+pub(crate) fn wrap_dashboard_query(
+    sql: &str,
+    limit: u32,
+    offset: u64,
+    chain_id: Option<u64>,
+) -> String {
     match chain_id {
         Some(chain_id) => format!(
             r#"
@@ -128,9 +135,12 @@ pub(crate) fn wrap_dashboard_query(sql: &str, limit: u32, chain_id: Option<u64>)
             SELECT *
             FROM ({sql}) AS _blink_dashboard_query
             LIMIT {limit}
+            OFFSET {offset}
             "#
         ),
-        None => format!("SELECT * FROM ({sql}) AS _blink_dashboard_query LIMIT {limit}"),
+        None => {
+            format!("SELECT * FROM ({sql}) AS _blink_dashboard_query LIMIT {limit} OFFSET {offset}")
+        }
     }
 }
 
