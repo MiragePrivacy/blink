@@ -39,7 +39,7 @@ pub enum Commands {
     Contracts(ContractsArgs),
     /// Load local contract datasets into Blink
     Load(LoadArgs),
-    /// Decode bytecode locally: compiler version, language, ERC standards, proxy detection
+    /// Decode bytecode locally: metadata plus creation/runtime opcode sets
     Decode(DecodeArgs),
     /// Build persistent block-time checkpoints from configured RPCs
     Checkpoints(CheckpointsArgs),

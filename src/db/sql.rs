@@ -1,7 +1,7 @@
 //! Read-only SQL guard rails and JSON conversion for `POST /api/query`.
 
 use anyhow::{anyhow, Result};
-use duckdb::types::ValueRef;
+use duckdb::types::{Value as DuckValue, ValueRef};
 use serde_json::{Number, Value};
 
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
@@ -11,6 +11,8 @@ pub struct SqlQueryResult {
     pub rows: Vec<Vec<Value>>,
     pub row_count: usize,
     pub limit: u32,
+    pub offset: u64,
+    pub has_more: bool,
     pub elapsed_ms: u128,
 }
 
@@ -111,7 +113,12 @@ pub(crate) fn normalize_read_only_sql(sql: &str) -> Result<String> {
     Ok(without_trailing_semicolon.to_string())
 }
 
-pub(crate) fn wrap_dashboard_query(sql: &str, limit: u32, chain_id: Option<u64>) -> String {
+pub(crate) fn wrap_dashboard_query(
+    sql: &str,
+    limit: u32,
+    offset: u64,
+    chain_id: Option<u64>,
+) -> String {
     match chain_id {
         Some(chain_id) => format!(
             r#"
@@ -119,13 +126,21 @@ pub(crate) fn wrap_dashboard_query(sql: &str, limit: u32, chain_id: Option<u64>)
                 SELECT *
                 FROM contract_metadata_all
                 WHERE chain_id = {chain_id}
+            ),
+            contract_opcodes AS (
+                SELECT *
+                FROM contract_opcodes_all
+                WHERE chain_id = {chain_id}
             )
             SELECT *
             FROM ({sql}) AS _blink_dashboard_query
             LIMIT {limit}
+            OFFSET {offset}
             "#
         ),
-        None => format!("SELECT * FROM ({sql}) AS _blink_dashboard_query LIMIT {limit}"),
+        None => {
+            format!("SELECT * FROM ({sql}) AS _blink_dashboard_query LIMIT {limit} OFFSET {offset}")
+        }
     }
 }
 
@@ -166,6 +181,41 @@ pub(crate) fn value_ref_to_json(value: ValueRef<'_>) -> Value {
             days,
             nanos,
         } => Value::String(format!("{months} months {days} days {nanos} ns")),
+        ValueRef::List(..) | ValueRef::Array(..) => duckdb_value_to_json(value.to_owned()),
+        other => Value::String(format!("{other:?}")),
+    }
+}
+
+fn duckdb_value_to_json(value: DuckValue) -> Value {
+    match value {
+        DuckValue::Null => Value::Null,
+        DuckValue::Boolean(value) => Value::Bool(value),
+        DuckValue::TinyInt(value) => Value::Number(Number::from(value)),
+        DuckValue::SmallInt(value) => Value::Number(Number::from(value)),
+        DuckValue::Int(value) => Value::Number(Number::from(value)),
+        DuckValue::BigInt(value) => Value::Number(Number::from(value)),
+        DuckValue::HugeInt(value) => i64::try_from(value)
+            .map(Number::from)
+            .map(Value::Number)
+            .unwrap_or_else(|_| Value::String(value.to_string())),
+        DuckValue::UTinyInt(value) => Value::Number(Number::from(value)),
+        DuckValue::USmallInt(value) => Value::Number(Number::from(value)),
+        DuckValue::UInt(value) => Value::Number(Number::from(value)),
+        DuckValue::UBigInt(value) => Value::Number(Number::from(value)),
+        DuckValue::Float(value) => Number::from_f64(value as f64)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        DuckValue::Double(value) => Number::from_f64(value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        DuckValue::Text(value) | DuckValue::Enum(value) => Value::String(value),
+        DuckValue::Blob(value) => Value::String(format!("0x{}", hex::encode(value))),
+        DuckValue::List(values) | DuckValue::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(duckdb_value_to_json)
+                .collect::<Vec<_>>(),
+        ),
         other => Value::String(format!("{other:?}")),
     }
 }

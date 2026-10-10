@@ -221,11 +221,22 @@ impl Db {
         limit: u32,
         chain_id: Option<u64>,
     ) -> Result<super::SqlQueryResult> {
+        self.query_sql_page(sql, limit, 0, chain_id).await
+    }
+
+    pub async fn query_sql_page(
+        &self,
+        sql: String,
+        limit: u32,
+        offset: u64,
+        chain_id: Option<u64>,
+    ) -> Result<super::SqlQueryResult> {
         let normalized = sql::normalize_read_only_sql(&sql)?;
         let limit = limit.clamp(1, 1_000);
+        let fetch_limit = limit + 1;
         self.run_read(move |conn| {
             let started = Instant::now();
-            let wrapped = sql::wrap_dashboard_query(&normalized, limit, chain_id);
+            let wrapped = sql::wrap_dashboard_query(&normalized, fetch_limit, offset, chain_id);
             let mut stmt = conn.prepare(&wrapped).context("prepare dashboard query")?;
             let mut rows = stmt.query([]).context("execute dashboard query")?;
             let (columns, column_count) = {
@@ -242,6 +253,8 @@ impl Db {
                 }
                 out.push(values);
             }
+            let has_more = out.len() > limit as usize;
+            out.truncate(limit as usize);
             let elapsed_ms = started.elapsed().as_millis();
             if elapsed_ms >= 1_000 {
                 // The HTTP-level slow log can't see the request body; name
@@ -258,6 +271,8 @@ impl Db {
                 row_count: out.len(),
                 rows: out,
                 limit,
+                offset,
+                has_more,
                 elapsed_ms,
             })
         })
